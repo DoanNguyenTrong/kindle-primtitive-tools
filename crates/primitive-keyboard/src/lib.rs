@@ -8,6 +8,76 @@
 //! letter, then back to `Lower`), `Symbols` (the "123" symbols) and `More` (the "#+=" symbols). The bottom row has the
 //! layer switch, ‹ and › (caret), space, a full stop, and Go.
 
+/// The keyboard's look and size, the same in both apps: Primitive Browser writes them into its keyboard's CSS, Primitive
+/// Launcher draws its keys with them. Sizes are device pixels on the 1264 × 1680 portrait screen.
+pub mod style {
+    /// The height of the keyboard's area at the bottom of a 1680 px screen.
+    pub const AREA_H: u32 = 730;
+    /// Padding inside the area: top, sides, bottom.
+    pub const PAD_TOP: u32 = 14;
+    pub const PAD_SIDE: u32 = 12;
+    pub const PAD_BOTTOM: u32 = 18;
+    /// The space between keys, across and down.
+    pub const GAP: u32 = 8;
+    /// The tallest a key gets.
+    pub const KEY_H_MAX: u32 = 124;
+    pub const RADIUS: u32 = 12;
+    /// A key's outline width and grey, its fill grey, and the line above the keyboard.
+    pub const BORDER: u32 = 1;
+    pub const BORDER_GRAY: u8 = 0xbd;
+    pub const FILL_GRAY: u8 = 0xf7;
+    pub const TOP_LINE: u32 = 2;
+    pub const TOP_LINE_GRAY: u8 = 0xe2;
+    /// Ink: the text, and the fill of a key that is on (Shift in upper case, Go).
+    pub const INK_GRAY: u8 = 0x11;
+    /// Label sizes: one character, and a word ("Shift", "space", "Join").
+    pub const LABEL: u32 = 48;
+    pub const LABEL_WORD: u32 = 30;
+
+    /// A key's height for an area of `area_h` pixels and `rows` rows.
+    pub fn key_height(area_h: u32, rows: u32) -> u32 {
+        let rows = rows.max(1);
+        (area_h.saturating_sub(PAD_TOP + PAD_BOTTOM + GAP * rows) / rows).min(KEY_H_MAX)
+    }
+
+    /// The label size for a key's label.
+    pub fn label_size(label: &str) -> u32 {
+        if label.chars().count() > 1 { LABEL_WORD } else { LABEL }
+    }
+}
+
+/// A key's place inside the keyboard's area (its top left is 0, 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Every key of a layer with its place in an area `width` × `area_h`: each row fills the width, its keys sharing it by
+/// their widths after the gaps, as the browser's flex rows do.
+pub fn layout(layer: Layer, go: &str, width: u32, area_h: u32) -> Vec<(KeyDef, KeyRect)> {
+    use style::*;
+    let rows = rows(layer, go);
+    let key_h = key_height(area_h, rows.len() as u32) as i32;
+    let inner = width.saturating_sub(2 * PAD_SIDE) as f32;
+    let mut out = Vec::new();
+    for (i, row) in rows.into_iter().enumerate() {
+        let gaps = GAP as f32 * (row.len().saturating_sub(1)) as f32;
+        let units: f32 = row.iter().map(|k| k.width).sum();
+        let free = (inner - gaps).max(0.0);
+        let y = PAD_TOP as i32 + i as i32 * (key_h + GAP as i32);
+        let mut x = PAD_SIDE as f32;
+        for key in row {
+            let w = free * key.width / units.max(0.001);
+            out.push((key, KeyRect { x: x.round() as i32, y, w: w.round() as i32, h: key_h }));
+            x += w + GAP as f32;
+        }
+    }
+    out
+}
+
 /// The keyboard's layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -202,6 +272,21 @@ mod tests {
         assert_eq!(lower[1].iter().map(|k| k.label.as_str()).collect::<String>(), "qwertyuiop");
         assert!(find(&lower, Key::Shift) && find(&lower, Key::Go) && find(&lower, Key::Space));
         assert_eq!(rows(Layer::Symbols, "Go")[4][0].key, Key::Layer(Layer::More));
+    }
+
+    #[test]
+    fn the_layout_fills_each_row_and_fits_the_area() {
+        let keys = layout(Layer::Lower, "Go", 1264, style::AREA_H);
+        assert_eq!(style::key_height(style::AREA_H, 5), 124, "the portrait keyboard has 124 px keys");
+        for row in 0..5 {
+            let in_row: Vec<_> = keys.iter().filter(|(_, r)| r.y == style::PAD_TOP as i32 + row * (124 + style::GAP as i32)).collect();
+            let first = in_row.first().unwrap().1;
+            let last = in_row.last().unwrap().1;
+            assert_eq!(first.x, style::PAD_SIDE as i32);
+            assert!((last.x + last.w - (1264 - style::PAD_SIDE as i32)).abs() <= 2, "row {row} ends at the right padding");
+        }
+        let bottom = keys.iter().map(|(_, r)| r.y + r.h).max().unwrap();
+        assert!(bottom as u32 + style::PAD_BOTTOM <= style::AREA_H);
     }
 
     #[test]
