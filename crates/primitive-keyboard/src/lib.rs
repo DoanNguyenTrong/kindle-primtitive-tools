@@ -8,6 +8,25 @@
 //! letter, then back to `Lower`), `Symbols` (the "123" symbols) and `More` (the "#+=" symbols). The bottom row has the
 //! layer switch, ‹ and › (caret), space, a full stop, and Go.
 
+/// How one key is drawn: its fill, its text and its outline, as gray levels (0 black, 255 white).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Look {
+    pub fill: u8,
+    pub ink: u8,
+    pub line: u8,
+}
+
+/// The look of a key. A key that is on (Shift in `Upper`, Go) and a key that is being pressed take the on look: the
+/// fill and outline in ink, the text in white. Every app draws a key with this, so a tap shows on each keyboard the
+/// same way, before the key's action runs.
+pub fn look(def: &KeyDef, pressed: bool) -> Look {
+    if def.on || pressed {
+        Look { fill: style::INK_GRAY, ink: 255, line: style::INK_GRAY }
+    } else {
+        Look { fill: style::FILL_GRAY, ink: style::INK_GRAY, line: style::BORDER_GRAY }
+    }
+}
+
 /// The keyboard's look and size, the same in both apps: Primitive Browser writes them into its keyboard's CSS, Primitive
 /// Launcher draws its keys with them. Sizes are device pixels on the 1264 × 1680 portrait screen.
 pub mod style {
@@ -353,5 +372,14 @@ mod tests {
         assert_eq!(f.press(Key::Delete), Press::Nothing);
         assert_eq!(f.press(Key::Left), Press::Nothing);
         assert_eq!(f.press(Key::Right), Press::Nothing);
+    }
+
+    #[test]
+    fn a_pressed_key_takes_the_on_look() {
+        let plain = KeyDef { key: Key::Char('a'), label: "a".into(), width: 1.0, on: false };
+        let go = KeyDef { key: Key::Go, label: "Go".into(), width: 1.5, on: true };
+        assert_eq!(look(&plain, false).fill, style::FILL_GRAY);
+        assert_eq!(look(&plain, true), look(&go, false), "pressed looks like an on key");
+        assert_eq!(look(&plain, true).ink, 255);
     }
 }
