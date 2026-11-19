@@ -273,11 +273,17 @@ pub struct Ui {
     /// The tab shown, and how far the product page is scrolled.
     pub store_tab: crate::store::StoreTab,
     pub store_scroll: i32,
+    pub store_query: primitive_keyboard::Editor,
+    pub store_search_keyboard: bool,
+    /// The catalog entry on the confirmation or progress sheet.
+    pub store_sheet: Option<usize>,
+    pub store_progress: Option<String>,
+    pub store_progress_percent: Option<u8>,
     /// A catalog refresh is running (the button shows Updating).
     pub store_busy: bool,
     /// The app being installed from the store, if any (its page shows Installing, and its action waits).
     pub store_installing: Option<String>,
-    /// The app whose Remove was tapped once: a second tap removes it.
+    /// The app awaiting confirmation in the Remove dialog.
     pub store_remove_armed: Option<String>,
     /// Background jobs still running (shown in the status bar).
     pub running: usize,
@@ -328,6 +334,11 @@ impl Ui {
             store_open: None,
             store_tab: crate::store::StoreTab::Today,
             store_scroll: 0,
+            store_query: primitive_keyboard::Editor::new(48),
+            store_search_keyboard: false,
+            store_sheet: None,
+            store_progress: None,
+            store_progress_percent: None,
             store_busy: false,
             store_installing: None,
             store_remove_armed: None,
@@ -432,13 +443,35 @@ impl Ui {
         Action::RunBackground(app)
     }
 
-    /// The Extensions tile: open the list at the top.
-    /// Replaces the store's entries (from the catalog cache and the installed record). Today is the first tab.
+    /// Replaces the store's entries (from the catalog cache and the installed record).
     pub fn set_store(&mut self, entries: Vec<crate::store::StoreEntry>) {
         self.store = entries;
         self.store_page = 0;
         self.store_open = None;
         self.store_scroll = 0;
+        self.store_sheet = None;
+        self.store_remove_armed = None;
+    }
+
+    /// Refresh entry data without replacing the open product with whichever app now occupies its old index.
+    pub fn update_store(&mut self, entries: Vec<crate::store::StoreEntry>) {
+        let open = self.store_open.and_then(|i| self.store.get(i)).map(|entry| entry.id.as_str());
+        self.store_open = open.and_then(|id| entries.iter().position(|entry| entry.id == id));
+        if self.store_open.is_none() {
+            if self.screen == Screen::StoreApp {
+                self.screen = Screen::Store;
+            }
+            if self.before_sleep == Screen::StoreApp {
+                self.before_sleep = Screen::Store;
+            }
+            self.store_sheet = None;
+            self.store_remove_armed = None;
+        } else if self.store_sheet.is_some() {
+            self.store_sheet = self.store_open;
+        }
+        self.store = entries;
+        self.store_scroll = self.store_scroll.min(self.store_scroll_max());
+        self.store_page = self.store_page.min(self.store_pages() - 1);
     }
 
     /// Today's featured app: the first entry.
@@ -456,6 +489,22 @@ impl Ui {
         (0..self.store.len()).collect()
     }
 
+    /// Search by app title, summary, developer or category. An empty query shows the whole catalog.
+    pub fn store_search(&self, query: &str) -> Vec<usize> {
+        let query = query.trim().to_lowercase();
+        self.store
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                [entry.name.as_str(), &entry.subtitle, &entry.developer]
+                    .into_iter()
+                    .chain(entry.categories.iter().map(String::as_str))
+                    .any(|field| field.to_lowercase().contains(&query))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The Updates tab: the entries installed from the store, with or without an update ready.
     pub fn store_updates(&self) -> Vec<usize> {
         self.store
@@ -466,17 +515,42 @@ impl Ui {
             .collect()
     }
 
-    /// The paged list of the current tab (Apps or Updates).
+    /// The paged list of the current tab.
     fn store_list_indices(&self) -> Vec<usize> {
         match self.store_tab {
             crate::store::StoreTab::Updates => self.store_updates(),
+            crate::store::StoreTab::Search => self.store_search(&self.store_query.string()),
             _ => self.store_apps(),
+        }
+    }
+
+    pub fn store_rows_per_page(&self) -> usize {
+        if self.store_tab == crate::store::StoreTab::Search {
+            self.layout.store_search_rows(self.store_search_keyboard)
+        } else {
+            self.layout.store_rows_per_page()
+        }
+    }
+
+    pub fn store_list_row(&self, i: usize) -> Rect {
+        if self.store_tab == crate::store::StoreTab::Search {
+            self.layout.store_search_row(i)
+        } else {
+            self.layout.store_list_row(i)
+        }
+    }
+
+    pub fn store_page_label(&self) -> Rect {
+        if self.store_tab == crate::store::StoreTab::Search {
+            self.layout.store_search_page_label(self.store_search_keyboard)
+        } else {
+            self.layout.store_page_label()
         }
     }
 
     /// The pages of the current tab's list.
     pub fn store_pages(&self) -> usize {
-        self.layout.store_pages(self.store_list_indices().len())
+        self.store_list_indices().len().div_ceil(self.store_rows_per_page()).max(1)
     }
 
     /// The rows of a product page (information, and Remove when it applies), and its screenshots, for its scroll limit.
@@ -507,7 +581,7 @@ impl Ui {
         if self.store_tab != StoreTab::Today && self.store_pages() > 1 {
             return self.store_turn(step);
         }
-        let tabs = [StoreTab::Today, StoreTab::Apps, StoreTab::Updates];
+        let tabs = StoreTab::ALL;
         let current = tabs.iter().position(|t| *t == self.store_tab).unwrap_or(0) as i32;
         let next = current + step;
         if next < 0 || next >= tabs.len() as i32 {
@@ -517,15 +591,53 @@ impl Ui {
     }
 
     fn store_open_entry(&mut self, index: usize) -> Action {
+        self.store_search_keyboard = false;
         self.store_open = Some(index);
         self.store_scroll = 0;
+        self.store_remove_armed = None;
         self.go(Screen::StoreApp)
     }
 
     fn set_store_tab(&mut self, tab: crate::store::StoreTab) -> Action {
         self.store_tab = tab;
         self.store_page = 0;
+        self.store_search_keyboard = false;
         Action::Redraw { full: false }
+    }
+
+    fn store_keyboard(&mut self, input: Input) -> Option<Action> {
+        let l = self.layout;
+        let mut open = self.store_search_keyboard;
+        let action = match input {
+            Input::PageBack if open => {
+                open = false;
+                Action::Redraw { full: true }
+            }
+            Input::Tap(x, y) if l.store_search_field().contains(x, y) && !open => {
+                open = true;
+                Action::Redraw { full: false }
+            }
+            Input::Tap(x, y) if open && l.keyboard_area().contains(x, y) => {
+                let key = l.keyboard_key_at(self.store_query.layer, x, y)?;
+                match self.store_query.press(key) {
+                    primitive_keyboard::Press::Go => {
+                        open = false;
+                        Action::Redraw { full: true }
+                    }
+                    primitive_keyboard::Press::Edited => {
+                        self.store_page = 0;
+                        Action::Redraw { full: false }
+                    }
+                    _ => Action::Redraw { full: false },
+                }
+            }
+            _ => return None,
+        };
+        if open != self.store_search_keyboard {
+            self.store_search_keyboard = open;
+            self.store_page = 0;
+        }
+        Some(action)
     }
 
     /// The store's tabs: a tap on the tab bar changes the tab; Today opens its featured app and rows; Apps and Updates
@@ -533,23 +645,31 @@ impl Ui {
     fn store_list(&mut self, input: Input) -> Action {
         use crate::store::StoreTab;
         let l = self.layout;
+        if self.store_tab == StoreTab::Search {
+            if let Some(action) = self.store_keyboard(input) {
+                return action;
+            }
+        }
         match input {
             Input::PageForward => self.store_page_key(1),
             Input::PageBack => self.store_page_key(-1),
             Input::Swipe { dx, dy, .. } if dx.abs() > SWIPE_MIN && dx.abs() > dy.abs() * 1.5 => self.store_turn(if dx < 0.0 { 1 } else { -1 }),
             Input::Tap(x, y) => {
                 if l.store_done().inset(-16).contains(x, y) {
+                    if self.store_installing.is_some() {
+                        return Action::None;
+                    }
                     return self.go(Screen::Home);
                 }
                 if l.store_refresh().inset(-16).contains(x, y) {
-                    if self.store_busy {
+                    if self.store_busy || self.store_installing.is_some() {
                         return Action::None;
                     }
                     self.store_busy = true;
                     return Action::Device(DeviceCmd::StoreRefresh);
                 }
-                if let Some(i) = l.store_tab_at(x, y) {
-                    let tab = [StoreTab::Today, StoreTab::Apps, StoreTab::Updates][i];
+                if let Some(i) = l.store_tab_at(x, y).filter(|_| !self.store_search_keyboard) {
+                    let tab = StoreTab::ALL[i];
                     if tab == self.store_tab {
                         return Action::None;
                     }
@@ -568,13 +688,13 @@ impl Ui {
                     let Some(row) = (0..rows.len()).find(|&i| l.store_today_row(i).contains(x, y)) else { return Action::None };
                     return self.store_open_entry(rows[row]);
                 }
-                if l.store_page_label().contains(x, y) {
+                if self.store_page_label().contains(x, y) {
                     return self.store_turn(if x < (l.width / 2) as f32 { -1 } else { 1 });
                 }
                 let list = self.store_list_indices();
-                let per = l.store_rows_per_page();
+                let per = self.store_rows_per_page();
                 let on_page = list.len().saturating_sub(self.store_page * per).min(per);
-                let Some(row) = (0..on_page).find(|&i| l.store_list_row(i).contains(x, y)) else { return Action::None };
+                let Some(row) = (0..on_page).find(|&i| self.store_list_row(i).contains(x, y)) else { return Action::None };
                 match list.get(self.store_page * per + row) {
                     Some(&index) => self.store_open_entry(index),
                     None => Action::None,
@@ -584,12 +704,45 @@ impl Ui {
         }
     }
 
-    /// A product page: scrolls with a vertical swipe; Back returns to the tab; the action button installs (from the
-    /// store), or shows where a link listing lives.
+    /// A product page with install and remove confirmations.
     fn store_app(&mut self, input: Input) -> Action {
         let l = self.layout;
         let Some(index) = self.store_open else { return self.go(Screen::Store) };
         let Some(entry) = self.store.get(index).cloned() else { return self.go(Screen::Store) };
+        if self.store_sheet.is_some() {
+            if self.store_installing.is_some() {
+                return Action::None;
+            }
+            let box_rect = l.store_sheet();
+            let [cancel, install] = l.store_sheet_buttons();
+            match input {
+                Input::Tap(x, y) if install.contains(x, y) => {
+                    if self.store_busy {
+                        self.notice = Some("Wait for the store to finish updating.".to_string());
+                        return Action::Redraw { full: false };
+                    }
+                    self.store_installing = Some(entry.id.clone());
+                    return Action::Device(DeviceCmd::StoreInstall(index));
+                }
+                Input::PageBack => self.store_sheet = None,
+                Input::Tap(x, y) if cancel.contains(x, y) || !box_rect.contains(x, y) => self.store_sheet = None,
+                _ => return Action::None,
+            }
+            return Action::Redraw { full: true };
+        }
+        if self.store_remove_armed.is_some() {
+            let [(_, cancel), (_, remove)] = l.confirm_buttons();
+            match input {
+                Input::Tap(x, y) if remove.contains(x, y) => {
+                    self.store_remove_armed = None;
+                    return Action::Device(DeviceCmd::StoreRemove(index));
+                }
+                Input::PageBack => self.store_remove_armed = None,
+                Input::Tap(x, y) if cancel.contains(x, y) || !l.confirm_box().contains(x, y) => self.store_remove_armed = None,
+                _ => return Action::None,
+            }
+            return Action::Redraw { full: true };
+        }
         let (rows, shots) = self.store_info_count(index);
         let max = (l.store_page_height(rows, shots) - l.height).max(0);
         match input {
@@ -615,7 +768,8 @@ impl Ui {
                 if l.store_back().inset(-20).contains(x, y) {
                     return self.go(Screen::Store);
                 }
-                if l.store_action(self.store_scroll).inset(-12).contains(x, y) {
+                let content_visible = (170.0..(l.height - 120) as f32).contains(&y);
+                if content_visible && l.store_action(self.store_scroll).inset(-12).contains(x, y) {
                     return match (entry.kind, &entry.status) {
                         (crate::store::Kind::Link, _) => {
                             self.notice = Some(format!("{} is on its own website: {}", entry.name, entry.repo));
@@ -624,23 +778,18 @@ impl Ui {
                         _ if self.store_installing.is_some() => Action::None,
                         (crate::store::Kind::Install, crate::store::Status::Installed(_)) => Action::None,
                         (crate::store::Kind::Install, _) => {
-                            self.store_installing = Some(entry.id.clone());
-                            Action::Device(DeviceCmd::StoreInstall(index))
+                            self.store_sheet = Some(index);
+                            Action::Redraw { full: false }
                         }
                     };
                 }
-                // The last row of an installed app: Remove, on a second tap.
+                // The last row of an installed app opens its Remove confirmation.
                 let rows = entry.page_rows();
                 if entry.can_remove() {
                     let last = rows.len() - 1;
                     let row = l.store_info_row(last, self.store_scroll, entry.screenshots);
-                    if row.contains(x, y) {
-                        if self.store_remove_armed.as_deref() == Some(entry.id.as_str()) {
-                            self.store_remove_armed = None;
-                            return Action::Device(DeviceCmd::StoreRemove(index));
-                        }
+                    if content_visible && row.contains(x, y) {
                         self.store_remove_armed = Some(entry.id.clone());
-                        self.notice = Some(format!("Tap Remove again to remove {} from this Kindle.", entry.name));
                         return Action::Redraw { full: false };
                     }
                 }
@@ -925,6 +1074,7 @@ impl Ui {
             Screen::Password => self.layout.keyboard_keys(self.password.layer),
             Screen::NetworkName => self.layout.keyboard_keys_with(self.network_name.layer, "Next"),
             Screen::SshPassword => self.layout.keyboard_keys_with(self.ssh_password.layer, "Set"),
+            Screen::Store if self.store_search_keyboard => self.layout.keyboard_keys_with(self.store_query.layer, "Search"),
             _ => return false,
         };
         match keys.into_iter().find(|(_, r)| r.contains(x, y)) {
@@ -1010,7 +1160,6 @@ impl Ui {
                     Launch::Settings => self.go(Screen::Settings),
                     Launch::KindleMode => self.go(Screen::ConfirmKindle),
                     Launch::Extensions => self.open_extensions(),
-                    Launch::Store => self.open_store(),
                     _ if app.background => self.run_background(app),
                     _ => {
                         self.pressed = self.icon_rect(index);
@@ -1387,11 +1536,15 @@ mod tests {
         u.open_store();
         u.store_open = Some(0);
         u.screen = Screen::StoreApp;
+        u.store_scroll = u.store_scroll_max();
         let last = u.store[0].page_rows().len() - 1;
-        let row = u.layout.store_info_row(last, 0, 0);
+        let row = u.layout.store_info_row(last, u.store_scroll, 0);
         assert_eq!(u.handle(centre(row)), Action::Redraw { full: false }, "the first tap asks");
-        assert!(u.notice.as_deref().unwrap_or("").contains("Tap Remove again"));
-        assert_eq!(u.handle(centre(row)), Action::Device(DeviceCmd::StoreRemove(0)), "the second tap removes");
+        assert_eq!(u.store_remove_armed.as_deref(), Some("a"));
+        let [(_, cancel), (_, remove)] = u.layout.confirm_buttons();
+        assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: true });
+        u.handle(centre(row));
+        assert_eq!(u.handle(centre(remove)), Action::Device(DeviceCmd::StoreRemove(0)));
         // Not installed: no Remove row, so the last row is information.
         assert!(!u.store[1].can_remove());
         assert_ne!(u.store[1].page_rows().last().map(|r| r.0.as_str()), Some(crate::store::StoreEntry::REMOVE_LABEL));
@@ -1428,7 +1581,7 @@ mod tests {
         use crate::store::{test_entry, Status, StoreTab};
         let mut u = ui(0);
         u.set_store(vec![test_entry("a", "Alpha", Status::NotInstalled)]);
-        for tab in [StoreTab::Today, StoreTab::Apps, StoreTab::Updates] {
+        for tab in StoreTab::ALL {
             u.open_store();
             u.store_tab = tab;
             u.handle(centre(u.layout.store_done()));
@@ -1468,6 +1621,37 @@ mod tests {
         assert_eq!(u.store_tab, StoreTab::Updates);
         // Only the installed app is in Updates.
         assert_eq!(u.store_updates(), vec![2]);
+        assert_eq!(u.handle(centre(u.layout.store_tab(3))), Action::Redraw { full: false });
+        assert_eq!(u.store_tab, StoreTab::Search);
+    }
+
+    #[test]
+    fn store_search_filters_each_catalog_field_and_accepts_keyboard_input() {
+        use crate::store::{test_entry, Status, StoreTab};
+        use primitive_keyboard::Key;
+
+        let mut u = ui(0);
+        let mut first = test_entry("a", "Alpha", Status::NotInstalled);
+        first.subtitle = "Web explorer".into();
+        first.developer = "Primitive Labs".into();
+        first.categories = vec!["internet".into()];
+        u.set_store(vec![first, test_entry("b", "Beta", Status::NotInstalled)]);
+        for query in ["AlPhA", "  WEB  ", "Labs", "INTERNET"] {
+            assert_eq!(u.store_search(query), vec![0]);
+        }
+        assert_eq!(u.store_search(""), vec![0, 1]);
+        assert!(u.store_search("nonexistent").is_empty());
+        u.open_store();
+        u.handle(centre(u.layout.store_tab(3)));
+        assert_eq!(u.store_tab, StoreTab::Search);
+        u.handle(centre(u.layout.store_search_field()));
+        for key in [Key::Char('b'), Key::Go] {
+            let (_, rect) = u.layout.keyboard_keys(u.store_query.layer).into_iter().find(|(def, _)| def.key == key).unwrap();
+            u.handle(centre(rect));
+        }
+        assert!(!u.store_search_keyboard);
+        assert_eq!(u.store_query.string(), "b");
+        assert_eq!(u.store_search(&u.store_query.string()), vec![0, 1]);
     }
 
     #[test]
@@ -1524,9 +1708,17 @@ mod tests {
         assert_eq!(u.store_scroll, 400.min(u.store_scroll_max()));
         u.handle(Input::Swipe { dx: 0.0, dy: 5000.0, start_y: 600.0 });
         assert_eq!(u.store_scroll, 0, "scrolling back up stops at the top");
-        // Get installs (the device runs it).
+        // Get opens a sheet. Cancel is reversible, and Install starts the operation.
         let action = u.layout.store_action(0);
-        assert_eq!(u.handle(centre(action)), Action::Device(DeviceCmd::StoreInstall(0)));
+        let [cancel, install] = u.layout.store_sheet_buttons();
+        assert_eq!(u.handle(centre(action)), Action::Redraw { full: false });
+        assert_eq!(u.store_sheet, Some(0));
+        assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: true });
+        assert_eq!(u.store_sheet, None);
+        u.handle(centre(action));
+        assert_eq!(u.handle(centre(install)), Action::Device(DeviceCmd::StoreInstall(0)));
+        u.store_sheet = None;
+        u.store_installing = None;
         // Back returns to the store.
         u.handle(centre(u.layout.store_back()));
         assert_eq!(u.screen, Screen::Store);

@@ -45,11 +45,13 @@ pub struct Settings {
     pub dark_mode: bool,
     /// The opening zoom when an app starts. On by default.
     pub animation: bool,
+    /// Refresh the store automatically when its catalog is a day old.
+    pub store_daily_check: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { rotation: Rotation::Upright, auto_rotation: true, sleep_screen_launcher: false, dark_mode: false, animation: true }
+        Settings { rotation: Rotation::Upright, auto_rotation: true, sleep_screen_launcher: false, dark_mode: false, animation: true, store_daily_check: true }
     }
 }
 
@@ -67,6 +69,8 @@ impl Settings {
                 ("sleep_screen", "kindle") => s.sleep_screen_launcher = false,
                 ("dark_mode", value) => s.dark_mode = value == "on",
                 ("animation", value) => s.animation = value != "off",
+                ("store_daily_check", "1") => s.store_daily_check = true,
+                ("store_daily_check", "0") => s.store_daily_check = false,
                 _ => {}
             }
         }
@@ -81,10 +85,11 @@ impl Settings {
         let sleep = if self.sleep_screen_launcher { "launcher" } else { "kindle" };
         let on = |b: bool| if b { "on" } else { "off" };
         format!(
-            "rotation={rotation}\nauto_rotation={}\nsleep_screen={sleep}\ndark_mode={}\nanimation={}\n",
+            "rotation={rotation}\nauto_rotation={}\nsleep_screen={sleep}\ndark_mode={}\nanimation={}\nstore_daily_check={}\n",
             on(self.auto_rotation),
             on(self.dark_mode),
-            on(self.animation)
+            on(self.animation),
+            u8::from(self.store_daily_check),
         )
     }
 }
@@ -95,7 +100,7 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let s = Settings { rotation: Rotation::UpsideDown, auto_rotation: false, sleep_screen_launcher: true, dark_mode: true, animation: false };
+        let s = Settings { rotation: Rotation::UpsideDown, auto_rotation: false, sleep_screen_launcher: true, dark_mode: true, animation: false, store_daily_check: false };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert!(Settings::default().animation && !Settings::default().dark_mode);
         assert!(Settings::parse("animation=yes\n").animation, "only off turns it off");
@@ -108,6 +113,14 @@ mod tests {
         assert!(Settings::parse("rotation=upright\n").auto_rotation);
         assert!(!Settings::parse("auto_rotation=off\n").auto_rotation);
         assert!(Settings::parse("auto_rotation=on\n").auto_rotation);
+    }
+
+    #[test]
+    fn store_daily_check_defaults_to_on_and_can_be_turned_off() {
+        assert!(Settings::parse("rotation=upright\n").store_daily_check);
+        assert!(Settings::parse("store_daily_check=maybe\n").store_daily_check);
+        assert!(!Settings::parse("store_daily_check=0\n").store_daily_check);
+        assert!(Settings::parse("store_daily_check=0\nstore_daily_check=1\n").store_daily_check);
     }
 
     #[test]

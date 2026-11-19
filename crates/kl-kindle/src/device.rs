@@ -362,18 +362,26 @@ pub fn wlan_ip() -> String {
 
 /// Free space on the Kindle's user partition (`/mnt/us`), e.g. "2.1 GB free".
 pub fn free_storage() -> String {
-    let Ok(path) = std::ffi::CString::new("/mnt/us") else { return "unknown".into() };
-    // SAFETY: statvfs fills the struct it is given; the path is a valid C string.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
-        return "unknown".into();
-    }
-    let bytes = st.f_bavail as u64 * st.f_frsize as u64;
+    let Ok(bytes) = available_storage_bytes(std::path::Path::new("/mnt/us")) else { return "unknown".into() };
     if bytes >= 1_000_000_000 {
         format!("{:.1} GB free", bytes as f64 / 1e9)
     } else {
         format!("{} MB free", bytes / 1_000_000)
     }
+}
+
+pub fn available_storage_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: The path is NUL terminated, and statvfs initializes the output on success.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
 pub fn set_light(level: u32) {

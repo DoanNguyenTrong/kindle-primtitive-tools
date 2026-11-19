@@ -30,6 +30,10 @@ pub enum Ev {
     StoreRefreshed { entries: Vec<kl_core::store::StoreEntry>, message: String },
     /// An app from the store was installed (or not): the store's entries, the library's apps again, and the message.
     StoreInstalled { entries: Vec<kl_core::store::StoreEntry>, message: String },
+    /// The store's install sheet changed stage or crossed another progress step.
+    StoreProgress { message: String, percent: Option<u8> },
+    /// The launcher finished installing the standalone store.
+    StoreBootstrapped(Result<(), String>),
 }
 
 pub fn log(msg: &str) {

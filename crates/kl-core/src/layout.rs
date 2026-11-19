@@ -792,20 +792,20 @@ impl Layout {
 
     // ---- Store (App Store style): a large title, a floating tab bar at the bottom, and product pages that scroll.
 
-    /// The floating tab bar: a capsule at the bottom, with its three tabs (Today, Apps, Updates).
+    /// The floating tab bar, with its four tabs.
     pub fn store_tabs(&self) -> Rect {
         Rect::new(40, self.height - 40 - STORE_TAB_BAR_H, self.width - 80, STORE_TAB_BAR_H)
     }
 
-    /// Tab `i` (0 Today, 1 Apps, 2 Updates): an equal part of the bar, inset a little.
+    /// Tab `i`: an equal part of the bar, inset a little.
     pub fn store_tab(&self, i: usize) -> Rect {
         let t = self.store_tabs();
-        let w = t.w / 3;
+        let w = t.w / crate::store::StoreTab::ALL.len() as i32;
         Rect::new(t.x + i as i32 * w + 10, t.y + 10, w - 20, t.h - 20)
     }
 
     pub fn store_tab_at(&self, x: f32, y: f32) -> Option<usize> {
-        (0..3).find(|&i| self.store_tab(i).contains(x, y))
+        (0..crate::store::StoreTab::ALL.len()).find(|&i| self.store_tab(i).contains(x, y))
     }
 
     /// The Done button, at the top right of every store tab: it returns to the home screen.
@@ -848,6 +848,26 @@ impl Layout {
     /// Row `i` of the Apps or Updates list, on the current page.
     pub fn store_list_row(&self, i: usize) -> Rect {
         Rect::new(40, 200 + i as i32 * STORE_ROW_H, self.width - 80, STORE_ROW_H)
+    }
+
+    pub fn store_search_field(&self) -> Rect {
+        Rect::new(40, 200, self.width - 80, 104)
+    }
+
+    pub fn store_search_row(&self, i: usize) -> Rect {
+        Rect::new(40, self.store_search_field().bottom() + 16 + i as i32 * STORE_ROW_H, self.width - 80, STORE_ROW_H)
+    }
+
+    pub fn store_search_rows(&self, keyboard: bool) -> usize {
+        ((self.store_search_page_label(keyboard).y - self.store_search_row(0).y) / STORE_ROW_H).max(1) as usize
+    }
+
+    pub fn store_search_page_label(&self, keyboard: bool) -> Rect {
+        if keyboard {
+            Rect::new(0, self.keyboard_area().y - 72, self.width, 60)
+        } else {
+            self.store_page_label()
+        }
     }
 
     /// Rows that fit above the tab bar, with room for the page label.
@@ -927,7 +947,7 @@ impl Layout {
 
     /// The height of a product page's content (for the scroll limit), with `rows` information rows.
     pub fn store_page_height(&self, rows: usize, shots: usize) -> i32 {
-        store_about_top(shots) + 426 + rows as i32 * STORE_INFO_ROW_H + 60
+        store_about_top(shots) + 426 + rows as i32 * STORE_INFO_ROW_H + 130
     }
 
     pub fn confirm_buttons(&self) -> [(Button, Rect); 2] {
@@ -937,6 +957,18 @@ impl Layout {
             (Button::ConfirmCancel, Rect::new(b.x + 40, y, 300, BUTTON_H)),
             (Button::ConfirmOpen, Rect::new(b.right() - 40 - 400, y, 400, BUTTON_H)),
         ]
+    }
+
+    pub fn store_sheet(&self) -> Rect {
+        let height = 760;
+        Rect::new(MARGIN * 2, (self.height - height) / 2, self.width - 4 * MARGIN, height)
+    }
+
+    pub fn store_sheet_buttons(&self) -> [Rect; 2] {
+        let b = self.store_sheet();
+        let y = b.bottom() - 40 - BUTTON_H;
+        let width = (b.w - 104) / 2;
+        [Rect::new(b.x + 40, y, width, BUTTON_H), Rect::new(b.right() - 40 - width, y, width, BUTTON_H)]
     }
 }
 

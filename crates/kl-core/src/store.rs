@@ -13,13 +13,20 @@ pub enum Status {
     Update { installed: String, latest: String },
 }
 
-/// The store's tabs: Today (a featured app and the next ones), Apps (every app), Updates (what is installed).
+/// The store's tabs in their display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreTab {
     Today,
     Apps,
     Updates,
+    Search,
 }
+
+impl StoreTab {
+    pub const ALL: [Self; 4] = [Self::Today, Self::Apps, Self::Updates, Self::Search];
+}
+
+pub const STORE_ID: &str = "primitive-store";
 
 /// What the action button does: install from the store (hosted or upstream), or show the page to read (link).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +50,8 @@ pub struct StoreEntry {
     pub status: Status,
     /// What the app does outside its own folder, in the words the install sheet uses.
     pub changes: Vec<String>,
+    /// Whether the confirmation needs a system and startup warning.
+    pub system_changes: bool,
     /// The download's size for the latest version (its armhf asset), when the listing has one.
     pub size: Option<u64>,
     /// The lowest Kindle firmware the latest version runs on.
@@ -143,6 +152,9 @@ impl StoreEntry {
             latest,
             status,
             changes: change_lines(&listing.changes),
+            system_changes: listing.categories.iter().any(|category| category == "system")
+                || listing.changes.starts_at_boot
+                || listing.changes.root_filesystem,
             size: newest.and_then(|v| v.assets.values().next()).map(|a| a.size),
             firmware_min: newest.map(|v| v.firmware.min.clone()).unwrap_or_default(),
             tested_on: newest.map(|v| v.tested_on.clone()).unwrap_or_default(),
@@ -155,7 +167,9 @@ impl StoreEntry {
 
     /// Whether the store installed this app (so the page offers Remove).
     pub fn can_remove(&self) -> bool {
-        self.kind == Kind::Install && matches!(self.status, Status::Installed(_) | Status::Update { .. })
+        self.kind == Kind::Install
+            && self.id != STORE_ID
+            && matches!(self.status, Status::Installed(_) | Status::Update { .. })
     }
 
     /// The rows the product page shows: the information rows, and Remove when the app is installed.
@@ -223,6 +237,7 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
         latest: Some("1.0.0".into()),
         status,
         changes: vec!["Changes nothing outside its own folder.".into()],
+        system_changes: false,
         size: Some(1_000_000),
         firmware_min: "5.16.3".into(),
         tested_on: vec!["KindleOasis3".into()],

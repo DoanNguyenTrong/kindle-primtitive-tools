@@ -22,7 +22,26 @@ pub fn install_downloaded(
     source_url: &str,
     installed_at: &str,
 ) -> Result<String, String> {
-    let result = install_inner(paths, listing, device, zip, source_url, installed_at);
+    install_downloaded_with_progress(paths, listing, device, zip, source_url, installed_at, |_| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Checking,
+    Installing,
+}
+
+pub fn install_downloaded_with_progress(
+    paths: &Paths,
+    listing: &Listing,
+    device: &Device,
+    zip: &Path,
+    source_url: &str,
+    installed_at: &str,
+    mut progress: impl FnMut(Stage),
+) -> Result<String, String> {
+    progress(Stage::Checking);
+    let result = install_inner(paths, listing, device, zip, source_url, installed_at, &mut progress);
     let _ = fs::remove_file(zip);
     result
 }
@@ -34,6 +53,7 @@ fn install_inner(
     zip: &Path,
     source_url: &str,
     installed_at: &str,
+    progress: &mut impl FnMut(Stage),
 ) -> Result<String, String> {
     let chosen = resolve::pick_version(listing, device).map_err(|e| e.to_string())?;
     let asset = chosen
@@ -52,6 +72,14 @@ fn install_inner(
     if manifest.arch != device.arch {
         return Err("the package is for another kind of Kindle".into());
     }
+    if manifest.schema != 1 || manifest.dir != listing.dir() || manifest.firmware != chosen.firmware
+        || manifest.requires != chosen.requires
+    {
+        return Err("the package details do not match the catalog listing".into());
+    }
+    if !manifest.hooks.is_empty() {
+        return Err("this store does not support packages with install steps".into());
+    }
 
     let rec = record::load(&paths.record).map_err(|e| e.to_string())?;
     let missing = resolve::missing_requirements(&manifest.requires, &|id: &str| {
@@ -69,6 +97,7 @@ fn install_inner(
     fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     unpack::unpack(zip, &staging, &manifest, Limits::default()).map_err(|e| e.to_string())?;
     let source = Source { manifest: &manifest, source_url, sha256: &asset.sha256, installed_at };
+    progress(Stage::Installing);
     install::install(paths, &source, None).map_err(|e| e.to_string())?;
     Ok(manifest.version.clone())
 }
@@ -106,6 +135,7 @@ mod tests {
     /// The sample listing (browser, version 0.2.18 and 0.2.17) with the asset of 0.2.18 set to this package.
     fn listing_for(sha: &str, size: u64, version: &str) -> Listing {
         let mut l = sample_listing();
+        l.dir = None;
         let asset = l.versions[0].assets.get_mut("armhf").unwrap();
         asset.sha256 = sha.into();
         asset.size = size;
@@ -159,7 +189,8 @@ mod tests {
         let dl = p.root.join("launcher/store/downloads");
         fs::create_dir_all(&dl).unwrap();
         let (zip, sha, size) = package(&dl, "primitive-browser", "0.2.18", r#"{"kterm":">=2.6"}"#);
-        let listing = listing_for(&sha, size, "0.2.18");
+        let mut listing = listing_for(&sha, size, "0.2.18");
+        listing.versions[0].requires.insert("kterm".into(), ">=2.6".into());
         let err = install_downloaded(&p, &listing, &device(), &zip, "u", "d").unwrap_err();
         assert!(err.contains("needs kterm"), "{err}");
         assert!(!p.root.join("primitive-browser").exists());

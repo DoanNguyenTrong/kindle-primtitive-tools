@@ -4,6 +4,7 @@
 //! E-ink rules (see the `kindle-eink` skill): chrome and text are pure black on pure white after
 //! `solidify`, so page changes do not flash; only icons carry gray, dithered to the panel's 16 steps.
 
+pub mod component;
 pub mod image;
 
 use std::collections::HashMap;
@@ -455,6 +456,8 @@ impl Renderer {
             Screen::PowerMenu => Some(l.power_box()),
             Screen::AppMenu => Some(l.menu_box(ui.menu_anchor(), ui.menu_actions().len())),
             Screen::QuickSettings => Some(l.quick_panel()),
+            Screen::StoreApp if ui.store_sheet.is_some() => Some(l.store_sheet()),
+            Screen::StoreApp if ui.store_remove_armed.is_some() => Some(l.confirm_box()),
             _ => None,
         };
         // Quick settings is a sheet from the top edge: square, with no margin.
@@ -467,6 +470,8 @@ impl Renderer {
                 Screen::ConfirmKindle => self.confirm(&l),
                 Screen::PowerMenu => self.power_menu_box(&l),
                 Screen::QuickSettings => self.quick_panel(&l, status),
+                Screen::StoreApp if ui.store_sheet.is_some() => self.store_install_sheet(ui),
+                Screen::StoreApp => self.store_remove_dialog(ui),
                 _ => self.app_menu_box(ui),
             }
             let layer = self.finish_gray();
@@ -856,6 +861,7 @@ impl Renderer {
             kl_core::store::StoreTab::Today => ("Today", 0),
             kl_core::store::StoreTab::Apps => ("Apps", 1),
             kl_core::store::StoreTab::Updates => ("Updates", 2),
+            kl_core::store::StoreTab::Search => ("Search", 3),
         };
         self.text(Text { text: title, x: 40.0, y: 50.0, w: (l.width - 80) as f32, size: 84.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         let refresh = if ui.store_busy { "Updating" } else { "Refresh" };
@@ -865,9 +871,37 @@ impl Renderer {
             kl_core::store::StoreTab::Today => self.store_today(ui),
             kl_core::store::StoreTab::Apps => self.store_rows(ui, &ui.store_apps(), "No apps yet. The store lists the apps once its catalog has been downloaded."),
             kl_core::store::StoreTab::Updates => self.store_rows(ui, &ui.store_updates(), "Nothing from the store yet. Apps you get here, and their updates, are listed here."),
+            kl_core::store::StoreTab::Search => self.store_search(ui),
         }
-        self.store_tab_bar(&l, active);
-        self.store_notice(ui, l.store_tabs().y - 120);
+        if !ui.store_search_keyboard {
+            self.store_tab_bar(&l, active);
+            self.store_notice(ui, l.store_tabs().y - 120);
+        }
+    }
+
+    fn store_search(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let field = l.store_search_field();
+        let query = ui.store_query.string();
+        let inner = field.inset(26);
+        let (shown, ink) = if query.is_empty() { ("Search apps", 85) } else { (query.as_str(), BLACK) };
+        self.rounded_frame(field, 22.0, 3, BLACK, WHITE);
+        self.text(Text { text: shown, x: inner.x as f32, y: (inner.y + 4) as f32, w: inner.w as f32, size: 36.0, bold: false, align: Align::Start, lines: 1, gray: ink });
+        if ui.store_search_keyboard && !query.is_empty() {
+            let before: String = ui.store_query.text[..ui.store_query.caret].iter().collect();
+            let x = (inner.x + self.text_width(&before, 36.0, false) as i32).min(inner.right());
+            self.fill(Rect::new(x, inner.y + 2, 3, inner.h - 4), BLACK);
+        }
+        let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "No apps match your search." };
+        self.store_rows(ui, &ui.store_search(&query), empty);
+        if ui.store_search_keyboard {
+            let area = l.keyboard_area();
+            self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
+            for (key, r) in l.keyboard_keys_with(ui.store_query.layer, "Search") {
+                self.key(&key, r, ui.pressed_key == Some(r));
+            }
+            self.store_notice(ui, 160);
+        }
     }
 
     /// The notice (what happened: a refresh, an install, a removal), on the store's screens.
@@ -907,21 +941,24 @@ impl Renderer {
 
     /// A paged list of entries (the Apps or Updates tab), with its page label, or a message when it is empty.
     fn store_rows(&mut self, ui: &Ui, indices: &[usize], empty: &str) {
-        let l = ui.layout;
         if indices.is_empty() {
             self.store_empty(empty);
             return;
         }
-        let per = l.store_rows_per_page();
-        let on_page: Vec<usize> = indices.iter().skip(ui.store_page * per).take(per).copied().collect();
-        for (i, &idx) in on_page.iter().enumerate() {
-            self.store_row(&ui.store[idx], l.store_list_row(i));
+        let per = ui.store_rows_per_page();
+        for (i, &idx) in indices.iter().skip(ui.store_page * per).take(per).enumerate() {
+            self.store_row(&ui.store[idx], ui.store_list_row(i));
         }
         let pages = ui.store_pages();
         if pages > 1 {
             let label = format!("{} of {}", ui.store_page + 1, pages);
-            let p = l.store_page_label();
+            let p = ui.store_page_label();
             self.text(Text { text: &label, x: p.x as f32, y: (p.y + 14) as f32, w: p.w as f32, size: 28.0, bold: true, align: Align::Center, lines: 1, gray: 85 });
+            for (visible, label, align) in [(ui.store_page > 0, "‹  Previous", Align::Start), (ui.store_page + 1 < pages, "Next  ›", Align::End)] {
+                if visible {
+                    self.text(Text { text: label, x: 40.0, y: (p.y + 14) as f32, w: (p.w - 80) as f32, size: 28.0, bold: true, align, lines: 1, gray: BLACK });
+                }
+            }
         }
     }
 
@@ -978,11 +1015,11 @@ impl Renderer {
         self.text(Text { text: &letter, x: tile.x as f32, y: tile.y as f32 + (tile.h as f32 - size * 1.25) / 2.0, w: tile.w as f32, size, bold: true, align: Align::Center, lines: 1, gray: ink });
     }
 
-    /// The floating tab bar: a capsule with three tabs; the active one is filled.
+    /// The floating tab bar: the active tab is filled.
     fn store_tab_bar(&mut self, l: &kl_core::Layout, active: usize) {
         let t = l.store_tabs();
         self.rounded_frame(t, 65.0, 3, BLACK, WHITE);
-        let names = ["Today", "Apps", "Updates"];
+        let names = ["Today", "Apps", "Updates", "Search"];
         for (i, name) in names.iter().enumerate() {
             let r = l.store_tab(i);
             let on = i == active;
@@ -995,7 +1032,7 @@ impl Renderer {
         }
     }
 
-    /// The tab glyphs: a star (Today), four squares (Apps), a tray with an arrow (Updates).
+    /// The tab glyphs: a star, four squares, a tray with an arrow, and a magnifying glass.
     fn tab_glyph(&mut self, i: usize, cx: f64, cy: f64, s: f64, ink: u8) {
         self.ctx.set_transform(Affine::IDENTITY);
         self.ctx.set_paint(gray(ink));
@@ -1023,7 +1060,7 @@ impl Renderer {
                     self.ctx.fill_path(&kurbo::RoundedRect::new(x0, y0, x0 + q, y0 + q, 0.1 * s).to_path(0.1));
                 }
             }
-            _ => {
+            2 => {
                 self.ctx.fill_path(&kurbo::RoundedRect::new(cx - 0.07 * s, cy - 0.5 * s, cx + 0.07 * s, cy + 0.12 * s, 0.02 * s).to_path(0.1));
                 let mut arrow = kurbo::BezPath::new();
                 arrow.move_to((cx - 0.3 * s, cy - 0.08 * s));
@@ -1033,7 +1070,77 @@ impl Renderer {
                 self.ctx.fill_path(&arrow);
                 self.ctx.fill_path(&kurbo::RoundedRect::new(cx - 0.42 * s, cy + 0.36 * s, cx + 0.42 * s, cy + 0.46 * s, 0.04 * s).to_path(0.1));
             }
+            _ => {
+                let lens = (cx - 0.10 * s, cy - 0.10 * s);
+                self.ctx.fill_path(&kurbo::Circle::new(lens, 0.36 * s).to_path(0.1));
+                let mut handle = kurbo::BezPath::new();
+                handle.move_to((cx + 0.08 * s, cy + 0.17 * s));
+                handle.line_to((cx + 0.17 * s, cy + 0.08 * s));
+                handle.line_to((cx + 0.48 * s, cy + 0.39 * s));
+                handle.line_to((cx + 0.39 * s, cy + 0.48 * s));
+                handle.close_path();
+                self.ctx.fill_path(&handle);
+                self.ctx.set_paint(gray(if ink == BLACK { WHITE } else { BLACK }));
+                self.ctx.fill_path(&kurbo::Circle::new(lens, 0.24 * s).to_path(0.1));
+            }
         }
+    }
+
+    fn store_install_sheet(&mut self, ui: &Ui) {
+        let Some(entry) = ui.store_sheet.and_then(|index| ui.store.get(index)) else { return };
+        let l = ui.layout;
+        let sheet = l.store_sheet();
+        let inner = sheet.inset(48);
+        self.rounded_frame(sheet, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        let x = inner.x as f32;
+        let y = inner.y as f32;
+        let w = inner.w as f32;
+        self.text(Text { text: &entry.name, x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        if let Some(progress) = &ui.store_progress {
+            self.text(Text { text: progress, x, y: y + 136.0, w, size: 38.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+            if let Some(percent) = ui.store_progress_percent {
+                let gap = 12;
+                let width = (inner.w - 9 * gap) / 10;
+                for i in 0..10 {
+                    let segment = Rect::new(inner.x + i * (gap + width), inner.y + 264, width, 36);
+                    if i < i32::from(percent / 10) {
+                        self.rounded(segment, 8.0, BLACK);
+                    } else {
+                        self.rounded_frame(segment, 8.0, 2, BLACK, WHITE);
+                    }
+                }
+            }
+            self.text(Text { text: "Keep this screen open until the install finishes.", x, y: y + 362.0, w, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+            return;
+        }
+        if let Some(size) = entry.size {
+            let size = format!("{} download", kl_core::store::format_size(size));
+            self.text(Text { text: &size, x, y: y + 80.0, w, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+        }
+        self.text(Text { text: "What this app changes", x, y: y + 150.0, w, size: 38.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        let changes = entry.changes.join("\n");
+        self.text(Text { text: &changes, x, y: y + 216.0, w, size: 30.0, bold: false, align: Align::Start, lines: 7, gray: BLACK });
+        if entry.system_changes {
+            self.text(Text { text: "This app may change how your Kindle starts or runs.", x, y: y + 500.0, w, size: 30.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        }
+        let [cancel, install] = l.store_sheet_buttons();
+        let label = if matches!(entry.status, kl_core::store::Status::Update { .. }) { "Update" } else { "Install" };
+        self.button(cancel, "Cancel", false);
+        self.button(install, label, true);
+    }
+
+    fn store_remove_dialog(&mut self, ui: &Ui) {
+        let Some(entry) = ui.store_open.and_then(|index| ui.store.get(index)) else { return };
+        let l = ui.layout;
+        let sheet = l.confirm_box();
+        let inner = sheet.inset(48);
+        self.rounded_frame(sheet, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        self.text(Text { text: "Remove from this Kindle?", x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        let explanation = format!("This removes {} from this Kindle. You can install it again from the store.", entry.name);
+        self.text(Text { text: &explanation, x: inner.x as f32, y: (inner.y + 100) as f32, w: inner.w as f32, size: 36.0, bold: false, align: Align::Start, lines: 4, gray: BLACK });
+        let [(_, cancel), (_, remove)] = l.confirm_buttons();
+        self.button(cancel, "Cancel", false);
+        self.button(remove, "Remove", true);
     }
 
     /// A product page. The header (back) stays at the top; the rest scrolls by `ui.store_scroll`.
