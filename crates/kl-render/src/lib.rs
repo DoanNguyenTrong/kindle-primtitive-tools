@@ -309,10 +309,14 @@ impl Renderer {
 
     /// Lay out and draw text. Returns the height used.
     fn text(&mut self, t: Text) -> f32 {
+        self.text_with_wrap(t, parley::OverflowWrap::Normal)
+    }
+
+    fn text_with_wrap(&mut self, t: Text, overflow: parley::OverflowWrap) -> f32 {
         let mut content = t.text.to_string();
         // Shorten until it fits in `lines` lines.
         loop {
-            let layout = self.layout_text(&content, t.size, t.bold, t.w);
+            let layout = self.layout_with_wrap(&content, t.size, t.bold, t.w, overflow);
             let count = layout.lines().count();
             if count <= t.lines || content.chars().count() <= 1 {
                 return self.draw_layout(&layout, &t);
@@ -326,10 +330,15 @@ impl Renderer {
     }
 
     fn layout_text(&mut self, text: &str, size: f32, bold: bool, w: f32) -> parley::Layout<()> {
+        self.layout_with_wrap(text, size, bold, w, parley::OverflowWrap::Normal)
+    }
+
+    fn layout_with_wrap(&mut self, text: &str, size: f32, bold: bool, w: f32, overflow: parley::OverflowWrap) -> parley::Layout<()> {
         let mut builder = self.layout_cx.ranged_builder(&mut self.fonts, text, 1.0, true);
         builder.push_default(StyleProperty::FontSize(size));
         builder.push_default(StyleProperty::FontWeight(if bold { FontWeight::BOLD } else { FontWeight::NORMAL }));
         builder.push_default(StyleProperty::LineHeight(parley::LineHeight::FontSizeRelative(1.25)));
+        builder.push_default(StyleProperty::OverflowWrap(overflow));
         let mut layout: parley::Layout<()> = builder.build(text);
         layout.break_all_lines(Some(w));
         layout

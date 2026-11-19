@@ -33,6 +33,13 @@ pub trait App {
     fn draw(&self, canvas: &mut Canvas);
     fn input(&mut self, input: Input) -> Change;
 
+    fn press_point(&self, input: Input) -> Option<(f32, f32)> {
+        match input {
+            Input::Tap(x, y) => Some((x, y)),
+            _ => None,
+        }
+    }
+
     fn deadline(&self) -> Option<Instant> {
         None
     }
@@ -82,6 +89,26 @@ impl Lifecycle {
         let changed = self.usb_drive != active;
         self.usb_drive = active;
         changed
+    }
+
+    /// Draw the pressed style before the app receives the action. Normal frames clear it.
+    pub fn press_feedback(
+        &self,
+        app: &impl App,
+        canvas: &mut Canvas,
+        input: Input,
+        dark: bool,
+    ) -> Option<Vec<u8>> {
+        if !self.is_awake() || self.usb_drive {
+            return None;
+        }
+        let (x, y) = app.press_point(input)?;
+        if !canvas.press_at(x, y) {
+            return None;
+        }
+        let pressed_frame = frame(app, canvas, dark);
+        canvas.clear_press();
+        Some(pressed_frame)
     }
 
     pub fn input(
@@ -289,10 +316,21 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         let usb_drive = managed_storage && !user_storage_is_mounted();
         let usb_changed = lifecycle.set_usb_drive(usb_drive);
         let usb_redraw = matches!(event, Ok(Ev::UsbRedraw));
+        let mut pressed = false;
         let change = match event {
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if !usb_drive => app.tick(Instant::now()),
-            Ok(Ev::Input(input)) => lifecycle.input(&mut app, input, on_save_error),
+            Ok(Ev::Input(input)) => {
+                if !usb_changed {
+                    if let Some(image) =
+                        lifecycle.press_feedback(&app, &mut canvas, input, settings.dark_mode)
+                    {
+                        display.show(image, &settings, false);
+                        pressed = true;
+                    }
+                }
+                lifecycle.input(&mut app, input, on_save_error)
+            }
             Ok(Ev::Turn(rotation)) if settings.auto_rotation && rotation != settings.rotation => {
                 settings.rotation = rotation;
                 input::TURN.store(rotation.turn(), Ordering::Relaxed);
@@ -331,9 +369,9 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             change
         };
         match change {
-            Change::None => {}
+            Change::None if !pressed => {}
             Change::Exit => break,
-            Change::Partial | Change::Full => {
+            Change::None | Change::Partial | Change::Full => {
                 let image = frame(&app, &mut canvas, settings.dark_mode);
                 display.show(image, &settings, change == Change::Full);
             }

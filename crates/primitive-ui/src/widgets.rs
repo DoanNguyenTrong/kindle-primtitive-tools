@@ -67,7 +67,7 @@ impl Rows<'_> {
             let Some(rect) = self.row_rect(index) else {
                 continue;
             };
-            let active = pressed == Some(index);
+            let active = canvas.control_pressed(rect, pressed == Some(index));
             if active {
                 canvas.panel(rect.inset(canvas.px(6)), 16, 2, BLACK);
             }
@@ -170,7 +170,8 @@ impl TabBar<'_> {
                 continue;
             };
             let inset = rect.inset(canvas.px(8));
-            let active = (index == self.selected) != (pressed == Some(index));
+            let active =
+                (index == self.selected) != canvas.control_pressed(rect, pressed == Some(index));
             if active {
                 canvas.circle(inset, BLACK);
             }

@@ -13,6 +13,19 @@ struct Picture {
     after_popups: usize,
 }
 
+enum TouchRegion {
+    Control(Rect),
+    Cover(Rect),
+}
+
+impl TouchRegion {
+    fn bounds(&self) -> Rect {
+        match *self {
+            Self::Control(rect) | Self::Cover(rect) => rect,
+        }
+    }
+}
+
 /// Text alignment inside its bounds.
 #[derive(Clone, Copy)]
 pub enum Align {
@@ -27,6 +40,8 @@ pub struct Canvas {
     bounds: Rect,
     pictures: Vec<Picture>,
     popup_covers: Vec<(Rect, f32)>,
+    touch_regions: Vec<TouchRegion>,
+    pressed: Option<usize>,
 }
 
 impl Canvas {
@@ -36,6 +51,8 @@ impl Canvas {
             bounds: Rect::new(0, 0, width as i32, height as i32),
             pictures: Vec::new(),
             popup_covers: Vec::new(),
+            touch_regions: Vec::new(),
+            pressed: None,
         })
     }
 
@@ -53,6 +70,7 @@ impl Canvas {
         self.renderer.fill(self.bounds, WHITE);
         self.pictures.clear();
         self.popup_covers.clear();
+        self.touch_regions.clear();
     }
 
     pub fn finish(&mut self, dark: bool) -> Vec<u8> {
@@ -86,6 +104,8 @@ impl Canvas {
     }
 
     pub fn popup(&mut self, rect: Rect) {
+        // The modal now receives taps, including taps outside its frame that dismiss it.
+        self.touch_regions.push(TouchRegion::Cover(self.bounds));
         let halo = self.px(10);
         let cover = rect.inset(-halo);
         let radius = self.px(38);
@@ -133,17 +153,20 @@ impl Canvas {
         let clip = super::kurbo::Shape::to_path(&super::krect(rect), 0.1);
         self.renderer.ctx.set_transform(super::Affine::IDENTITY);
         self.renderer.ctx.push_clip_layer(&clip);
-        self.renderer.text(Text {
-            text: content,
-            x: rect.x as f32,
-            y: rect.y as f32,
-            w: rect.w as f32,
-            size: self.px(style.size).max(1) as f32,
-            bold: style.bold,
-            align,
-            lines: style.lines,
-            gray: style.ink,
-        });
+        self.renderer.text_with_wrap(
+            Text {
+                text: content,
+                x: rect.x as f32,
+                y: rect.y as f32,
+                w: rect.w as f32,
+                size: self.px(style.size).max(1) as f32,
+                bold: style.bold,
+                align,
+                lines: style.lines,
+                gray: style.ink,
+            },
+            style.overflow,
+        );
         self.renderer.ctx.pop_layer();
     }
 
@@ -151,6 +174,38 @@ impl Canvas {
         self.renderer
             .text_width(content, self.px(size).max(1) as f32, false)
             .ceil() as i32
+    }
+
+    /// Byte ranges for pages using the same line breaks as `text`.
+    pub fn text_pages(
+        &mut self,
+        rect: Rect,
+        content: &str,
+        style: TextStyle,
+    ) -> Vec<std::ops::Range<usize>> {
+        if rect.w <= 0 || content.is_empty() || style.lines == 0 {
+            return Vec::new();
+        }
+        let layout = self.renderer.layout_with_wrap(
+            content,
+            self.px(style.size).max(1) as f32,
+            style.bold,
+            rect.w as f32,
+            style.overflow,
+        );
+        let mut starts = layout
+            .lines()
+            .step_by(style.lines)
+            .map(|line| line.text_range().start)
+            .peekable();
+        let mut pages = Vec::new();
+        while let Some(start) = starts.next() {
+            let end = starts.peek().copied().unwrap_or(content.len());
+            if start < end {
+                pages.push(start..end);
+            }
+        }
+        pages
     }
 
     /// Draw an editable single line, keeping the editor's caret in view. Masked fields show one bullet per character.
@@ -166,7 +221,7 @@ impl Canvas {
     }
 
     pub fn button(&mut self, rect: Rect, label: &str, primary: bool, pressed: bool) {
-        let filled = primary != pressed;
+        let filled = primary != self.control_pressed(rect, pressed);
         self.panel(rect, 16, 4, if filled { BLACK } else { WHITE });
         let top = (rect.h - self.px(45)).max(0) / 2;
         self.text(
@@ -182,6 +237,35 @@ impl Canvas {
                 .center()
                 .ink(if filled { WHITE } else { BLACK }),
         );
+    }
+
+    /// Register a manually drawn control and return its pressed style for the current frame.
+    /// Standard buttons, keyboard keys, and shared widgets register their own regions.
+    pub fn control_pressed(&mut self, rect: Rect, pressed: bool) -> bool {
+        let index = self.touch_regions.len();
+        self.touch_regions.push(TouchRegion::Control(rect));
+        pressed || self.pressed == Some(index)
+    }
+
+    /// Read the live feedback state after a shared widget has drawn its controls.
+    pub fn is_control_pressed(&self, rect: Rect) -> bool {
+        self.pressed
+            .and_then(|index| self.touch_regions.get(index))
+            .is_some_and(|target| matches!(target, TouchRegion::Control(area) if *area == rect))
+    }
+
+    /// Select the topmost visible control from the previous draw for a pre-action feedback frame.
+    pub fn press_at(&mut self, x: f32, y: f32) -> bool {
+        self.pressed = self
+            .touch_regions
+            .iter()
+            .rposition(|region| region.bounds().contains(x, y))
+            .filter(|&index| matches!(self.touch_regions[index], TouchRegion::Control(_)));
+        self.pressed.is_some()
+    }
+
+    pub fn clear_press(&mut self) {
+        self.pressed = None;
     }
 
     pub fn icon(&mut self, rect: Rect, icon: Icon, ink: u8) {
@@ -211,10 +295,12 @@ impl Canvas {
     ) {
         let layout = Layout::new(self.bounds.w as u32, self.bounds.h as u32, 4, 5);
         let band = layout.keyboard_area();
+        self.touch_regions.push(TouchRegion::Cover(band));
         self.fill(band, WHITE);
         self.fill(Rect::new(band.x, band.y, band.w, 2), 226);
         for (key, rect) in layout.keyboard_keys_with(layer, done) {
-            self.renderer.key(&key, rect, pressed == Some(rect));
+            let active = self.control_pressed(rect, pressed == Some(rect));
+            self.renderer.key(&key, rect, active);
         }
     }
 }
@@ -353,6 +439,7 @@ pub struct TextStyle {
     align: Align,
     lines: usize,
     ink: u8,
+    overflow: parley::OverflowWrap,
 }
 
 impl TextStyle {
@@ -363,11 +450,17 @@ impl TextStyle {
             align: Align::Left,
             lines: 1,
             ink: BLACK,
+            overflow: parley::OverflowWrap::Normal,
         }
     }
 
     pub const fn bold(mut self) -> Self {
         self.bold = true;
+        self
+    }
+
+    pub const fn break_long_words(mut self) -> Self {
+        self.overflow = parley::OverflowWrap::Anywhere;
         self
     }
 
