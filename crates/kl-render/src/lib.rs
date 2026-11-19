@@ -6,6 +6,7 @@
 
 pub mod component;
 pub mod image;
+mod settings_management;
 
 use std::collections::HashMap;
 
@@ -87,6 +88,8 @@ pub struct Renderer {
     pixmap: Pixmap,
     fonts: FontContext,
     layout_cx: LayoutContext<()>,
+    large_text: bool,
+    high_contrast: bool,
     icons: HashMap<String, GrayImage>,
     /// The launcher's own sleep screen picture, when one is set (screensavers folder).
     sleep_image: Option<GrayImage>,
@@ -170,6 +173,8 @@ impl Renderer {
             pixmap: Pixmap::new(w, h),
             fonts,
             layout_cx: LayoutContext::new(),
+            large_text: false,
+            high_contrast: false,
             icons: HashMap::new(),
             sleep_image: None,
             store_blits: Vec::new(),
@@ -342,6 +347,7 @@ impl Renderer {
     }
 
     fn layout_with_wrap(&mut self, text: &str, size: f32, bold: bool, w: f32, overflow: parley::OverflowWrap) -> parley::Layout<()> {
+        let size = if self.large_text { size * 1.15 } else { size };
         let mut builder = self.layout_cx.ranged_builder(&mut self.fonts, text, 1.0, true);
         builder.push_default(StyleProperty::FontSize(size));
         builder.push_default(StyleProperty::FontWeight(if bold { FontWeight::BOLD } else { FontWeight::NORMAL }));
@@ -354,6 +360,7 @@ impl Renderer {
 
     fn draw_layout(&mut self, layout: &parley::Layout<()>, t: &Text) -> f32 {
         let mut height = 0.0;
+        let ink = if self.high_contrast && t.gray < 128 { BLACK } else { t.gray };
         for line in layout.lines().take(t.lines) {
             let m = line.metrics();
             let dx = match t.align {
@@ -366,7 +373,7 @@ impl Renderer {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else { continue };
                 let run = glyph_run.run();
                 self.ctx.set_transform(Affine::translate(((t.x + dx) as f64, t.y as f64)));
-                self.ctx.set_paint(gray(t.gray));
+                self.ctx.set_paint(gray(ink));
                 let _ = self
                     .ctx
                     .glyph_run(&mut self.resources, run.font())
@@ -428,6 +435,9 @@ impl Renderer {
 
     /// Draw the current screen. Returns `width × height` gray pixels, upright.
     pub fn draw(&mut self, ui: &Ui, status: &Status) -> Vec<u8> {
+        let launcher = !matches!(ui.screen, Screen::Store | Screen::StoreApp);
+        self.large_text = launcher && status.large_text;
+        self.high_contrast = launcher && status.high_contrast;
         // While the drive is shown on a computer, the drive-mode screen is all there is.
         if ui.usb == kl_core::Usb::Drive {
             return self.usb_drive_frame(ui);
@@ -634,6 +644,9 @@ impl Renderer {
         // Round icon buttons, above the sliders: black with a white icon when on, outlined when off, with a small
         // caption underneath.
         for (tile, slot) in l.quick_buttons() {
+            if tile == QuickTile::AutoRotate && !s.display_support.auto_rotation {
+                continue;
+            }
             let (label, on) = match tile {
                 QuickTile::Airplane => ("Airplane", !s.wifi_on),
                 QuickTile::AutoRotate => ("Auto-rotate", s.auto_rotation),
@@ -664,31 +677,47 @@ impl Renderer {
             self.text(Text { text: label, x: slot.x as f32, y: (c.bottom() + 6) as f32, w: slot.w as f32, size: 24.0, bold: false, align: Align::Center, lines: 1, gray: BLACK });
         }
         for row in 0..2 {
-            let (icon, label, level) =
-                if row == 0 { (primitive_quick::icons::SUN, "Brightness", s.light) } else { (primitive_quick::icons::WARMTH, "Warmth", s.warmth) };
+            let (icon, label, value, available) = if row == 0 {
+                (primitive_quick::icons::SUN, "Front light", s.light, s.display_support.front_light)
+            } else {
+                (primitive_quick::icons::WARMTH, "Warmth", s.warmth, s.display_support.warmth)
+            };
             let r = l.quick_row(row);
             self.draw_icon(icon, (r.x + 28) as f64, (r.y + 14) as f64, 40.0, BLACK);
             self.text(Text { text: label, x: (r.x + 92) as f32, y: (r.y + 18) as f32, w: 400.0, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: BLACK });
-            let value = level.to_string();
-            self.text(Text { text: &value, x: 0.0, y: (r.y + 22) as f32, w: (r.w - 28) as f32, size: 26.0, bold: false, align: Align::End, lines: 1, gray: 85 });
-            let bar = l.quick_bar(row);
-            let gap = 3;
-            let step = (bar.w - gap * QUICK_LEVEL_MAX as i32) / (QUICK_LEVEL_MAX as i32 + 1);
-            for n in 0..=QUICK_LEVEL_MAX as i32 {
-                let seg = Rect::new(bar.x + n * (step + gap), bar.y, step, bar.h);
-                if n <= level.min(QUICK_LEVEL_MAX) as i32 {
-                    self.rounded(seg, 6.0, BLACK);
-                } else {
-                    self.rounded_frame(seg, 6.0, 2, 189, WHITE);
-                }
+            let level = if available { value.to_string() } else { "Unavailable".into() };
+            self.text(Text { text: &level, x: 0.0, y: (r.y + 22) as f32, w: (r.w - 28) as f32, size: 26.0, bold: false, align: Align::End, lines: 1, gray: 85 });
+            if available {
+                self.level_bar(l.quick_bar(row), value);
+                self.round_button(l.quick_minus(row), false);
+                self.round_button(l.quick_plus(row), true);
             }
-            self.round_button(l.quick_minus(row), false);
-            self.round_button(l.quick_plus(row), true);
         }
         self.quick_system(l, s);
         let handle = l.quick_handle();
         self.stroke_icon("M6 15 L12 9 L18 15", (handle.x + handle.w / 2 - 16) as f64, (handle.y + 8) as f64, 32.0, 2.4, BLACK);
         self.text(Text { text: "Swipe up to close", x: handle.x as f32, y: (handle.y + 40) as f32, w: handle.w as f32, size: 24.0, bold: false, align: Align::Center, lines: 1, gray: BLACK });
+    }
+
+    fn level_bar(&mut self, bar: Rect, level: u32) {
+        let steps = QUICK_LEVEL_MAX as i32 + 1;
+        let gap = (bar.w / steps / 3).clamp(0, 3);
+        for n in 0..steps {
+            let start = n * bar.w / steps;
+            let end = (n + 1) * bar.w / steps;
+            let width = end - start - if n + 1 == steps { 0 } else { gap };
+            if width <= 0 {
+                continue;
+            }
+            let segment = Rect::new(bar.x + start, bar.y, width, bar.h);
+            let radius = f64::from(width.min(12)) / 2.0;
+            if n as u32 <= level.min(QUICK_LEVEL_MAX) {
+                self.rounded(segment, radius, BLACK);
+            } else {
+                let border = if self.high_contrast { 100 } else { 189 };
+                self.rounded_frame(segment, radius, 2, border, WHITE);
+            }
+        }
     }
 
     /// A shared icon (`primitive-quick`) at (`x`, `y`), `size` pixels, in gray `v`: its stroked paths, then its filled ones.
@@ -1666,7 +1695,7 @@ impl Renderer {
         let l = ui.layout;
         self.text(Text { text: "Settings", x: 40.0, y: 36.0, w: 700.0, size: 64.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.button(l.done_button(), "Done", true);
-        for (header, card, rows) in l.home_sections() {
+        for (header, card, rows) in l.home_sections(ui.settings_index) {
             if !header.is_empty() {
                 self.section_header(card.x, card.y - 44, header);
             }
@@ -1682,6 +1711,7 @@ impl Renderer {
                 }
             }
         }
+        self.settings_pager(l, ui.settings_index, l.settings_pages());
     }
 
     /// One page of Settings: its title and Back, then its sections (header, card of rows, footer). The Wi-Fi page
@@ -1700,6 +1730,9 @@ impl Renderer {
             self.file_transfer_page(ui);
             return;
         }
+        if page == kl_core::layout::Page::AppVisibility {
+            self.settings_visibility(ui);
+        }
         for section in l.page_sections(page) {
             self.section_header(section.card.x, section.header_y, section.header);
             self.card(section.card);
@@ -1717,10 +1750,18 @@ impl Renderer {
         if page == kl_core::layout::Page::Wifi {
             self.wifi_list(ui, s);
         }
+        if page == kl_core::layout::Page::Battery {
+            self.battery_history(l, s);
+        }
         // A result of an action on this page (a Wi-Fi join, an SSH check or password): shown at the bottom on every page.
         if let Some(notice) = ui.notice.clone() {
             let width = (l.width - 2 * MARGIN_X) as f32;
-            self.text(Text { text: &notice, x: MARGIN_X as f32, y: (l.height - 84) as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+            let y = if page == kl_core::layout::Page::AppVisibility && ui.visibility_pages() > 1 {
+                l.footer().y - 76
+            } else {
+                l.height - 84
+            };
+            self.text(Text { text: &notice, x: MARGIN_X as f32, y: y as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
         }
     }
 
@@ -1747,21 +1788,47 @@ impl Renderer {
     fn setting_row(&mut self, ui: &Ui, s: &Status, row: &kl_core::layout::SettingsRow) {
         let r = row.rect;
         let value = row_value(row.row, ui, s);
-        let (label_w, text_x) = (r.w as f32 - 360.0, (r.x + 32) as f32);
+        let level = match row.row {
+            Row::Frontlight if s.display_support.front_light => Some(s.light),
+            Row::Warmth if s.display_support.warmth => Some(s.warmth),
+            _ => None,
+        };
+        let label_w = if level.is_some() { (r.w / 3 - 52) as f32 } else { r.w as f32 - 360.0 };
+        let text_x = (r.x + 32) as f32;
         self.text(Text { text: row.row.label(), x: text_x, y: (r.y + 20) as f32, w: label_w, size: 36.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.text(Text { text: &value, x: text_x, y: (r.y + 66) as f32, w: label_w, size: 27.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+        if let Some(value) = level {
+            self.level_bar(kl_core::layout::setting_level_bar(r), value);
+        }
+        match row.row {
+            Row::BatteryReading => {
+                if let Some(percent) = s.power.percent {
+                    self.level_meter(r, u64::from(percent), 100);
+                }
+            }
+            Row::StorageUsage if ui.usb != kl_core::Usb::Drive => {
+                if let Some((used, total)) = s.system.storage {
+                    self.level_meter(r, used, total);
+                }
+            }
+            _ => {}
+        }
         for &(b, rect) in &row.buttons {
             match b {
-                Button::LightDown | Button::WarmDown => self.round_button(rect, false),
-                Button::LightUp | Button::WarmUp => self.round_button(rect, true),
-                Button::RotationAuto => self.switch(rect, s.auto_rotation),
+                Button::LightDown | Button::WarmDown if level.is_some() => self.round_button(rect, false),
+                Button::LightUp | Button::WarmUp if level.is_some() => self.round_button(rect, true),
+                Button::RotationAuto if s.display_support.auto_rotation => self.switch(rect, s.auto_rotation),
                 Button::ShowHidden => self.button(rect, "Show all", false),
+                Button::OpenPage(_) | Button::ManageInstalled | Button::GridColumns | Button::GridRows => self.chevron(r),
+                Button::LowPower => self.switch(switch_rect(r), s.low_power),
                 Button::KindleUi => self.chevron(r),
                 Button::Restart => {}
                 Button::Rotation => {}
                 Button::Wifi => self.switch(switch_rect(r), s.wifi_on),
                 Button::DarkMode => self.switch(switch_rect(r), s.dark_mode),
                 Button::Animation => self.switch(switch_rect(r), s.animation),
+                Button::LargeText => self.switch(switch_rect(r), s.large_text),
+                Button::HighContrast => self.switch(switch_rect(r), s.high_contrast),
                 Button::Ssh => self.switch(switch_rect(r), s.ssh),
                 Button::Autostart => self.switch(switch_rect(r), s.autostart),
                 Button::SleepScreen => self.switch(switch_rect(r), s.sleep_launcher),
@@ -1845,6 +1912,9 @@ impl Renderer {
         let rows = [
             ("System", SYSTEM_NAME.into()),
             ("Launcher version", ui.version.clone()),
+            ("Device profile", ui.device_profile.clone().unwrap_or_else(|| "Unavailable".into())),
+            ("Kindle firmware", ui.firmware.clone().unwrap_or_else(|| "Unavailable".into())),
+            ("USB", settings_management::usb_status(ui.usb).into()),
             ("Apps", ui.apps().len().to_string()),
             ("Memory", if s.memory.is_empty() { "unknown".into() } else { s.memory.clone() }),
             ("Storage", s.storage.clone()),
@@ -1877,7 +1947,7 @@ impl Renderer {
 
     /// A hairline between rows, from `x0` to `x1` at `y`.
     fn hairline(&mut self, y: i32, x0: i32, x1: i32) {
-        self.fill(Rect::new(x0, y, x1 - x0, 2), 200);
+        self.fill(Rect::new(x0, y, x1 - x0, 2), if self.high_contrast { 105 } else { 200 });
     }
 
     /// A switch: a pill with a knob, black and knob-right when on; outlined and knob-left when off.
@@ -1997,15 +2067,24 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
     let onoff = |on: bool| if on { "on" } else { "off" };
     match page {
         Page::Wifi => wifi_word(s),
-        Page::Display => format!("Frontlight {} · Dark mode {} · Animation {}", s.light, onoff(s.dark_mode), onoff(s.animation)),
+        Page::Display => format!("Front light {} · Dark mode {}", light_description(s.light, s.display_support.front_light), onoff(s.dark_mode)),
+        Page::Accessibility => format!("Larger text {} · Higher contrast {}", onoff(s.large_text), onoff(s.high_contrast)),
         Page::Sleep => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },
         Page::Apps => format!("{} hidden", ui.hidden_count()),
+        Page::AppVisibility => format!("{} hidden", ui.hidden_count()),
+        Page::Battery => settings_management::battery_status(s),
+        Page::Storage => settings_management::storage_status(ui, s),
+        Page::Store if s.low_power && ui.store_daily_check => "Daily update check paused".into(),
         Page::Store => format!("Daily update check {}", onoff(ui.store_daily_check)),
         Page::Connection => format!("SSH {} · Public DNS {}", onoff(s.ssh), onoff(s.public_dns)),
         Page::FileTransfer => "Send documents from another device".into(),
         Page::Device => format!("Start with the Kindle {}", onoff(s.autostart)),
         Page::About => format!("{SYSTEM_NAME} · Launcher {}", ui.version),
     }
+}
+
+fn light_description(level: u32, available: bool) -> String {
+    if available { format!("{level} / {QUICK_LEVEL_MAX}") } else { "Unavailable".into() }
 }
 
 /// The Wi-Fi state as a word: Off, On, or the network state.
@@ -2020,8 +2099,11 @@ fn wifi_word(s: &Status) -> String {
 /// The value a setting row shows.
 fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
     match row {
-        Row::Frontlight => format!("{} / 24", s.light),
-        Row::Warmth => format!("{} / 24", s.warmth),
+        Row::Frontlight => light_description(s.light, s.display_support.front_light),
+        Row::Warmth => light_description(s.warmth, s.display_support.warmth),
+        Row::LargeText => if s.large_text { "On".into() } else { "Off".into() },
+        Row::HighContrast => if s.high_contrast { "On".into() } else { "Off".into() },
+        Row::TextPreview => "Read at your own pace.".into(),
         Row::Wifi => wifi_word(s),
         Row::DarkMode => if s.dark_mode { "On: white on black".into() } else { "Off".into() },
         Row::Animation => if s.animation { "On: a zoom when an app opens".into() } else { "Off".into() },
@@ -2042,7 +2124,20 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
             0 => "None. Long-press to hide".into(),
             n => format!("{n} hidden"),
         },
+        Row::AppVisibility => format!("{} hidden", ui.hidden_count()),
+        Row::ManageInstalled => ui.managed_count.map_or_else(|| "Open in Store".into(), |count| format!("{count} in Store")),
+        Row::GridColumns => ui.layout.cols.to_string(),
+        Row::GridRows => ui.layout.rows.to_string(),
+        Row::BatteryReading => settings_management::battery_status(s),
+        Row::LowPower => if s.low_power { "On".into() } else { "Off".into() },
+        Row::BatteryDisplay => light_description(s.light, s.display_support.front_light),
+        Row::BatteryWifi => wifi_word(s),
+        Row::StoreSettings if s.low_power && ui.store_daily_check => "Daily check paused".into(),
+        Row::StoreSettings => if ui.store_daily_check { "Daily check on".into() } else { "Daily check off".into() },
+        Row::StorageUsage => settings_management::storage_status(ui, s),
+        Row::DeviceAbout => ui.firmware.as_ref().map_or_else(|| "Device profile and firmware".into(), |version| format!("Kindle firmware {version}")),
         Row::KindleUi => "Stock Kindle UI".into(),
+        Row::StoreDailyCheck if s.low_power && ui.store_daily_check => "Paused by Low power mode".into(),
         Row::StoreDailyCheck => if ui.store_daily_check { "On".into() } else { "Off".into() },
         Row::StoreClearCache => "Remove offline catalog data".into(),
         Row::Restart => "Tap to restart".into(),

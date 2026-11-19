@@ -85,10 +85,12 @@ pub enum DeviceCmd {
     StoreClearCache,
     ToggleAutostart,
     ToggleSleepScreen,
-    /// Follow the device's turn again (Settings > Screen > Auto).
-    AutoRotation,
+    ToggleLowPower,
+    OpenInstalledApps,
     ToggleDarkMode,
     ToggleAnimation,
+    ToggleLargeText,
+    ToggleHighContrast,
     /// Quick settings' sliders: a level from 0 to 24.
     SetLight(u32),
     SetWarmth(u32),
@@ -109,6 +111,7 @@ pub enum Action {
     Device(DeviceCmd),
     /// Hide (true) or show (false) apps by id: written to apps.toml, then redraw.
     SetHidden(Vec<(String, bool)>),
+    SetGrid { columns: u32, rows: u32 },
     /// Save the grid order: (id, position) for every app the user can move. Written to apps.toml.
     SetOrder(Vec<(String, i64)>),
     /// Set (`Some`) or clear (`None`) an app's icon file. Written to apps.toml; the driver reloads the tile.
@@ -150,6 +153,20 @@ impl Usb {
     }
 }
 
+/// Physical display controls available on this Kindle. The desktop preview supports all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySupport {
+    pub front_light: bool,
+    pub warmth: bool,
+    pub auto_rotation: bool,
+}
+
+impl Default for DisplaySupport {
+    fn default() -> Self {
+        Self { front_light: true, warmth: true, auto_rotation: true }
+    }
+}
+
 /// What the status strip and Settings show. Filled by the driver.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
@@ -157,6 +174,10 @@ pub struct Status {
     pub date: String,
     pub battery: Option<u32>,
     pub charging: bool,
+    pub power: battery::Reading,
+    pub battery_history: Vec<battery::Sample>,
+    pub battery_now: u64,
+    pub low_power: bool,
     /// The USB state (see `Usb`).
     pub usb: Usb,
     pub wifi_on: bool,
@@ -166,6 +187,9 @@ pub struct Status {
     pub wifi_signal: Option<(u32, u32)>,
     pub light: u32,
     pub warmth: u32,
+    pub display_support: DisplaySupport,
+    pub large_text: bool,
+    pub high_contrast: bool,
     pub ssh: bool,
     /// The address to connect to while SSH runs, e.g. "ssh -p 2222 root@192.168.1.28"; empty when off or unknown.
     pub ssh_address: String,
@@ -201,11 +225,21 @@ impl Status {
         self.wifi_on != other.wifi_on
             || self.wifi_state != other.wifi_state
             || self.wifi_signal != other.wifi_signal
+            || self.display_differs(other)
             || self.ssh != other.ssh
             || self.ssh_address != other.ssh_address
             || self.ssh_password_set != other.ssh_password_set
             || self.public_dns != other.public_dns
             || self.autostart != other.autostart
+    }
+
+    pub fn display_differs(&self, other: &Self) -> bool {
+        self.display_support != other.display_support
+            || self.auto_rotation != other.auto_rotation
+            || self.light != other.light
+            || self.warmth != other.warmth
+            || self.large_text != other.large_text
+            || self.high_contrast != other.high_contrast
     }
 
     /// Whether what the status bar shows differs between two readings (the clock minute, battery, charging,
@@ -262,7 +296,14 @@ impl StoreRequirementReview {
 pub struct Ui {
     apps: Vec<App>,
     pub layout: Layout,
+    pub display_support: DisplaySupport,
     pub page: usize,
+    pub settings_index: usize,
+    settings_parent: Option<Page>,
+    pub visibility_index: usize,
+    pub managed_count: Option<usize>,
+    pub firmware: Option<String>,
+    pub device_profile: Option<String>,
     pub screen: Screen,
     before_sleep: Screen,
     /// The pressed icon, drawn darkened until the app starts.
@@ -353,7 +394,14 @@ impl Ui {
             apps,
             hidden_apps,
             layout,
+            display_support: DisplaySupport::default(),
             page: 0,
+            settings_index: 0,
+            settings_parent: None,
+            visibility_index: 0,
+            managed_count: None,
+            firmware: None,
+            device_profile: None,
             screen: Screen::Home,
             before_sleep: Screen::Home,
             pressed: None,
@@ -417,7 +465,9 @@ impl Ui {
     /// KUAL extension menus. When there are any, the Extensions tile joins the grid (with the built-ins).
     /// Replace the app list (the user storage came back: the apps are read again from /mnt/us).
     pub fn set_apps(&mut self, apps: Vec<App>) {
-        self.apps = apps;
+        self.original_icons = apps.iter().map(|app| (app.id.clone(), app.icon.clone())).collect();
+        (self.hidden_apps, self.apps) = apps.into_iter().partition(|app| app.hidden);
+        self.visibility_index = self.visibility_index.min(self.visibility_pages() - 1);
         self.page = 0;
         self.pressed = None;
     }
@@ -1223,6 +1273,40 @@ impl Ui {
         self.hidden_apps.len()
     }
 
+    fn visibility_apps(&self) -> Vec<&App> {
+        let mut apps: Vec<_> = self.apps.iter().chain(&self.hidden_apps).filter(|app| !is_builtin(app)).collect();
+        apps.sort_by_cached_key(|app| (app.name.to_lowercase(), app.id.clone()));
+        apps
+    }
+
+    pub fn visibility_pages(&self) -> usize {
+        let count = self.apps.iter().chain(&self.hidden_apps).filter(|app| !is_builtin(app)).count();
+        self.layout.list_pages(count)
+    }
+
+    pub fn visible_visibility_apps(&self) -> impl Iterator<Item = &App> {
+        let limit = self.layout.list_rows_per_page();
+        self.visibility_apps().into_iter().skip(self.visibility_index * limit).take(limit)
+    }
+
+    /// Reconcile an optimistic visibility change if its write fails.
+    pub fn restore_visibility(&mut self, changes: &[(String, bool)]) {
+        for (id, hidden) in changes {
+            let (from, to) = if *hidden { (&mut self.hidden_apps, &mut self.apps) } else { (&mut self.apps, &mut self.hidden_apps) };
+            if let Some(i) = from.iter().position(|app| &app.id == id) {
+                to.push(App { hidden: !hidden, ..from.remove(i) });
+            }
+        }
+        self.apps.sort_by_cached_key(sort_key);
+        self.page = self.page.min(self.pages() - 1);
+    }
+
+    pub fn set_grid(&mut self, columns: u32, rows: u32) {
+        self.layout = Layout::new(self.layout.width as u32, self.layout.height as u32, columns, rows);
+        self.page = self.page.min(self.pages() - 1);
+        self.pressed = None;
+    }
+
     /// The app (index into the visible apps) whose icon is under a point on the home screen.
     fn app_at(&self, x: f32, y: f32) -> Option<usize> {
         let l = self.layout;
@@ -1323,7 +1407,7 @@ impl Ui {
         }
         let app = self.apps.remove(index);
         let id = app.id.clone();
-        self.notice = Some(format!("Hidden: {}. Show it again in Settings > Hidden apps.", app.name));
+        self.notice = Some(format!("Hidden: {}. Show it again in Settings › Apps.", app.name));
         self.hidden_apps.push(App { hidden: true, ..app });
         self.page = self.page.min(self.pages().saturating_sub(1));
         Action::SetHidden(vec![(id, true)])
@@ -1365,6 +1449,17 @@ impl Ui {
         self.screen = screen;
         self.pressed = None;
         Action::Redraw { full: false }
+    }
+
+    fn open_settings(&mut self) -> Action {
+        self.settings_index = 0;
+        self.settings_parent = None;
+        self.go(Screen::Settings)
+    }
+
+    fn back_from_setting(&mut self) -> Action {
+        let target = self.settings_parent.take().map_or(Screen::Settings, Screen::Page);
+        self.go(target)
     }
 
     /// A tap on a key of the keyboard marks the key as pressed, so the driver can show it before the key's action
@@ -1458,7 +1553,7 @@ impl Ui {
                 let Some(index) = self.app_at(x, y) else { return Action::None };
                 let app = self.apps[index].clone();
                 match app.launch {
-                    Launch::Settings => self.go(Screen::Settings),
+                    Launch::Settings => self.open_settings(),
                     Launch::KindleMode => self.go(Screen::ConfirmKindle),
                     Launch::Extensions => self.open_extensions(),
                     _ if app.background => self.run_background(app),
@@ -1486,18 +1581,28 @@ impl Ui {
                 if l.header_wifi().inset(-12).contains(x, y) {
                     return Action::Device(DeviceCmd::ToggleWifi);
                 }
+                if l.header_battery().inset(-12).contains(x, y) {
+                    self.settings_index = 0;
+                    self.settings_parent = None;
+                    return self.go(Screen::Page(Page::Battery));
+                }
                 if let Some((tile, _)) = l.quick_buttons().into_iter().find(|(_, slot)| slot.contains(x, y)) {
                     return match tile {
                         QuickTile::Airplane => Action::Device(DeviceCmd::ToggleWifi),
-                        QuickTile::AutoRotate => Action::Device(DeviceCmd::ToggleAutoRotation),
+                        QuickTile::AutoRotate if self.display_support.auto_rotation => Action::Device(DeviceCmd::ToggleAutoRotation),
+                        QuickTile::AutoRotate => Action::None,
                         QuickTile::DarkMode => Action::Device(DeviceCmd::ToggleDarkMode),
                         QuickTile::Animation => Action::Device(DeviceCmd::ToggleAnimation),
                         QuickTile::Ssh => Action::Device(DeviceCmd::ToggleSsh),
-                        QuickTile::AllSettings => self.go(Screen::Settings),
+                        QuickTile::AllSettings => self.open_settings(),
                         QuickTile::Power => self.go(Screen::PowerMenu),
                     };
                 }
                 for row in 0..2 {
+                    let supported = if row == 0 { self.display_support.front_light } else { self.display_support.warmth };
+                    if !supported {
+                        continue;
+                    }
                     let level = |step: i32| if row == 0 { DeviceCmd::Light(step) } else { DeviceCmd::Warmth(step) };
                     if l.quick_minus(row).inset(-10).contains(x, y) {
                         return Action::Device(level(-1));
@@ -1650,14 +1755,26 @@ impl Ui {
 
     /// Settings: the list of pages. A tap on a page opens it; Done (or the back key) goes to the home screen.
     fn settings_home(&mut self, input: Input) -> Action {
+        let [previous, next] = self.layout.settings_nav();
         match input {
+            Input::PageForward => self.turn_settings(1),
+            Input::PageBack if self.settings_index > 0 => self.turn_settings(-1),
             Input::PageBack => self.go(Screen::Home),
             Input::Tap(x, y) => {
                 if self.layout.done_button().inset(-20).contains(x, y) {
                     return self.go(Screen::Home);
                 }
-                match self.layout.settings_home_at(x, y) {
-                    Some(page) => self.go(Screen::Page(page)),
+                if self.settings_index > 0 && previous.contains(x, y) {
+                    return self.turn_settings(-1);
+                }
+                if self.settings_index + 1 < self.layout.settings_pages() && next.contains(x, y) {
+                    return self.turn_settings(1);
+                }
+                match self.layout.settings_home_at(self.settings_index, x, y) {
+                    Some(page) => {
+                        self.settings_parent = None;
+                        self.go(Screen::Page(page))
+                    }
                     None => Action::None,
                 }
             }
@@ -1665,13 +1782,72 @@ impl Ui {
         }
     }
 
+    fn turn_settings(&mut self, step: isize) -> Action {
+        let next = self.settings_index.saturating_add_signed(step).min(self.layout.settings_pages() - 1);
+        if next == self.settings_index {
+            return Action::None;
+        }
+        self.settings_index = next;
+        Action::Redraw { full: false }
+    }
+
+    fn app_visibility(&mut self, input: Input) -> Action {
+        let pages = self.visibility_pages();
+        let [previous, next] = self.layout.settings_nav();
+        let forward = match input {
+            Input::PageForward => true,
+            Input::PageBack if self.visibility_index == 0 => return self.back_from_setting(),
+            Input::PageBack => false,
+            Input::Tap(x, y) if self.layout.done_button().inset(-20).contains(x, y) => return self.back_from_setting(),
+            Input::Tap(x, y) if self.visibility_index > 0 && previous.contains(x, y) => false,
+            Input::Tap(x, y) if self.visibility_index + 1 < pages && next.contains(x, y) => true,
+            Input::Tap(x, y) => {
+                let Some(index) = self.layout.list_row_at(x, y) else { return Action::None };
+                let Some((id, hidden)) = self.visible_visibility_apps().nth(index).map(|app| (app.id.clone(), app.hidden)) else {
+                    return Action::None;
+                };
+                if hidden {
+                    let Some(index) = self.hidden_apps.iter().position(|app| app.id == id) else { return Action::None };
+                    self.apps.push(App { hidden: false, ..self.hidden_apps.remove(index) });
+                    self.apps.sort_by_cached_key(sort_key);
+                    return Action::SetHidden(vec![(id, false)]);
+                }
+                let Some(index) = self.apps.iter().position(|app| app.id == id) else { return Action::None };
+                return self.hide_at(index);
+            }
+            _ => return Action::None,
+        };
+        let index = if forward { (self.visibility_index + 1).min(pages - 1) } else { self.visibility_index.saturating_sub(1) };
+        if index == self.visibility_index {
+            return Action::None;
+        }
+        self.visibility_index = index;
+        Action::Redraw { full: false }
+    }
+
     /// One page of Settings: its rows' buttons. Back (or the back key) returns to the Settings list.
     fn settings_page(&mut self, input: Input, page: Page) -> Action {
+        if page == Page::AppVisibility {
+            return self.app_visibility(input);
+        }
+        if page == Page::Display {
+            if let Input::Tap(x, y) = input {
+                match self.layout.display_level_at(x, y) {
+                    Some((crate::layout::Row::Frontlight, level)) if self.display_support.front_light => {
+                        return Action::Device(DeviceCmd::SetLight(level));
+                    }
+                    Some((crate::layout::Row::Warmth, level)) if self.display_support.warmth => {
+                        return Action::Device(DeviceCmd::SetWarmth(level));
+                    }
+                    _ => {}
+                }
+            }
+        }
         if page == Page::Store && self.store_clear_confirm {
             return self.confirm_clear_store_cache(input);
         }
         match input {
-            Input::PageBack => self.go(Screen::Settings),
+            Input::PageBack => self.back_from_setting(),
             Input::Swipe { dy, dx, .. } if page == Page::Wifi && dy.abs() > SWIPE_MIN && dy.abs() > dx.abs() => {
                 // The list moves by about as many rows as the swipe covers (at least one).
                 let rows = ((dy.abs() / crate::layout::NETWORK_H as f32) as usize).max(1);
@@ -1708,11 +1884,26 @@ impl Ui {
                 }
             }
             Input::Tap(x, y) => match self.layout.settings_button_at(page, x, y) {
-                Some(Button::Done) => self.go(Screen::Settings),
-                Some(Button::LightDown) => Action::Device(DeviceCmd::Light(-2)),
-                Some(Button::LightUp) => Action::Device(DeviceCmd::Light(2)),
-                Some(Button::WarmDown) => Action::Device(DeviceCmd::Warmth(-2)),
-                Some(Button::WarmUp) => Action::Device(DeviceCmd::Warmth(2)),
+                Some(Button::Done) => self.back_from_setting(),
+                Some(Button::OpenPage(target)) => {
+                    self.settings_parent = Some(page);
+                    self.visibility_index = 0;
+                    self.go(Screen::Page(target))
+                }
+                Some(Button::ManageInstalled) => Action::Device(DeviceCmd::OpenInstalledApps),
+                Some(Button::LowPower) => Action::Device(DeviceCmd::ToggleLowPower),
+                Some(Button::GridColumns) => Action::SetGrid {
+                    columns: if self.layout.cols == 5 { 3 } else { self.layout.cols as u32 + 1 },
+                    rows: self.layout.rows as u32,
+                },
+                Some(Button::GridRows) => Action::SetGrid {
+                    columns: self.layout.cols as u32,
+                    rows: if self.layout.rows == 6 { 3 } else { self.layout.rows as u32 + 1 },
+                },
+                Some(Button::LightDown) if self.display_support.front_light => Action::Device(DeviceCmd::Light(-1)),
+                Some(Button::LightUp) if self.display_support.front_light => Action::Device(DeviceCmd::Light(1)),
+                Some(Button::WarmDown) if self.display_support.warmth => Action::Device(DeviceCmd::Warmth(-1)),
+                Some(Button::WarmUp) if self.display_support.warmth => Action::Device(DeviceCmd::Warmth(1)),
                 Some(Button::Wifi) => Action::Device(DeviceCmd::ToggleWifi),
                 Some(Button::Rotation) => Action::Device(DeviceCmd::ToggleRotation),
                 Some(Button::Ssh) => Action::Device(DeviceCmd::ToggleSsh),
@@ -1730,9 +1921,11 @@ impl Ui {
                     Action::Redraw { full: false }
                 }
                 Some(Button::SleepScreen) => Action::Device(DeviceCmd::ToggleSleepScreen),
-                Some(Button::RotationAuto) => Action::Device(DeviceCmd::AutoRotation),
+                Some(Button::RotationAuto) if self.display_support.auto_rotation => Action::Device(DeviceCmd::ToggleAutoRotation),
                 Some(Button::DarkMode) => Action::Device(DeviceCmd::ToggleDarkMode),
                 Some(Button::Animation) => Action::Device(DeviceCmd::ToggleAnimation),
+                Some(Button::LargeText) => Action::Device(DeviceCmd::ToggleLargeText),
+                Some(Button::HighContrast) => Action::Device(DeviceCmd::ToggleHighContrast),
                 Some(Button::KindleUi) => self.go(Screen::ConfirmKindle),
                 Some(Button::Restart) => Action::Device(DeviceCmd::RestartLauncher),
                 _ => Action::None,
@@ -1777,6 +1970,54 @@ fn is_builtin(app: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_app_management_and_battery_shortcuts_follow_navigation() {
+        use crate::layout::Row;
+        let mut u = ui(22);
+        u.open_settings();
+        assert!(matches!(u.handle(centre(u.layout.settings_nav()[1])), Action::Redraw { .. }));
+        let home_row = |ui: &Ui, page| ui.layout.settings_home_rows(ui.settings_index)
+            .into_iter().find(|(candidate, _)| *candidate == page).unwrap().1;
+        let setting_row = |ui: &Ui, page, row| ui.layout.page_sections(page).into_iter()
+            .flat_map(|section| section.rows).find(|entry| entry.row == row).unwrap().rect;
+
+        u.handle(centre(home_row(&u, Page::Apps)));
+        assert_eq!(u.screen, Screen::Page(Page::Apps));
+        let manage = setting_row(&u, Page::Apps, Row::ManageInstalled);
+        assert_eq!(u.handle(centre(manage)), Action::Device(DeviceCmd::OpenInstalledApps));
+        let columns = setting_row(&u, Page::Apps, Row::GridColumns);
+        assert_eq!(u.handle(centre(columns)), Action::SetGrid { columns: 4, rows: 3 });
+        u.set_grid(4, 3);
+        assert_eq!(u.layout.cols, 4);
+
+        u.handle(centre(setting_row(&u, Page::Apps, Row::AppVisibility)));
+        assert_eq!(u.screen, Screen::Page(Page::AppVisibility));
+        let row = u.layout.list_row(0);
+        let Action::SetHidden(changes) = u.handle(centre(row)) else { panic!("visibility row did not toggle") };
+        assert_eq!(u.hidden_count(), 1);
+        u.restore_visibility(&changes);
+        assert_eq!(u.hidden_count(), 0);
+        u.handle(centre(row));
+        let Action::SetHidden(reveal) = u.handle(centre(row)) else { panic!("hidden app was not reachable") };
+        assert_eq!(reveal, vec![(changes[0].0.clone(), false)]);
+        u.handle(centre(u.layout.settings_nav()[1]));
+        assert_eq!(u.visibility_index, 1);
+        u.handle(centre(u.layout.done_button()));
+        assert_eq!(u.screen, Screen::Page(Page::Apps));
+        u.handle(Input::PageBack);
+        assert_eq!(u.settings_index, 1);
+
+        u.go(Screen::QuickSettings);
+        u.handle(centre(u.layout.header_battery()));
+        assert_eq!(u.screen, Screen::Page(Page::Battery));
+        let power = setting_row(&u, Page::Battery, Row::LowPower);
+        assert_eq!(u.handle(centre(power)), Action::Device(DeviceCmd::ToggleLowPower));
+        u.handle(centre(setting_row(&u, Page::Battery, Row::BatteryDisplay)));
+        assert_eq!(u.screen, Screen::Page(Page::Display));
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Page(Page::Battery));
+    }
     use crate::apps::IconSource;
 
     fn app(id: &str, launch: Launch) -> App {
@@ -1802,7 +2043,8 @@ mod tests {
     fn launcher_settings_can_toggle_daily_checks_and_confirm_clearing_the_catalog() {
         let mut u = ui(0);
         u.screen = Screen::Settings;
-        let page = u.layout.settings_home_rows().into_iter().find(|(page, _)| *page == Page::Store).unwrap().1;
+        u.settings_index = 1;
+        let page = u.layout.settings_home_rows(1).into_iter().find(|(page, _)| *page == Page::Store).unwrap().1;
         u.handle(centre(page));
         assert_eq!(u.screen, Screen::Page(Page::Store));
         let rows = &u.layout.page_sections(Page::Store)[0].rows;
@@ -2308,13 +2550,13 @@ mod tests {
         u.handle(centre(all));
         assert_eq!(u.screen, Screen::Settings);
         // The Settings list opens the Display page, whose rows give the device commands.
-        let (display, r) = *u.layout.settings_home_rows().iter().find(|(p, _)| *p == Page::Display).unwrap();
+        let (display, r) = *u.layout.settings_home_rows(0).iter().find(|(p, _)| *p == Page::Display).unwrap();
         assert_eq!(display, Page::Display);
         u.handle(centre(r));
         assert_eq!(u.screen, Screen::Page(Page::Display));
         let rows: Vec<_> = u.layout.page_sections(Page::Display).into_iter().flat_map(|s| s.rows).collect();
         let row = |rw: crate::layout::Row| rows.iter().find(|x| x.row == rw).unwrap().buttons[0].1;
-        assert_eq!(u.handle(centre(rows[0].buttons[1].1)), Action::Device(DeviceCmd::Light(2)));
+        assert_eq!(u.handle(centre(rows[0].buttons[1].1)), Action::Device(DeviceCmd::Light(1)));
         assert_eq!(u.handle(centre(row(crate::layout::Row::Rotation))), Action::Device(DeviceCmd::ToggleRotation));
         assert_eq!(u.handle(centre(row(crate::layout::Row::DarkMode))), Action::Device(DeviceCmd::ToggleDarkMode));
         // Wi-Fi and Animation are on their own pages.
@@ -2328,6 +2570,40 @@ mod tests {
         u.screen = Screen::Page(Page::Display);
         let anim = u.layout.page_sections(Page::Display).into_iter().flat_map(|s| s.rows).find(|r| r.row == crate::layout::Row::Animation).unwrap().buttons[0].1;
         assert_eq!(u.handle(centre(anim)), Action::Device(DeviceCmd::ToggleAnimation));
+    }
+
+    #[test]
+    fn display_and_quick_settings_select_the_same_levels_and_check_support() {
+        let mut u = ui(1);
+        let levels = u.layout.page_sections(Page::Display).remove(0).rows;
+        let light = crate::layout::setting_level_bar(levels[0].rect);
+        let warmth = crate::layout::setting_level_bar(levels[1].rect);
+        u.screen = Screen::Page(Page::Display);
+        assert_eq!(u.handle(centre(light)), Action::Device(DeviceCmd::SetLight(12)));
+        assert_eq!(u.handle(centre(warmth)), Action::Device(DeviceCmd::SetWarmth(12)));
+        assert_eq!(u.handle(centre(levels[1].buttons[0].1)), Action::Device(DeviceCmd::Warmth(-1)));
+        u.display_support.warmth = false;
+        assert_eq!(u.handle(centre(warmth)), Action::None);
+        assert_eq!(u.handle(centre(levels[1].buttons[1].1)), Action::None);
+
+        u.screen = Screen::QuickSettings;
+        assert_eq!(u.handle(centre(u.layout.quick_bar(0))), Action::Device(DeviceCmd::SetLight(12)));
+        assert_eq!(u.handle(centre(u.layout.quick_bar(1))), Action::None);
+        assert_eq!(u.handle(centre(u.layout.quick_minus(1))), Action::None);
+        u.display_support.auto_rotation = false;
+        let auto_rotate = u.layout.quick_buttons().into_iter().find(|(tile, _)| *tile == QuickTile::AutoRotate).unwrap().1;
+        assert_eq!(u.handle(centre(auto_rotate)), Action::None);
+    }
+
+    #[test]
+    fn accessibility_rows_use_the_saved_appearance_commands() {
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Accessibility);
+        let sections = u.layout.page_sections(Page::Accessibility);
+        assert_eq!(u.handle(centre(sections[0].rows[0].rect)), Action::Device(DeviceCmd::ToggleLargeText));
+        assert_eq!(u.handle(centre(sections[0].rows[1].rect)), Action::Device(DeviceCmd::ToggleHighContrast));
+        assert_eq!(u.handle(centre(sections[0].rows[2].rect)), Action::None);
+        assert_eq!(u.handle(centre(sections[1].rows[0].rect)), Action::Device(DeviceCmd::ToggleAnimation));
     }
 
     #[test]

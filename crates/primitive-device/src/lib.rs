@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use kl_core::rotation::Debouncer;
+use kl_core::{battery::{Reading, Source}, rotation::Debouncer};
 pub use kl_core::{Input, Rotation, Settings, Status, Usb};
 
 pub mod profile;
@@ -117,14 +117,49 @@ pub fn local_time() -> (String, String, i32) {
 
 /// The battery level as a percentage, if it can be read.
 pub fn battery() -> Option<u32> {
-    get_int(POWERD, "battLevel").or_else(|| sysfs_text(profile::ACTIVE.battery_capacity).parse().ok())
+    let valid = |value: &u32| *value <= 100;
+    get_int(POWERD, "battLevel").filter(valid).or_else(|| {
+        sysfs_text(profile::ACTIVE.battery_capacity).parse().ok().filter(valid)
+    })
 }
 
 /// Whether the Kindle is charging.
 pub fn charging() -> bool {
-    get_int(POWERD, "isCharging") == Some(1)
-        || sysfs_text(profile::ACTIVE.charger_charging) == "1"
-        || sysfs_text(profile::ACTIVE.charger_status) == "Charging"
+    power_source() == Source::Charging
+}
+
+pub fn battery_reading() -> Reading {
+    Reading { percent: battery(), source: power_source() }
+}
+
+fn power_source() -> Source {
+    let bit = |value| match value {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    };
+    classify_power_source(
+        bit(sysfs_text(profile::ACTIVE.charger_online).parse().ok()),
+        [
+            bit(get_int(POWERD, "isCharging")),
+            bit(sysfs_text(profile::ACTIVE.charger_charging).parse().ok()),
+        ],
+        &sysfs_text(profile::ACTIVE.charger_status),
+    )
+}
+
+fn classify_power_source(online: Option<bool>, charging: [Option<bool>; 2], status: &str) -> Source {
+    if charging.contains(&Some(true)) || status == "Charging" {
+        Source::Charging
+    } else if online == Some(false) || (online.is_none() && status == "Discharging") {
+        Source::OnBattery
+    } else if online == Some(true) && status == "Full" {
+        Source::Full
+    } else if online == Some(true) && (charging.contains(&Some(false)) || status == "Not charging") {
+        Source::PluggedIn
+    } else {
+        Source::Unknown
+    }
 }
 
 fn mem_available() -> String {
@@ -172,22 +207,37 @@ pub fn status(settings: &Settings) -> Status {
     let sleep_launcher = settings.sleep_screen_launcher;
     let (clock, date, _) = local_time();
     let (wifi_on, wifi_state) = wifi_status();
+    let power = battery_reading();
+    let light = light_level();
+    let warmth = get_int(POWERD, "currentAmberLevel").filter(|level| *level <= LEVEL_MAX);
+    let display_support = kl_core::ui::DisplaySupport {
+        front_light: light.is_some(),
+        warmth: warmth.is_some(),
+        auto_rotation: auto_rotation_supported(),
+    };
     Status {
         clock,
         date,
-        battery: battery(),
-        charging: charging(),
+        battery: power.percent,
+        charging: power.source == Source::Charging,
+        power,
+        battery_history: Vec::new(),
+        battery_now: 0,
+        low_power: settings.low_power,
         usb: usb_state(),
         autostart: !Path::new(&launcher_dir()).join("DISABLE").exists(),
         sleep_launcher,
-        auto_rotation: settings.auto_rotation,
+        auto_rotation: settings.auto_rotation && display_support.auto_rotation,
         dark_mode: settings.dark_mode,
         animation: settings.animation,
+        large_text: settings.large_text,
+        high_contrast: settings.high_contrast,
         wifi_on,
         wifi_state,
         wifi_signal: lipc_text(WIFID, "signalStrength").and_then(|t| kl_core::wifi::parse_signal(&t)),
-        light: get_int(POWERD, "flIntensity").unwrap_or(0).min(LEVEL_MAX),
-        warmth: get_int(POWERD, "currentAmberLevel").unwrap_or(0).min(LEVEL_MAX),
+        light: light.unwrap_or(0),
+        warmth: warmth.unwrap_or(0),
+        display_support,
         ssh,
         ssh_address,
         ssh_password_set: ssh_password_set(),
@@ -417,7 +467,15 @@ pub fn available_storage_bytes(path: &std::path::Path) -> std::io::Result<u64> {
 }
 
 pub fn set_light(level: u32) {
-    set_int(POWERD, "flIntensity", level.min(LEVEL_MAX));
+    let _ = try_set_light(level);
+}
+
+pub fn light_level() -> Option<u32> {
+    get_int(POWERD, "flIntensity").filter(|level| *level <= LEVEL_MAX)
+}
+
+pub fn try_set_light(level: u32) -> bool {
+    set_int(POWERD, "flIntensity", level.min(LEVEL_MAX))
 }
 
 pub fn set_warmth(level: u32) {
@@ -443,6 +501,14 @@ pub fn accelerometer_turn() -> Option<Rotation> {
         "D" => Some(Rotation::UpsideDown),
         _ => None,
     }
+}
+
+fn auto_rotation_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        accel_value_path().is_some()
+            || matches!(get_text("com.lab126.winmgr", "accelerometer").as_str(), "U" | "D" | "L" | "R")
+    })
 }
 
 /// The accelerometer's `value` file: the input device named `bma2x2` (`/sys/class/input/input6` on the
@@ -634,6 +700,17 @@ pub fn power_loop(mut report: impl FnMut(Input)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_state_distinguishes_missing_and_idle_charger_readings() {
+        assert_eq!(classify_power_source(None, [Some(false), None], ""), Source::Unknown);
+        assert_eq!(classify_power_source(Some(true), [None, None], ""), Source::Unknown);
+        assert_eq!(classify_power_source(Some(true), [Some(false), None], ""), Source::PluggedIn);
+        assert_eq!(classify_power_source(Some(true), [None, None], "Full"), Source::Full);
+        assert_eq!(classify_power_source(Some(false), [None, None], "Full"), Source::OnBattery);
+        assert_eq!(classify_power_source(Some(true), [None, Some(true)], ""), Source::Charging);
+        assert_eq!(classify_power_source(None, [None, None], "Discharging"), Source::OnBattery);
+    }
 
     #[test]
     fn idle_timeout_refresh_requires_an_active_known_power_state() {

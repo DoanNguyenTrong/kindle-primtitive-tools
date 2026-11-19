@@ -53,9 +53,13 @@ pub enum Page {
     Connection,
     FileTransfer,
     Display,
+    Accessibility,
+    Battery,
     Sleep,
     Apps,
+    AppVisibility,
     Store,
+    Storage,
     Device,
     About,
 }
@@ -68,7 +72,11 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 9] = [Page::Wifi, Page::Connection, Page::FileTransfer, Page::Display, Page::Sleep, Page::Apps, Page::Store, Page::Device, Page::About];
+    pub const ALL: [Page; 13] = [
+        Page::Battery, Page::Display, Page::Accessibility, Page::Sleep, Page::Wifi,
+        Page::Connection, Page::FileTransfer, Page::Apps, Page::AppVisibility, Page::Store,
+        Page::Storage, Page::Device, Page::About,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -76,9 +84,13 @@ impl Page {
             Page::Connection => "SSH & DNS",
             Page::FileTransfer => "Wi-Fi file transfer",
             Page::Display => "Display",
+            Page::Accessibility => "Accessibility",
+            Page::Battery => "Battery",
             Page::Sleep => "Sleep",
             Page::Apps => "Apps",
+            Page::AppVisibility => "App visibility",
             Page::Store => "Store",
+            Page::Storage => "Storage",
             Page::Device => "Device",
             Page::About => "About",
         }
@@ -106,32 +118,60 @@ impl Page {
                 Group { header: "Motion", rows: &[Row::Animation], footer: "A card zooms out of the icon when an app opens." },
                 Group { header: "Screen", rows: &[Row::Rotation], footer: "Turns with the Kindle while Auto is on. Tap the value to set it by hand." },
             ],
+            Page::Accessibility => &[
+                Group {
+                    header: "Text and contrast",
+                    rows: &[Row::LargeText, Row::HighContrast, Row::TextPreview],
+                    footer: "These options apply to Launcher screens.",
+                },
+                Group {
+                    header: "Motion",
+                    rows: &[Row::Animation],
+                    footer: "You can also change this from Quick Settings.",
+                },
+            ],
+            Page::Battery => &[
+                Group { header: "Current charge", rows: &[Row::BatteryReading, Row::LowPower], footer: "Low power mode dims the front light when enabled and pauses automatic Store checks." },
+                Group { header: "Power settings", rows: &[Row::BatteryDisplay, Row::BatteryWifi, Row::StoreSettings], footer: "" },
+            ],
             Page::Sleep => &[Group {
                 header: "Sleep screen",
                 rows: &[Row::SleepScreen],
-                footer: "On shows a picture from the launcher's screensavers folder. Off shows the Kindle's screensaver.",
+                footer: "Use Launcher pictures, or return to the Kindle screensaver after opening the Kindle UI or restarting.",
             }],
-            Page::Apps => &[Group { header: "Grid", rows: &[Row::Hidden], footer: "Long-press an icon to hide it." }],
+            Page::Apps => &[
+                Group { header: "Installed apps", rows: &[Row::ManageInstalled], footer: "Store opens the installed list for updates and removal." },
+                Group { header: "Home screen", rows: &[Row::AppVisibility, Row::Hidden, Row::GridColumns, Row::GridRows], footer: "Long-press an app on the home screen to move it or change its icon." },
+            ],
             Page::Store => &[Group {
                 header: "Catalog",
                 rows: &[Row::StoreDailyCheck, Row::StoreClearCache],
                 footer: "The Store checks for updates over Wi-Fi when it opens.",
             }],
-            Page::Device => &[
-                Group { header: "Startup", rows: &[Row::Autostart], footer: "Not active yet: the boot job comes in a later phase." },
-                Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
-                Group { header: "Kindle", rows: &[Row::KindleUi], footer: "Opens the stock Kindle UI. It takes about a minute to start." },
+            Page::Storage => &[
+                Group { header: "Kindle user storage", rows: &[Row::StorageUsage], footer: "" },
+                Group { header: "Manage storage", rows: &[Row::ManageInstalled, Row::StoreSettings], footer: "Use Store settings to clear the saved catalog." },
             ],
-            Page::About | Page::FileTransfer => &[],
+            Page::Device => &[
+                Group { header: "Startup", rows: &[Row::Autostart], footer: "Choose whether Launcher opens when the Kindle starts." },
+                Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
+                Group { header: "Kindle", rows: &[Row::DeviceAbout, Row::KindleUi], footer: "Opening the Kindle UI takes about a minute." },
+            ],
+            Page::About | Page::FileTransfer | Page::AppVisibility => &[],
         }
     }
 }
 
 /// The Settings list: its groups, each a header, a card of pages, and nothing under it.
-pub const HOME_GROUPS: &[(&str, &[Page])] = &[
-    ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
-    ("Display", &[Page::Display, Page::Sleep]),
-    ("System", &[Page::Apps, Page::Store, Page::Device, Page::About]),
+const HOME_PAGES: &[&[(&str, &[Page])]] = &[
+    &[
+        ("Power and display", &[Page::Battery, Page::Display, Page::Accessibility, Page::Sleep]),
+        ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
+    ],
+    &[
+        ("Applications", &[Page::Apps, Page::Store]),
+        ("System", &[Page::Storage, Page::Device, Page::About]),
+    ],
 ];
 
 /// A group of the Settings list: its header, its card, and the page rows in it.
@@ -164,12 +204,19 @@ pub enum Button {
     PublicDns,
     Autostart,
     ShowHidden,
+    OpenPage(Page),
+    ManageInstalled,
+    GridColumns,
+    GridRows,
+    LowPower,
     StoreDailyCheck,
     StoreClearCache,
     SleepScreen,
     KindleUi,
     /// Settings > Device > Launcher: restart the launcher.
     Restart,
+    LargeText,
+    HighContrast,
     MenuEarlier,
     MenuLater,
     MenuIcon,
@@ -217,15 +264,29 @@ pub enum Row {
     PublicDns,
     Autostart,
     Hidden,
+    AppVisibility,
+    ManageInstalled,
+    GridColumns,
+    GridRows,
+    BatteryReading,
+    LowPower,
+    BatteryDisplay,
+    BatteryWifi,
+    StoreSettings,
+    StorageUsage,
+    DeviceAbout,
     StoreDailyCheck,
     StoreClearCache,
     SleepScreen,
     KindleUi,
     Restart,
+    LargeText,
+    HighContrast,
+    TextPreview,
 }
 
 impl Row {
-    pub const ALL: [Row; 18] = [
+    pub const ALL: [Row; 32] = [
         Row::Frontlight,
         Row::Warmth,
         Row::DarkMode,
@@ -239,16 +300,22 @@ impl Row {
         Row::PublicDns,
         Row::Autostart,
         Row::Hidden,
+        Row::AppVisibility, Row::ManageInstalled, Row::GridColumns, Row::GridRows,
+        Row::BatteryReading, Row::LowPower, Row::BatteryDisplay, Row::BatteryWifi, Row::StoreSettings,
+        Row::StorageUsage, Row::DeviceAbout,
         Row::StoreDailyCheck,
         Row::StoreClearCache,
         Row::SleepScreen,
         Row::KindleUi,
         Row::Restart,
+        Row::LargeText,
+        Row::HighContrast,
+        Row::TextPreview,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Row::Frontlight => "Frontlight",
+            Row::Frontlight => "Front light",
             Row::Warmth => "Warmth",
             Row::DarkMode => "Dark mode",
             Row::Animation => "Opening animation",
@@ -261,11 +328,25 @@ impl Row {
             Row::PublicDns => "Public DNS",
             Row::Autostart => "Start with the Kindle",
             Row::Hidden => "Hidden apps",
+            Row::AppVisibility => "App visibility",
+            Row::ManageInstalled => "Manage installed apps",
+            Row::GridColumns => "Grid columns",
+            Row::GridRows => "Grid rows",
+            Row::BatteryReading => "Battery level",
+            Row::LowPower => "Low power mode",
+            Row::BatteryDisplay => "Front light",
+            Row::BatteryWifi => "Wi-Fi",
+            Row::StoreSettings => "Store settings",
+            Row::StorageUsage => "Used storage",
+            Row::DeviceAbout => "Device information",
             Row::StoreDailyCheck => "Check for updates daily",
             Row::StoreClearCache => "Clear saved catalog",
             Row::SleepScreen => "Sleep screen",
             Row::KindleUi => "Kindle UI",
             Row::Restart => "Restart the launcher",
+            Row::LargeText => "Larger text",
+            Row::HighContrast => "Higher contrast",
+            Row::TextPreview => "Preview",
         }
     }
 }
@@ -344,6 +425,29 @@ fn section_foot(footer: &str) -> i32 {
     if footer.is_empty() { SECTION_GAP } else { 76 + SECTION_GAP }
 }
 
+fn setting_level_nudges(row: Rect) -> (Rect, Rect) {
+    let y = row.y + (row.h - ROUND_D) / 2;
+    let minus = Rect::new(row.x + row.w / 3, y, ROUND_D, ROUND_D);
+    let plus = Rect::new(row.right() - SWITCH_INSET - ROUND_D, y, ROUND_D, ROUND_D);
+    (minus, plus)
+}
+
+/// The directly selectable part of a front-light or warmth row in Settings.
+pub fn setting_level_bar(row: Rect) -> Rect {
+    let (minus, plus) = setting_level_nudges(row);
+    let x = minus.right() + 12;
+    Rect::new(x, minus.y, (plus.x - 12 - x).max(0), minus.h)
+}
+
+fn level_step(bar: Rect, x: f32, y: f32) -> Option<u32> {
+    let zone = Rect::new(bar.x, bar.y - 16, bar.w, bar.h + 32);
+    if !zone.contains(x, y) {
+        return None;
+    }
+    let t = ((x - bar.x as f32) / bar.w as f32).clamp(0.0, 0.9999);
+    Some((t * (QUICK_LEVEL_MAX + 1) as f32) as u32)
+}
+
 /// The keyboard's Go key on the password screen.
 const KEYBOARD_GO: &str = "Join";
 
@@ -363,9 +467,7 @@ pub struct WifiArea {
 /// rotation (the value turns the screen by hand).
 fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
     let switch = Rect::new(r.right() - SWITCH_INSET - SWITCH_W, r.y + (r.h - SWITCH_H) / 2, SWITCH_W, SWITCH_H);
-    let round_y = r.y + (r.h - ROUND_D) / 2;
-    let plus = Rect::new(r.right() - SWITCH_INSET - ROUND_D, round_y, ROUND_D, ROUND_D);
-    let minus = Rect::new(plus.x - 12 - ROUND_D, round_y, ROUND_D, ROUND_D);
+    let (minus, plus) = setting_level_nudges(r);
     let _ = l;
     match row {
         Row::Frontlight => vec![(Button::LightDown, minus), (Button::LightUp, plus)],
@@ -375,6 +477,16 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
             (Button::RotationAuto, switch),
         ],
         Row::Hidden => vec![(Button::ShowHidden, Rect::new(r.right() - SWITCH_INSET - 200, r.y + (r.h - SWITCH_H) / 2, 200, SWITCH_H))],
+        Row::AppVisibility => vec![(Button::OpenPage(Page::AppVisibility), r)],
+        Row::ManageInstalled => vec![(Button::ManageInstalled, r)],
+        Row::GridColumns => vec![(Button::GridColumns, r)],
+        Row::GridRows => vec![(Button::GridRows, r)],
+        Row::LowPower => vec![(Button::LowPower, r)],
+        Row::BatteryDisplay => vec![(Button::OpenPage(Page::Display), r)],
+        Row::BatteryWifi => vec![(Button::OpenPage(Page::Wifi), r)],
+        Row::StoreSettings => vec![(Button::OpenPage(Page::Store), r)],
+        Row::DeviceAbout => vec![(Button::OpenPage(Page::About), r)],
+        Row::BatteryReading | Row::StorageUsage => vec![],
         Row::StoreDailyCheck => vec![(Button::StoreDailyCheck, r)],
         Row::StoreClearCache => vec![(Button::StoreClearCache, r)],
         Row::KindleUi => vec![(Button::KindleUi, r)],
@@ -389,6 +501,9 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
         Row::PublicDns => vec![(Button::PublicDns, r)],
         Row::Autostart => vec![(Button::Autostart, r)],
         Row::SleepScreen => vec![(Button::SleepScreen, r)],
+        Row::LargeText => vec![(Button::LargeText, r)],
+        Row::HighContrast => vec![(Button::HighContrast, r)],
+        Row::TextPreview => vec![],
     }
 }
 const BUTTON_H: i32 = 100;
@@ -522,11 +637,21 @@ impl Layout {
         y
     }
 
+    pub fn settings_pages(&self) -> usize {
+        HOME_PAGES.len()
+    }
+
+    pub fn settings_nav(&self) -> [Rect; 2] {
+        let y = self.footer().y;
+        let w = (self.width / 3).min(260);
+        [Rect::new(MARGIN, y, w, 84), Rect::new(self.width - MARGIN - w, y, w, 84)]
+    }
+
     /// The Settings list: the groups of pages, each a header and a card with one row per page.
-    pub fn home_sections(&self) -> Vec<HomeSection> {
+    pub fn home_sections(&self, page: usize) -> Vec<HomeSection> {
         let w = self.width - 2 * MARGIN;
         let mut y = TITLE_H + SECTION_TOP;
-        HOME_GROUPS
+        HOME_PAGES[page.min(self.settings_pages() - 1)]
             .iter()
             .map(|&(header, pages)| {
                 y += if header.is_empty() { 0 } else { SECTION_HEAD_H };
@@ -539,13 +664,13 @@ impl Layout {
     }
 
     /// The Settings list's rows (one per page), flat.
-    pub fn settings_home_rows(&self) -> Vec<(Page, Rect)> {
-        self.home_sections().into_iter().flat_map(|(_, _, rows)| rows).collect()
+    pub fn settings_home_rows(&self, page: usize) -> Vec<(Page, Rect)> {
+        self.home_sections(page).into_iter().flat_map(|(_, _, rows)| rows).collect()
     }
 
     /// The Settings list row under a point.
-    pub fn settings_home_at(&self, x: f32, y: f32) -> Option<Page> {
-        self.settings_home_rows().into_iter().find(|(_, r)| r.contains(x, y)).map(|(p, _)| p)
+    pub fn settings_home_at(&self, page: usize, x: f32, y: f32) -> Option<Page> {
+        self.settings_home_rows(page).into_iter().find(|(_, r)| r.contains(x, y)).map(|(p, _)| p)
     }
 
     /// The Wi-Fi page's own area under its Wi-Fi section: the current network, then the scan list.
@@ -624,13 +749,7 @@ impl Layout {
 
     /// The level (0 to `QUICK_LEVEL_MAX`) of the step under (`x`, `y`) on row `i`'s bar, or `None` off the bar.
     pub fn quick_step(&self, i: usize, x: f32, y: f32) -> Option<u32> {
-        let bar = self.quick_bar(i);
-        let zone = Rect::new(bar.x, bar.y - 16, bar.w, bar.h + 32);
-        if !zone.contains(x, y) {
-            return None;
-        }
-        let t = ((x - bar.x as f32) / bar.w as f32).clamp(0.0, 0.9999);
-        Some((t * (QUICK_LEVEL_MAX + 1) as f32) as u32)
+        level_step(self.quick_bar(i), x, y)
     }
 
     /// The "System" header above the figures.
@@ -719,6 +838,14 @@ impl Layout {
             .flat_map(|r| r.buttons)
             .find(|(_, rect)| rect.inset(-12).contains(x, y))
             .map(|(b, _)| b)
+    }
+
+    pub fn display_level_at(&self, x: f32, y: f32) -> Option<(Row, u32)> {
+        self.page_sections(Page::Display)
+            .into_iter()
+            .flat_map(|section| section.rows)
+            .filter(|setting| matches!(setting.row, Row::Frontlight | Row::Warmth))
+            .find_map(|setting| level_step(setting_level_bar(setting.rect), x, y).map(|level| (setting.row, level)))
     }
 
     /// The password field: the network's password, shown as dots unless "Show password" is on.
@@ -1155,12 +1282,16 @@ mod tests {
         assert_eq!(l.settings_button_at(Page::Display, (r.x + 10) as f32, (r.y + 10) as f32), Some(b));
         let d = l.done_button();
         assert_eq!(l.settings_button_at(Page::Display, (d.x + 1) as f32, (d.y + 1) as f32), Some(Button::Done));
-        let home = l.home_sections();
-        assert_eq!(home.len(), HOME_GROUPS.len());
-        assert_eq!(l.settings_home_rows().len(), Page::ALL.len());
-        let (page, r) = l.settings_home_rows()[2];
-        assert_eq!(l.settings_home_at((r.x + 5) as f32, (r.y + 5) as f32), Some(page));
-        assert!(l.settings_home_rows().last().unwrap().1.bottom() < l.height - 200);
+        let mut pages = Vec::new();
+        for page_index in 0..l.settings_pages() {
+            for (page, r) in l.settings_home_rows(page_index) {
+                assert_eq!(l.settings_home_at(page_index, (r.x + 5) as f32, (r.y + 5) as f32), Some(page));
+                assert!(r.bottom() < l.settings_nav()[0].y);
+                assert!(!pages.contains(&page));
+                pages.push(page);
+            }
+        }
+        assert_eq!(pages.len() + 1, Page::ALL.len()); // App visibility is inside Apps.
     }
 
     #[test]

@@ -3,6 +3,48 @@
 //! Charging clears every warning.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reading {
+    pub percent: Option<u32>,
+    pub source: Source,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    #[default]
+    Unknown,
+    OnBattery,
+    PluggedIn,
+    Charging,
+    Full,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Status unavailable",
+            Self::OnBattery => "On battery",
+            Self::PluggedIn => "Plugged in · Not charging",
+            Self::Charging => "Charging",
+            Self::Full => "Fully charged",
+        }
+    }
+}
+
+/// The observed portion of the last 24 hours. A gap starts a new line on the chart.
+pub const HISTORY_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    pub observed_at: u64,
+    pub percent: u32,
+    pub source: Source,
+    pub gap_before: bool,
+}
+
+/// A temporary front-light level used when the owner enables Low power mode.
+pub const LOW_POWER_LIGHT: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Warning {
     #[default]
     None,
