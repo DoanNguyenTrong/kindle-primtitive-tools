@@ -39,6 +39,7 @@ pub enum UnpackError {
     DuplicateFile(String),
     ReservedPlace(String),
     BadManifest(String),
+    UnsupportedHooks,
 }
 
 impl fmt::Display for UnpackError {
@@ -56,6 +57,7 @@ impl fmt::Display for UnpackError {
             UnpackError::DuplicateFile(n) => write!(f, "{n} appears more than once in the package"),
             UnpackError::ReservedPlace(n) => write!(f, "{n} is outside the places an app may use"),
             UnpackError::BadManifest(e) => write!(f, "the manifest is not valid: {e}"),
+            UnpackError::UnsupportedHooks => write!(f, "this store does not support packages with install steps"),
         }
     }
 }
@@ -68,11 +70,7 @@ impl From<io::Error> for UnpackError {
 
 /// Files that are part of a package but are not installed into the Kindle (the store reads or keeps them).
 pub fn is_package_only(name: &str) -> bool {
-    name == "manifest.json"
-        || name == "INSTALL.md"
-        || name.starts_with("LICENSE")
-        || name == "hooks/post-install.sh"
-        || name == "hooks/pre-uninstall.sh"
+    matches!(name, "manifest.json" | "INSTALL.md" | "LICENSE" | "LICENSE-DOCS")
 }
 
 /// A relative path inside the package: no absolute paths, no `..`, no backslashes, no empty or `.` parts, no NUL.
@@ -111,33 +109,34 @@ pub fn valid_module_dir(dir: &str) -> bool {
 /// Unpacks a package into `dest` and checks it against `manifest`. Returns the installed file names, relative to the
 /// package's top folder and sorted.
 pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits) -> Result<Vec<String>, UnpackError> {
+    if !manifest.hooks.is_empty() {
+        return Err(UnpackError::UnsupportedHooks);
+    }
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| UnpackError::Zip(e.to_string()))?;
     if archive.len() > limits.max_files {
         return Err(UnpackError::TooManyFiles { limit: limits.max_files });
     }
 
-    // First pass: every name, the top folder, the sizes and the links, before anything is written.
+    // Validate the complete archive before writing payload files.
     let mut top: Option<String> = None;
     let mut total = 0u64;
     let mut entries: Vec<(usize, String)> = Vec::new();
     let mut names = BTreeSet::new();
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| UnpackError::Zip(e.to_string()))?;
-        let name = entry.name().to_string();
-        if !is_safe_relative(name.trim_end_matches('/')) {
-            return Err(UnpackError::UnsafeName(name));
+        let name = entry.name();
+        let relative = name.strip_suffix('/').unwrap_or(name);
+        if !is_safe_relative(relative) {
+            return Err(UnpackError::UnsafeName(name.to_string()));
         }
         if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
-            return Err(UnpackError::Symlink(name));
+            return Err(UnpackError::Symlink(name.to_string()));
         }
-        if !names.insert(name.trim_end_matches('/').to_ascii_lowercase()) {
-            return Err(UnpackError::DuplicateFile(name));
+        if !names.insert(relative.to_ascii_lowercase()) {
+            return Err(UnpackError::DuplicateFile(name.to_string()));
         }
-        let (folder, rest) = name.split_once('/').unwrap_or((name.as_str(), ""));
-        if !rest.is_empty() && !is_safe_relative(rest) {
-            return Err(UnpackError::UnsafeName(name));
-        }
+        let (folder, rest) = relative.split_once('/').unwrap_or((relative, ""));
         match &top {
             None => top = Some(folder.to_string()),
             Some(t) if t != folder => return Err(UnpackError::TopFolder(format!("{t} and {folder}"))),
@@ -146,11 +145,19 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
         if entry.is_dir() {
             continue;
         }
+        if rest.is_empty() {
+            return Err(UnpackError::UnsafeName(name.to_string()));
+        }
+        if rest.split('/').next().is_some_and(|part| part.eq_ignore_ascii_case("hooks")) {
+            return Err(UnpackError::UnsupportedHooks);
+        }
         total = total.saturating_add(entry.size());
         if total > limits.max_total_bytes {
             return Err(UnpackError::TooLarge { limit: limits.max_total_bytes });
         }
-        entries.push((i, rest.to_string()));
+        if !is_package_only(rest) {
+            entries.push((i, rest.to_string()));
+        }
     }
     top.ok_or_else(|| UnpackError::Zip("the package is empty".into()))?;
 
@@ -160,15 +167,23 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
             return Err(UnpackError::ReservedPlace(f.clone()));
         }
     }
+    let listed: BTreeSet<&str> = manifest.files.iter().map(String::as_str).collect();
+    if listed.len() != manifest.files.len() {
+        return Err(UnpackError::BadManifest("a file appears twice in the manifest".into()));
+    }
+    let present: BTreeSet<&str> = entries.iter().map(|(_, name)| name.as_str()).collect();
+    if let Some(extra) = present.difference(&listed).next() {
+        return Err(UnpackError::NotInManifest((*extra).to_string()));
+    }
+    if let Some(missing) = listed.difference(&present).next() {
+        return Err(UnpackError::MissingFromPackage((*missing).to_string()));
+    }
 
     // Second pass: write the files.
     let mut written: Vec<String> = Vec::new();
     let mut remaining = limits.max_total_bytes;
     for (i, rest) in &entries {
         let mut entry = archive.by_index(*i).map_err(|e| UnpackError::Zip(e.to_string()))?;
-        if rest.is_empty() || is_package_only(rest) {
-            continue;
-        }
         let out: PathBuf = dest.join(rest);
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
@@ -195,18 +210,6 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
     }
     written.sort();
 
-    // The files must match the manifest exactly.
-    let listed: BTreeSet<&str> = manifest.files.iter().map(String::as_str).collect();
-    if listed.len() != manifest.files.len() {
-        return Err(UnpackError::BadManifest("a file appears twice in the manifest".into()));
-    }
-    let present: BTreeSet<&str> = written.iter().map(String::as_str).collect();
-    if let Some(extra) = present.difference(&listed).next() {
-        return Err(UnpackError::NotInManifest((*extra).to_string()));
-    }
-    if let Some(missing) = listed.difference(&present).next() {
-        return Err(UnpackError::MissingFromPackage((*missing).to_string()));
-    }
     Ok(written)
 }
 
@@ -301,6 +304,7 @@ mod tests {
             &d.join("p.zip"),
             &[
                 ("browser-1.0.0/", b"", false),
+                ("browser-1.0.0/browser/", b"", false),
                 ("browser-1.0.0/manifest.json", b"{}", false),
                 ("browser-1.0.0/LICENSE", b"license", false),
                 ("browser-1.0.0/browser/kb-kindle", b"bin", false),
@@ -386,6 +390,20 @@ mod tests {
             unpack(&z2, &out, &manifest(&["browser/a", "browser/b"]), Limits::default()),
             Err(UnpackError::MissingFromPackage(n)) if n == "browser/b"
         ));
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn refuses_undeclared_hooks_without_unpacking_payload_files() {
+        let d = scratch("undeclared-hook");
+        let z = make_zip(&d.join("p.zip"), &[
+            ("b-1/browser/a", b"a", false),
+            ("b-1/hooks/post-install.sh", b"hook", false),
+        ]);
+        let out = d.join("out");
+        fs::create_dir_all(&out).unwrap();
+        assert!(matches!(unpack(&z, &out, &manifest(&["browser/a"]), Limits::default()), Err(UnpackError::UnsupportedHooks)));
+        assert_eq!(fs::read_dir(out).unwrap().count(), 0);
     }
 
     #[test]
