@@ -3,6 +3,8 @@
 pub use super::image::GrayImage;
 use super::{gray, Align as RenderAlign, Renderer, Text, BLACK, WHITE};
 use kl_core::{Layout, Rect, Status};
+use parley::{Affinity, Cursor};
+use primitive_keyboard::Editor;
 pub use primitive_quick::{icons, Icon};
 
 struct Picture {
@@ -151,6 +153,18 @@ impl Canvas {
             .ceil() as i32
     }
 
+    /// Draw an editable single line, keeping the editor's caret in view. Masked fields show one bullet per character.
+    pub fn single_line_field(
+        &mut self,
+        rect: Rect,
+        editor: &Editor,
+        placeholder: &str,
+        masked: bool,
+    ) {
+        self.renderer
+            .single_line_field(rect, editor, placeholder, masked);
+    }
+
     pub fn button(&mut self, rect: Rect, label: &str, primary: bool, pressed: bool) {
         let filled = primary != pressed;
         self.panel(rect, 16, 4, if filled { BLACK } else { WHITE });
@@ -203,6 +217,96 @@ impl Canvas {
             self.renderer.key(&key, rect, pressed == Some(rect));
         }
     }
+}
+
+impl Renderer {
+    pub(super) fn single_line_field(
+        &mut self,
+        field: Rect,
+        editor: &Editor,
+        placeholder: &str,
+        masked: bool,
+    ) {
+        if field.w <= 0 || field.h <= 0 {
+            return;
+        }
+        // The launcher's 100-pixel field supplies the proportions for smaller screens.
+        let scale = |measurement| (field.h as f32 * measurement / 100.0) as i32;
+        let border = scale(3.0).max(1);
+        self.rounded_frame(field, f64::from(scale(20.0)), border, BLACK, WHITE);
+        let padding = scale(28.0).min(field.w / 4);
+        let inner = Rect::new(
+            field.x + padding,
+            field.y + border,
+            field.w - 2 * padding,
+            field.h - 2 * border,
+        );
+        if inner.w < border || inner.h <= 0 {
+            return;
+        }
+        let clip = super::kurbo::Shape::to_path(&super::krect(inner), 0.1);
+        self.ctx.set_transform(super::Affine::IDENTITY);
+        self.ctx.push_clip_layer(&clip);
+        let (shown, caret) = single_line_content(editor, masked);
+        let mut text = Text {
+            text: &shown,
+            x: inner.x as f32,
+            y: (field.y + scale(30.0)) as f32,
+            w: inner.w as f32,
+            size: scale(40.0).max(1) as f32,
+            bold: false,
+            align: RenderAlign::Start,
+            lines: 1,
+            gray: BLACK,
+        };
+        if shown.is_empty() {
+            text.text = placeholder;
+            text.gray = 120;
+            self.text(text);
+        } else {
+            let layout = self.layout_text(&shown, text.size, false, f32::MAX);
+            let caret_x = Cursor::from_byte_index(&layout, caret, Affinity::Downstream)
+                .geometry(&layout, 0.0)
+                .x0;
+            let scroll = horizontal_scroll(caret_x, inner.w - border);
+            text.x -= scroll as f32;
+            self.draw_layout(&layout, &text);
+            self.fill(
+                Rect::new(
+                    inner.x + caret_x as i32 - scroll,
+                    field.y + scale(22.0),
+                    border,
+                    scale(56.0),
+                ),
+                BLACK,
+            );
+        }
+        self.ctx.pop_layer();
+    }
+}
+
+fn single_line_content(editor: &Editor, masked: bool) -> (String, usize) {
+    let shown = if masked {
+        "•".repeat(editor.text.len())
+    } else {
+        editor
+            .text
+            .iter()
+            .map(|&character| match character {
+                '\r' | '\n' | '\u{2028}' | '\u{2029}' => ' ',
+                _ => character,
+            })
+            .collect()
+    };
+    let caret = shown
+        .char_indices()
+        .nth(editor.caret)
+        .map_or(shown.len(), |(index, _)| index);
+    (shown, caret)
+}
+
+fn horizontal_scroll(caret_x: f64, visible_width: i32) -> i32 {
+    (caret_x as i32 - visible_width).max(0)
 }
 
 fn blit_picture(frame: &mut [u8], bounds: Rect, picture: &Picture, covered_by: &[(Rect, f32)]) {
@@ -291,6 +395,24 @@ impl TextStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_field_masks_characters_and_tracks_unicode_caret() {
+        let mut editor = Editor::new(16);
+        editor.text = "aé\nz".chars().collect();
+        editor.caret = 2;
+        assert_eq!(single_line_content(&editor, false), ("aé z".into(), 3));
+        assert_eq!(single_line_content(&editor, true), ("••••".into(), 6));
+        editor.caret = 42;
+        assert_eq!(single_line_content(&editor, false), ("aé z".into(), 5));
+    }
+
+    #[test]
+    fn single_line_field_scrolls_only_to_keep_the_caret_visible() {
+        assert_eq!(horizontal_scroll(40.0, 160), 0);
+        assert_eq!(horizontal_scroll(160.8, 160), 0);
+        assert_eq!(horizontal_scroll(215.2, 160), 55);
+    }
 
     #[test]
     fn pictures_clip_at_screen_edges_and_leave_overlapping_popup_visible() {

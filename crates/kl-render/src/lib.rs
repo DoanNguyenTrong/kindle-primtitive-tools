@@ -1538,18 +1538,7 @@ impl Renderer {
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         let name = ui.wifi_target.as_ref().map(|n| n.name.clone()).unwrap_or_default();
         self.text(Text { text: &name, x: MARGIN_X as f32, y: (l.title().bottom() + 24) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
-        let field = l.password_field();
-        self.rounded_frame(field, 20.0, 3, BLACK, WHITE);
-        let typed = &ui.password.text;
-        let shown = if ui.show_password { typed.iter().collect::<String>() } else { "•".repeat(typed.len()) };
-        let (text, gray) = if typed.is_empty() { ("Type the password".to_string(), 120) } else { (shown, BLACK) };
-        self.text(Text { text: &text, x: (field.x + 28) as f32, y: (field.y + 30) as f32, w: (field.w - 56) as f32, size: 40.0, bold: false, align: Align::Start, lines: 1, gray });
-        // The caret: a bar at the caret's place in the text (on the typed characters).
-        let caret_chars = if ui.show_password { ui.password.text[..ui.password.caret].iter().collect::<String>() } else { "•".repeat(ui.password.caret) };
-        let caret_x = field.x + 28 + self.text_width(&caret_chars, 40.0, false) as i32;
-        if !typed.is_empty() {
-            self.fill(Rect::new(caret_x, field.y + 22, 3, 56), BLACK);
-        }
+        self.single_line_field(l.password_field(), &ui.password, "Type the password", !ui.show_password);
         if ui.wifi_hidden {
             self.text(Text { text: "Leave it empty for an open network.", x: MARGIN_X as f32, y: (l.password_notice().y - 60) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 26.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
         }
@@ -1579,15 +1568,7 @@ impl Renderer {
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         self.text(Text { text: "Network name", x: MARGIN_X as f32, y: (title.bottom() + 24) as f32, w: 600.0, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
         let field = l.password_field();
-        self.rounded_frame(field, 20.0, 3, BLACK, WHITE);
-        let typed: String = ui.network_name.text.iter().collect();
-        let (text, gray) = if typed.is_empty() { ("Type the name, as it is written".to_string(), 120) } else { (typed.clone(), BLACK) };
-        self.text(Text { text: &text, x: (field.x + 28) as f32, y: (field.y + 30) as f32, w: (field.w - 56) as f32, size: 40.0, bold: false, align: Align::Start, lines: 1, gray });
-        if !typed.is_empty() {
-            let before: String = ui.network_name.text[..ui.network_name.caret].iter().collect();
-            let x = field.x + 28 + self.text_width(&before, 40.0, false) as i32;
-            self.fill(Rect::new(x, field.y + 22, 3, 56), BLACK);
-        }
+        self.single_line_field(field, &ui.network_name, "Type the name, as it is written", false);
         let note = "For a network that does not show in the list. Next asks for its password.";
         self.text(Text { text: note, x: MARGIN_X as f32, y: (field.bottom() + 24) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 26.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
         let area = l.keyboard_area();
@@ -1611,15 +1592,7 @@ impl Renderer {
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         self.text(Text { text: "Root password for SSH", x: MARGIN_X as f32, y: (title.bottom() + 24) as f32, w: 600.0, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
         let field = l.password_field();
-        self.rounded_frame(field, 20.0, 3, BLACK, WHITE);
-        let typed: String = ui.ssh_password.text.iter().collect();
-        let (text, gray) = if typed.is_empty() { ("Type the password".to_string(), 120) } else { (typed.clone(), BLACK) };
-        self.text(Text { text: &text, x: (field.x + 28) as f32, y: (field.y + 30) as f32, w: (field.w - 56) as f32, size: 40.0, bold: false, align: Align::Start, lines: 1, gray });
-        if !typed.is_empty() {
-            let before: String = ui.ssh_password.text[..ui.ssh_password.caret].iter().collect();
-            let x = field.x + 28 + self.text_width(&before, 40.0, false) as i32;
-            self.fill(Rect::new(x, field.y + 22, 3, 56), BLACK);
-        }
+        self.single_line_field(field, &ui.ssh_password, "Type the password", false);
         let note = "6 to 64 letters, digits or - _ . @ # % + = !, no spaces. Connect with the address on this page.";
         self.text(Text { text: note, x: MARGIN_X as f32, y: (field.bottom() + 24) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 26.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
         let area = l.keyboard_area();
