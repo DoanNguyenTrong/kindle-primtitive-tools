@@ -322,6 +322,7 @@ pub struct Ui {
     pub store_busy: bool,
     /// The app being installed from the store, if any (its page shows Installing, and its action waits).
     pub store_installing: Option<String>,
+    pub store_removing: bool,
     /// The app awaiting confirmation in the Remove dialog.
     pub store_remove_armed: Option<String>,
     /// Background jobs still running (shown in the status bar).
@@ -393,6 +394,7 @@ impl Ui {
             store_collection: None,
             store_busy: false,
             store_installing: None,
+            store_removing: false,
             store_remove_armed: None,
             running: 0,
             wifi: crate::wifi::WifiInfo::default(),

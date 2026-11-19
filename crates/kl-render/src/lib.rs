@@ -103,7 +103,7 @@ pub const STORE_SHOT_H: u32 = 540;
 /// The store's pictures in the cache: `icons/<id>.png` for each app, and `shots/<id>-<n>.png` (n from 0) for its
 /// screenshots. A picture that does not read is skipped; the store then shows the app's letter.
 pub fn load_store_pictures(renderer: &mut Renderer, cache: &std::path::Path) {
-    renderer.icons.retain(|key, _| !key.starts_with("store-icon:") && !key.starts_with("store-shot:"));
+    renderer.clear_store_artwork();
     if let Ok(read) = std::fs::read_dir(cache.join("icons")) {
         for e in read.flatten() {
             let path = e.path();
@@ -133,6 +133,10 @@ fn krect(r: Rect) -> kurbo::Rect {
 }
 
 impl Renderer {
+    pub fn clear_store_artwork(&mut self) {
+        self.icons.retain(|key, _| !key.starts_with("store-icon:") && !key.starts_with("store-shot:"));
+    }
+
     /// A renderer for a `width` × `height` screen with the fonts at `font_paths` (Noto Sans regular and
     /// bold). Fails when no font could be loaded.
     pub fn new(width: u32, height: u32, font_paths: &[String]) -> Result<Renderer, String> {
@@ -1323,7 +1327,12 @@ impl Renderer {
         let inner = sheet.inset(48);
         self.rounded_frame(sheet, POPUP_RADIUS as f64, 6, BLACK, WHITE);
         self.text(Text { text: "Remove from this Kindle?", x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        let explanation = format!("This removes {} from this Kindle. You can install it again from the store.", entry.name);
+        let consequence = if entry.system_changes {
+            "Removing it may change how your Kindle starts or runs."
+        } else {
+            "You can install it again from the store."
+        };
+        let explanation = format!("This removes {} from this Kindle. {consequence}", entry.name);
         self.text(Text { text: &explanation, x: inner.x as f32, y: (inner.y + 100) as f32, w: inner.w as f32, size: 36.0, bold: false, align: Align::Start, lines: 4, gray: BLACK });
         let [(_, cancel), (_, remove)] = l.confirm_buttons();
         self.button(cancel, "Cancel", false);
@@ -1344,7 +1353,11 @@ impl Renderer {
         self.text(Text { text: &e.name, x: 40.0, y: name.y as f32, w, size: 56.0, bold: true, align: Align::Center, lines: 2, gray: BLACK });
         let sub = l.store_subtitle(scroll);
         self.text(Text { text: &e.subtitle, x: 40.0, y: sub.y as f32, w, size: 32.0, bold: false, align: Align::Center, lines: 2, gray: 85 });
-        let label = if ui.store_installing.as_deref() == Some(e.id.as_str()) { "Installing" } else { e.action_label() };
+        let label = if ui.store_installing.as_deref() == Some(e.id.as_str()) {
+            if ui.store_removing { "Removing" } else { "Installing" }
+        } else {
+            e.action_label()
+        };
         self.store_capsule(l.store_action(scroll), label, e.can_install() || e.can_open() || e.kind == kl_core::store::Kind::Link, BLACK);
         let dev = l.store_developer(scroll);
         let caption = e.availability.clone().unwrap_or_else(|| {

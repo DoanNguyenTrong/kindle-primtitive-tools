@@ -8,6 +8,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
     pub name: &'static str,
+    /// Stable catalog name for this build's device profile.
+    pub catalog_name: &'static str,
     /// Screen size in device pixels, upright.
     pub screen_w: u32,
     pub screen_h: u32,
@@ -26,6 +28,7 @@ pub struct Profile {
 /// The Kindle Oasis 3 on firmware 5.18.2.
 pub const OASIS_3: Profile = Profile {
     name: "Kindle Oasis 3 (5.18.2)",
+    catalog_name: "KindleOasis3",
     screen_w: 1264,
     screen_h: 1680,
     touch_name: "cyttsp",
@@ -46,6 +49,7 @@ mod tests {
 
     #[test]
     fn the_oasis_3_values_are_unchanged() {
+        assert_eq!(ACTIVE.catalog_name, "KindleOasis3");
         assert_eq!((ACTIVE.screen_w, ACTIVE.screen_h), (1264, 1680));
         assert_eq!(ACTIVE.touch_name, "cyttsp");
         assert_eq!((ACTIVE.page_back_key, ACTIVE.page_forward_key), (104, 109));

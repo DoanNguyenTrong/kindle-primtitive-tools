@@ -1,6 +1,7 @@
 //! What the store has installed: `installed.json` in the store's folder. The file list of each app is what removal and
 //! update use, so nothing outside it is ever deleted.
 
+use crate::hooks::HookScripts;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,6 +31,9 @@ pub struct Installed {
     /// The requirements the app declared (`id` → `>=version`), so removal can refuse to break another app.
     #[serde(default)]
     pub requires: BTreeMap<String, String>,
+    /// Digests of the reviewed scripts retained for this installed package.
+    #[serde(default, skip_serializing_if = "HookScripts::is_empty")]
+    pub hooks: HookScripts,
 }
 
 impl Record {
@@ -89,6 +93,7 @@ mod tests {
             sha256: "0".repeat(64),
             files: vec![format!("{id}/x")],
             requires: requires.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+            hooks: HookScripts::default(),
         }
     }
 

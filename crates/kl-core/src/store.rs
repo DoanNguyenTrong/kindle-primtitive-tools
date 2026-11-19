@@ -129,7 +129,7 @@ pub fn change_lines(c: &Changes) -> Vec<String> {
         lines.push("Changes the Kindle's system files.".to_string());
     }
     if c.hooks {
-        lines.push("Runs its own install steps.".to_string());
+        lines.push("Runs reviewed install steps with system access.".to_string());
     }
     if lines.is_empty() {
         lines.push("Changes nothing outside its own folder.".to_string());
@@ -194,7 +194,9 @@ impl StoreEntry {
             changes: change_lines(&listing.changes),
             system_changes: listing.categories.iter().any(|category| category == "system")
                 || listing.changes.starts_at_boot
-                || listing.changes.root_filesystem,
+                || listing.changes.root_filesystem
+                || listing.changes.hooks
+                || installed.is_some_and(|app| !app.hooks.is_empty()),
             size: newest.and_then(|v| match arch {
                 Some(arch) => v.assets.get(arch),
                 None => v.assets.get("armhf").or_else(|| v.assets.values().next()),
@@ -222,8 +224,8 @@ impl StoreEntry {
             kind: Kind::Install,
             latest: None,
             status: Status::Installed(app.version.clone()),
-            changes: Vec::new(),
-            system_changes: false,
+            changes: if app.hooks.is_empty() { Vec::new() } else { vec!["Runs reviewed removal steps with system access.".into()] },
+            system_changes: !app.hooks.is_empty(),
             size: None,
             firmware_min: String::new(),
             tested_on: Vec::new(),
@@ -366,6 +368,7 @@ mod tests {
             sha256: String::new(),
             files: vec![],
             requires: Default::default(),
+            hooks: Default::default(),
         }
     }
 

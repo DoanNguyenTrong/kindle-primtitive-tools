@@ -11,3 +11,6 @@ kl-core = { path = "../kl-core" }
 primitive-device = { path = "../primitive-device" }
 primitive-eink = { path = "../primitive-eink" }
 primitive-input = { path = "../primitive-input" }
+libc.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

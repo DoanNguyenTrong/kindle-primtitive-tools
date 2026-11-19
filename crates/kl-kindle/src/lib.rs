@@ -3,6 +3,7 @@
 
 pub mod device;
 pub mod input;
+pub mod package_hooks;
 
 pub use primitive_device::{log, profile};
 pub use primitive_eink::{self as eink, display};

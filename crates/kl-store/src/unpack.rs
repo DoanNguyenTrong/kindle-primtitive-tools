@@ -3,6 +3,7 @@
 //! against the manifest: exactly the listed files, in the allowed places.
 
 use crate::catalog::Manifest;
+use crate::hooks::{HookScripts, MAX_HOOK_SIZE, POST_INSTALL_PATH, PRE_UNINSTALL_PATH};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File};
@@ -40,6 +41,7 @@ pub enum UnpackError {
     ReservedPlace(String),
     BadManifest(String),
     UnsupportedHooks,
+    InvalidHooks,
 }
 
 impl fmt::Display for UnpackError {
@@ -57,7 +59,8 @@ impl fmt::Display for UnpackError {
             UnpackError::DuplicateFile(n) => write!(f, "{n} appears more than once in the package"),
             UnpackError::ReservedPlace(n) => write!(f, "{n} is outside the places an app may use"),
             UnpackError::BadManifest(e) => write!(f, "the manifest is not valid: {e}"),
-            UnpackError::UnsupportedHooks => write!(f, "this store does not support packages with install steps"),
+            UnpackError::UnsupportedHooks => write!(f, "this package needs reviewed install steps"),
+            UnpackError::InvalidHooks => write!(f, "the package must contain exactly its declared install and undo hooks"),
         }
     }
 }
@@ -109,8 +112,24 @@ pub fn valid_module_dir(dir: &str) -> bool {
 /// Unpacks a package into `dest` and checks it against `manifest`. Returns the installed file names, relative to the
 /// package's top folder and sorted.
 pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits) -> Result<Vec<String>, UnpackError> {
-    if !manifest.hooks.is_empty() {
+    unpack_inner(zip_path, dest, manifest, limits, false).map(|(files, _)| files)
+}
+
+/// Inventory both hooks, stage them separately from installed files, and return their digests for approval.
+pub(crate) fn unpack_reviewed(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits) -> Result<HookScripts, UnpackError> {
+    unpack_inner(zip_path, dest, manifest, limits, true).map(|(_, hooks)| hooks)
+}
+
+fn unpack_inner(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits, review_hooks: bool) -> Result<(Vec<String>, HookScripts), UnpackError> {
+    let declared_hooks: BTreeSet<_> = manifest.hooks.iter().map(String::as_str).collect();
+    if !review_hooks && !declared_hooks.is_empty() {
         return Err(UnpackError::UnsupportedHooks);
+    }
+    if !declared_hooks.is_empty()
+        && (declared_hooks.len() != manifest.hooks.len()
+            || declared_hooks != BTreeSet::from([POST_INSTALL_PATH, PRE_UNINSTALL_PATH]))
+    {
+        return Err(UnpackError::InvalidHooks);
     }
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| UnpackError::Zip(e.to_string()))?;
@@ -122,6 +141,7 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
     let mut top: Option<String> = None;
     let mut total = 0u64;
     let mut entries: Vec<(usize, String)> = Vec::new();
+    let mut hooks = Vec::new();
     let mut names = BTreeSet::new();
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| UnpackError::Zip(e.to_string()))?;
@@ -148,18 +168,26 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
         if rest.is_empty() {
             return Err(UnpackError::UnsafeName(name.to_string()));
         }
-        if rest.split('/').next().is_some_and(|part| part.eq_ignore_ascii_case("hooks")) {
-            return Err(UnpackError::UnsupportedHooks);
-        }
         total = total.saturating_add(entry.size());
         if total > limits.max_total_bytes {
             return Err(UnpackError::TooLarge { limit: limits.max_total_bytes });
         }
-        if !is_package_only(rest) {
+        if rest.split('/').next().is_some_and(|part| part.eq_ignore_ascii_case("hooks")) {
+            if !review_hooks || !declared_hooks.contains(rest) {
+                return Err(UnpackError::UnsupportedHooks);
+            }
+            if entry.size() == 0 || entry.size() > MAX_HOOK_SIZE {
+                return Err(UnpackError::InvalidHooks);
+            }
+            hooks.push((i, rest.to_string()));
+        } else if !is_package_only(rest) {
             entries.push((i, rest.to_string()));
         }
     }
     top.ok_or_else(|| UnpackError::Zip("the package is empty".into()))?;
+    if declared_hooks.len() != hooks.len() {
+        return Err(UnpackError::InvalidHooks);
+    }
 
     // The manifest's own list must be safe too.
     for f in &manifest.files {
@@ -180,10 +208,12 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
     }
 
     // Second pass: write the files.
-    let mut written: Vec<String> = Vec::new();
+    let mut written: Vec<String> = Vec::with_capacity(entries.len());
+    let mut scripts = HookScripts::default();
     let mut remaining = limits.max_total_bytes;
-    for (i, rest) in &entries {
+    for (i, rest) in hooks.iter().chain(&entries) {
         let mut entry = archive.by_index(*i).map_err(|e| UnpackError::Zip(e.to_string()))?;
+        let is_hook = matches!(rest.as_str(), POST_INSTALL_PATH | PRE_UNINSTALL_PATH);
         let out: PathBuf = dest.join(rest);
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
@@ -191,6 +221,7 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
         let mode = entry.unix_mode();
         let mut out_file = File::create(&out)?;
         let mut buf = [0u8; 64 * 1024];
+        let mut hook_room = MAX_HOOK_SIZE;
         loop {
             let n = entry.read(&mut buf)?;
             if n == 0 {
@@ -198,9 +229,27 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
             }
             remaining = remaining.checked_sub(n as u64)
                 .ok_or(UnpackError::TooLarge { limit: limits.max_total_bytes })?;
+            if is_hook {
+                hook_room = hook_room.checked_sub(n as u64).ok_or(UnpackError::InvalidHooks)?;
+                if buf[..n].contains(&0) {
+                    return Err(UnpackError::InvalidHooks);
+                }
+            }
             out_file.write_all(&buf[..n])?;
         }
         drop(out_file);
+        if is_hook {
+            let (digest, length) = crate::verify::sha256_file(&out)?;
+            if length == 0 {
+                return Err(UnpackError::InvalidHooks);
+            }
+            match rest.as_str() {
+                POST_INSTALL_PATH => scripts.post_install = Some(digest),
+                PRE_UNINSTALL_PATH => scripts.pre_uninstall = Some(digest),
+                _ => unreachable!("only the known hook filenames were inventoried"),
+            }
+            continue;
+        }
         // Keep the package's permissions: a program or a library entry must stay executable on the Kindle.
         if let Some(m) = mode {
             use std::os::unix::fs::PermissionsExt;
@@ -210,7 +259,7 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
     }
     written.sort();
 
-    Ok(written)
+    Ok((written, scripts))
 }
 
 /// Reads and checks a package's `manifest.json` (the entry inside the zip, at its top folder).

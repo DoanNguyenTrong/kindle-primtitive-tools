@@ -23,6 +23,25 @@ pub fn power_loop(tx: Sender<Ev>) {
     });
 }
 
+/// Loading a trusted key opts the device into signed catalog and package verification.
+pub fn store_catalog_key() -> std::io::Result<Option<kl_store::signatures::TrustedKey>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Error, ErrorKind};
+        let Some(bytes) = crate::package_hooks::read_store_policy_file(crate::package_hooks::SIGNING_KEY_FILE, 128)? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+        kl_store::signatures::TrustedKey::from_hex(text.trim())
+            .map(Some)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
 /// Resolve the local Kindle's architecture and firmware version for the Store.
 pub fn store_device() -> Option<kl_store::resolve::Device> {
     let text = |path: &str| std::fs::read_to_string(path).ok();

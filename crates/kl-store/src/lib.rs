@@ -4,11 +4,13 @@
 //! the Mac with fixtures.
 
 pub mod catalog;
+pub mod hooks;
 pub mod refresh;
 pub mod install;
 pub mod pipeline;
 pub mod record;
 pub mod resolve;
+pub mod signatures;
 pub mod unpack;
 pub mod verify;
 pub mod version;

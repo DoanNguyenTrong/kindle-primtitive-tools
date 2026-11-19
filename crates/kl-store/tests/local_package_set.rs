@@ -2,6 +2,7 @@ use kl_store::catalog::{
     Asset, Changes, Developer, Index, Listing, Manifest, Source, VersionEntry,
 };
 use kl_store::install::{self, LauncherUpdate, Paths, LAUNCHER_ID};
+use kl_store::signatures::TrustedKey;
 use kl_store::{pipeline, record, refresh, resolve::Device, unpack, Version};
 use std::collections::BTreeSet;
 use std::fs;
@@ -38,9 +39,10 @@ impl refresh::Source for LocalCatalog {
     }
 }
 
-fn refresh_catalog(site: PathBuf, cache: &Path, packages: &[(Manifest, PathBuf)]) {
-    let site = LocalCatalog(site);
-    let report = refresh::refresh(CATALOG_URL, cache, &site).unwrap();
+fn refresh_catalog(site: &LocalCatalog, cache: &Path, packages: &[(Manifest, PathBuf)], key: Option<&TrustedKey>) -> refresh::CachedCatalog {
+    let report = refresh::refresh_with_key(CATALOG_URL, cache, site, key).unwrap();
+    let catalog = refresh::cached_catalog(cache, key).unwrap();
+    let cache = catalog.directory();
     assert!(report.failed.is_empty(), "{report:?}");
     let index: Index =
         serde_json::from_slice(&fs::read(cache.join("index.json")).unwrap()).unwrap();
@@ -86,6 +88,7 @@ fn refresh_catalog(site: PathBuf, cache: &Path, packages: &[(Manifest, PathBuf)]
         }
     }
     println!("Refreshed {} private catalog listings", report.refreshed);
+    catalog
 }
 
 fn synthetic_listing(manifest: &Manifest, archive: &Path, url: &str) -> Listing {
@@ -159,28 +162,35 @@ fn installs_and_removes_the_local_package_set() {
     fs::create_dir_all(&documents).unwrap();
     let user_file = documents.join("Personal note.txt");
     fs::write(&user_file, "user data").unwrap();
-    let catalog_cache = std::env::var_os("KL_TEST_CATALOG_SITE").map(|site| {
+    let catalog_source = std::env::var_os("KL_TEST_CATALOG_SITE").map(|site| LocalCatalog(site.into()));
+    let key = std::env::var_os("KL_TEST_CATALOG_PUBLIC_KEY").map(|path| {
+        assert!(catalog_source.is_some(), "a signing key requires a fixture catalog source");
+        let text = fs::read_to_string(path).unwrap();
+        TrustedKey::from_hex(text.trim()).unwrap()
+    });
+    let catalog_cache = catalog_source.as_ref().map(|site| {
         let cache = paths.root.join("launcher/store/cache");
-        refresh_catalog(site.into(), &cache, &packages);
-        cache
+        refresh_catalog(site, &cache, &packages, key.as_ref())
     });
 
     for (manifest, archive) in &packages {
         let zip = downloads.join(archive.file_name().unwrap());
         fs::copy(archive, &zip).unwrap();
         let listing = match &catalog_cache {
-            Some(cache) => {
-                let contents =
-                    fs::read(cache.join("apps").join(format!("{}.json", manifest.id))).unwrap();
-                serde_json::from_slice(&contents).unwrap()
-            }
+            Some(cache) => cache.listing(&manifest.id).unwrap(),
             None => synthetic_listing(
                 manifest,
                 archive,
                 "https://example.invalid/local-package.zip",
             ),
         };
-        let url = &listing.versions[0].assets[&manifest.arch].url;
+        let version = &listing.versions[0];
+        let asset = &version.assets[&manifest.arch];
+        if let (Some(key), Some(site)) = (&key, &catalog_source) {
+            refresh::verify_asset_signature(site, key, &listing.id, &version.version, &manifest.arch, asset).unwrap();
+            println!("Verified release signature for {} ({})", manifest.id, manifest.arch);
+        }
+        let url = &asset.url;
         let device = Device {
             arch: manifest.arch.clone(),
             firmware: Version::parse("5.18.2").unwrap(),

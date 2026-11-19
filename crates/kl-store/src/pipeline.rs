@@ -3,6 +3,7 @@
 //! install it with the journal. The download itself is the caller's; this takes the file it wrote.
 
 use crate::catalog::{valid_app_id, Listing, Manifest};
+use crate::hooks::{HookRunner, HookScripts};
 use crate::install::{self, Paths, Source};
 use crate::record;
 use crate::resolve::{self, Device};
@@ -31,6 +32,15 @@ pub enum Stage {
     Installing,
 }
 
+pub struct DownloadedPackage<'a> {
+    pub paths: &'a Paths,
+    pub listing: &'a Listing,
+    pub device: &'a Device,
+    pub zip: &'a Path,
+    pub source_url: &'a str,
+    pub installed_at: &'a str,
+}
+
 pub fn install_downloaded_with_progress(
     paths: &Paths,
     listing: &Listing,
@@ -38,23 +48,38 @@ pub fn install_downloaded_with_progress(
     zip: &Path,
     source_url: &str,
     installed_at: &str,
+    progress: impl FnMut(Stage),
+) -> Result<String, String> {
+    install_package(DownloadedPackage { paths, listing, device, zip, source_url, installed_at }, None, progress)
+}
+
+/// Use a reviewer-backed runner for an install or for updates of a previously reviewed app.
+pub fn install_downloaded_reviewed(
+    package: DownloadedPackage<'_>,
+    runner: &dyn HookRunner,
+    progress: impl FnMut(Stage),
+) -> Result<String, String> {
+    install_package(package, Some(runner), progress)
+}
+
+fn install_package(
+    package: DownloadedPackage<'_>,
+    runner: Option<&dyn HookRunner>,
     mut progress: impl FnMut(Stage),
 ) -> Result<String, String> {
     progress(Stage::Checking);
-    let result = install_inner(paths, listing, device, zip, source_url, installed_at, &mut progress);
+    let zip = package.zip;
+    let result = install_inner(package, runner, &mut progress);
     let _ = fs::remove_file(zip);
     result
 }
 
 fn install_inner(
-    paths: &Paths,
-    listing: &Listing,
-    device: &Device,
-    zip: &Path,
-    source_url: &str,
-    installed_at: &str,
+    package: DownloadedPackage<'_>,
+    runner: Option<&dyn HookRunner>,
     progress: &mut impl FnMut(Stage),
 ) -> Result<String, String> {
+    let DownloadedPackage { paths, listing, device, zip, source_url, installed_at } = package;
     install::require_idle(paths).map_err(|error| error.to_string())?;
     let chosen = resolve::pick_version(listing, device).map_err(|e| e.to_string())?;
     if listing.schema != 1 || !valid_app_id(&listing.id) || !unpack::valid_module_dir(listing.dir()) {
@@ -81,8 +106,12 @@ fn install_inner(
     {
         return Err("the package details do not match the catalog listing".into());
     }
-    if !manifest.hooks.is_empty() {
-        return Err("this store does not support packages with install steps".into());
+    let has_hooks = !manifest.hooks.is_empty();
+    if has_hooks != listing.changes.hooks {
+        return Err("the package and catalog disagree on custom install steps".into());
+    }
+    if has_hooks && (runner.is_none() || matches!(manifest.id.as_str(), install::LAUNCHER_ID | "primitive-store")) {
+        return Err("this package cannot use reviewed install steps".into());
     }
 
     let rec = record::load(&paths.record).map_err(|e| e.to_string())?;
@@ -104,14 +133,21 @@ fn install_inner(
     let staging = paths.staging.join(&listing.id);
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    if let Err(error) = unpack::unpack(zip, &staging, &manifest, Limits::default()) {
+    let unpacked = if has_hooks {
+        unpack::unpack_reviewed(zip, &staging, &manifest, Limits::default())
+    } else {
+        unpack::unpack(zip, &staging, &manifest, Limits::default()).map(|_| HookScripts::default())
+    };
+    let scripts = unpacked.map_err(|error| {
         let _ = fs::remove_dir_all(&staging);
-        return Err(error.to_string());
-    }
+        error.to_string()
+    })?;
     let source = Source { manifest: &manifest, source_url, sha256: &asset.sha256, installed_at };
     progress(Stage::Installing);
     let result = if manifest.id == install::LAUNCHER_ID {
         install::prepare_launcher_update(paths, &source).map_err(|error| error.to_string())
+    } else if let Some(runner) = runner {
+        install::install_with_hooks(paths, &source, scripts, runner, None).map_err(|error| error.to_string())
     } else {
         install::install(paths, &source, None).map_err(|error| error.to_string())
     };
@@ -167,6 +203,50 @@ mod tests {
 
     fn device() -> Device {
         Device { arch: "armhf".into(), firmware: Version::parse("5.18.2").unwrap() }
+    }
+
+    #[test]
+    fn a_reviewed_archive_stages_and_runs_only_its_declared_hooks() {
+        use crate::hooks::{verified_bytes, HookPhase, POST_INSTALL_PATH, PRE_UNINSTALL_PATH};
+        use std::{cell::RefCell, io};
+        struct FixtureRunner(RefCell<Vec<HookPhase>>);
+        impl HookRunner for FixtureRunner {
+            fn approve(&self, package: &record::Installed) -> io::Result<()> {
+                assert_eq!(package.id, "primitive-browser");
+                assert!(!package.hooks.is_empty());
+                Ok(())
+            }
+
+            fn run(&self, package: &record::Installed, phase: HookPhase, script: &Path) -> io::Result<()> {
+                assert_eq!(verified_bytes(script, package.hooks.digest(phase).unwrap())?, b"#!/bin/sh\nexit 0\n");
+                self.0.borrow_mut().push(phase);
+                Ok(())
+            }
+        }
+
+        let paths = paths("reviewed-pipeline");
+        let root = paths.root.join("downloads");
+        fs::create_dir_all(&root).unwrap();
+        let mut manifest = unpack::read_manifest(&package(&root, "primitive-browser", "0.2.18", "{}").0).unwrap();
+        manifest.hooks = [POST_INSTALL_PATH, PRE_UNINSTALL_PATH].map(str::to_string).to_vec();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let zip = make_zip(&root.join("reviewed.zip"), &[
+            ("primitive-browser-0.2.18/manifest.json", &bytes, false),
+            ("primitive-browser-0.2.18/primitive-browser/app.bin", b"payload", false),
+            ("primitive-browser-0.2.18/hooks/post-install.sh", b"#!/bin/sh\nexit 0\n", false),
+            ("primitive-browser-0.2.18/hooks/pre-uninstall.sh", b"#!/bin/sh\nexit 0\n", false),
+        ]);
+        let (sha, size) = verify::sha256_file(&zip).unwrap();
+        let mut listing = listing_for(&sha, size, "0.2.18");
+        listing.changes.hooks = true;
+        let kindle = device();
+        let downloaded = DownloadedPackage { paths: &paths, listing: &listing, device: &kindle, zip: &zip, source_url: "https://example.invalid/reviewed.zip", installed_at: "2026-11-19" };
+        let runner = FixtureRunner(RefCell::new(Vec::new()));
+        install_downloaded_reviewed(downloaded, &runner, |_| {}).unwrap();
+        assert!(!paths.root.join("primitive-browser/hooks").exists());
+        install::remove_with_hooks(&paths, "primitive-browser", &runner).unwrap();
+        assert_eq!(*runner.0.borrow(), [HookPhase::PostInstall, HookPhase::PreUninstall]);
+        assert!(!zip.exists());
     }
 
     fn paths(name: &str) -> Paths {

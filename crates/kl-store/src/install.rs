@@ -7,10 +7,12 @@
 //! the next start calls `recover`, which does the same.
 
 use crate::catalog::Manifest;
+use crate::hooks::{self, HookPhase, HookRunner, HookScripts};
 use crate::record::{self, Installed, Record};
 use crate::unpack::{is_allowed_place, is_safe_relative, valid_module_dir};
 use crate::verify::sha256_file;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -109,6 +111,16 @@ pub struct Journal {
     pub previous: Option<Installed>,
     #[serde(default)]
     pub trial: Option<Trial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<HookChange>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct HookChange {
+    candidate: Option<Installed>,
+    previous_started: bool,
+    candidate_started: bool,
+    files_restored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,7 +138,14 @@ fn write_journal(path: &Path, j: &Journal) -> io::Result<()> {
     serde_json::to_writer(&mut file, j).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     file.flush()?;
     file.sync_all()?;
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    if j.hooks.is_some() {
+        // The intent must survive before a hook changes files outside the Store journal.
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 fn read_journal(path: &Path) -> io::Result<Option<Journal>> {
@@ -145,6 +164,40 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn sync_payload_directories<'a>(root: &Path, paths: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        for parent in path.ancestors().skip(1) {
+            directories.insert(parent);
+            if parent == root {
+                break;
+            }
+        }
+    }
+    for directory in directories.into_iter().rev() {
+        match fs::File::open(directory) {
+            Ok(file) => file.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn sync_hook_payload(paths: &Paths, relatives: impl IntoIterator<Item = impl AsRef<Path>>) -> io::Result<()> {
+    let targets: Vec<_> = relatives.into_iter().map(|relative| paths.root.join(relative)).collect();
+    sync_payload_directories(&paths.root, targets.iter().map(PathBuf::as_path))
+}
+
+fn clear_journal(paths: &Paths, journal: &Journal) -> io::Result<()> {
+    remove_if_exists(&paths.journal)?;
+    if journal.hooks.is_some() {
+        sync_payload_directories(&paths.root, [paths.journal.as_path()])?;
+    }
+    let _ = fs::remove_dir_all(paths.staging.join(&journal.id));
+    Ok(())
 }
 
 fn prev_of(path: &Path) -> PathBuf {
@@ -285,6 +338,7 @@ fn installed_entry(source: &Source<'_>) -> Installed {
         sha256: source.sha256.to_string(),
         files: source.manifest.files.clone(),
         requires: source.manifest.requires.clone(),
+        hooks: HookScripts::default(),
     }
 }
 
@@ -293,6 +347,9 @@ fn journal_for_install(paths: &Paths, rec: &Record, source: &Source<'_>) -> io::
     let previous = rec.apps.get(&id).cloned();
     validate_changes(paths, rec, &id, &source.manifest.dir, &source.manifest.files)?;
     if let Some(previous) = &previous {
+        if previous.id != id {
+            return Err(invalid_data("the Store record does not identify the installed app".into()));
+        }
         validate_changes(paths, rec, &id, &previous.dir, &previous.files)?;
     }
     let obsolete: Vec<String> = previous
@@ -311,6 +368,7 @@ fn journal_for_install(paths: &Paths, rec: &Record, source: &Source<'_>) -> io::
         obsolete,
         previous,
         trial: None,
+        hooks: None,
     })
 }
 
@@ -329,6 +387,9 @@ fn move_files(paths: &Paths, journal: &mut Journal, dir: &str, files: &[String],
             fs::create_dir_all(parent)?;
         }
         let had_old = existing_size.is_some();
+        if journal.hooks.is_some() {
+            fs::File::open(&src)?.sync_all()?;
+        }
         journal.done.push(Done { path: relative.clone(), prev: had_old });
         write_journal(&paths.journal, journal)?;
         if had_old {
@@ -336,38 +397,122 @@ fn move_files(paths: &Paths, journal: &mut Journal, dir: &str, files: &[String],
         }
         fs::rename(&src, &dst).map_err(|e| io::Error::new(e.kind(), format!("{relative}: {e}")))?;
     }
+    if journal.hooks.is_some() {
+        let sources: Vec<_> = files.iter().map(|file| paths.staging.join(&journal.id).join(file)).collect();
+        sync_payload_directories(&paths.root, sources.iter().map(PathBuf::as_path))?;
+        sync_hook_payload(paths, files)?;
+    }
     Ok(())
 }
 
 /// Installs or updates an app from verified unpacked staging. `fail_after` is used by rollback tests.
 pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) -> Result<(), InstallError> {
+    install_package(paths, source, HookScripts::default(), None, fail_after)
+}
+
+/// Installs a reviewed package using the caller's approval and execution implementation.
+pub fn install_with_hooks(
+    paths: &Paths,
+    source: &Source<'_>,
+    scripts: HookScripts,
+    runner: &dyn HookRunner,
+    fail_after: Option<usize>,
+) -> Result<(), InstallError> {
+    install_package(paths, source, scripts, Some(runner), fail_after)
+}
+
+fn install_package(
+    paths: &Paths,
+    source: &Source<'_>,
+    scripts: HookScripts,
+    runner: Option<&dyn HookRunner>,
+    fail_after: Option<usize>,
+) -> Result<(), InstallError> {
     require_idle(paths)?;
     if source.manifest.id == LAUNCHER_ID {
         return Err(invalid_data("Launcher updates must restart through the Store".into()).into());
     }
+    scripts.check_manifest(&source.manifest.hooks)?;
     let mut rec = record::load(&paths.record)?;
     let mut journal = journal_for_install(paths, &rec, source)?;
+    let mut installed = installed_entry(source);
+    installed.hooks = scripts;
+    let candidate = (!installed.hooks.is_empty()).then_some(&installed);
+    let previous = journal.previous.as_ref().filter(|app| !app.hooks.is_empty());
+    let shared_hooks = same_hooks(candidate, previous)?;
+    if let Some(previous) = previous {
+        hooks::preflight(&paths.root, previous, reviewed_runner(runner)?)?;
+    }
+    if let Some(candidate) = candidate {
+        hooks::validate(candidate)?;
+        reviewed_runner(runner)?.approve(candidate)?;
+        hooks::check_staged(&paths.root, &paths.staging, candidate, shared_hooks)?;
+    }
+    if candidate.is_some() || previous.is_some() {
+        journal.hooks = Some(HookChange { candidate: candidate.cloned(), ..HookChange::default() });
+    }
     write_journal(&paths.journal, &journal)?;
 
-    if let Err(error) = move_files(paths, &mut journal, &source.manifest.dir, &source.manifest.files, fail_after) {
-        undo(paths, &journal.done)?;
-        remove_if_exists(&paths.journal)?;
-        return Err(InstallError::RolledBack(error.to_string()));
+    let changed = (|| -> io::Result<()> {
+        if !installed.hooks.is_empty() {
+            hooks::retain(&paths.root, &paths.staging, &installed, shared_hooks)?;
+        }
+        start_previous_hook(paths, &mut journal, runner)?;
+        move_files(paths, &mut journal, &source.manifest.dir, &source.manifest.files, fail_after)?;
+        start_candidate_hook(paths, &mut journal, runner)?;
+        // The record becomes authoritative once the next journal state commits.
+        rec.schema = record::SCHEMA;
+        rec.apps.insert(installed.id.clone(), installed);
+        record::save(&paths.record, &rec)
+            .map_err(|error| io::Error::new(error.kind(), format!("cannot save the record: {error}")))
+    })();
+    if let Err(error) = changed {
+        return Err(rollback_error(paths, &mut journal, runner, error));
     }
 
-    // Record the new version, then clean up.
-    rec.schema = record::SCHEMA;
-    let installed = installed_entry(source);
-    rec.apps.insert(installed.id.clone(), installed);
-    if let Err(e) = record::save(&paths.record, &rec) {
-        undo(paths, &journal.done)?;
-        remove_if_exists(&paths.journal)?;
-        return Err(InstallError::RolledBack(format!("cannot save the record: {e}")));
-    }
     journal.state = State::Recorded;
     write_journal(&paths.journal, &journal)?;
     finish(paths, &journal)?;
     Ok(())
+}
+
+fn reviewed_runner(runner: Option<&dyn HookRunner>) -> io::Result<&dyn HookRunner> {
+    runner.ok_or_else(|| invalid_data("this Store change needs a reviewed hook runner".into()))
+}
+
+fn same_hooks(candidate: Option<&Installed>, previous: Option<&Installed>) -> io::Result<bool> {
+    let (Some(candidate), Some(previous)) = (candidate, previous) else { return Ok(false) };
+    if candidate.sha256 != previous.sha256 {
+        return Ok(false);
+    }
+    if candidate.id != previous.id || candidate.hooks != previous.hooks {
+        return Err(invalid_data("the retained hook identity conflicts with the installed package".into()));
+    }
+    Ok(true)
+}
+
+fn start_previous_hook(paths: &Paths, journal: &mut Journal, runner: Option<&dyn HookRunner>) -> io::Result<()> {
+    let Some(previous) = journal.previous.as_ref().filter(|app| !app.hooks.is_empty()) else { return Ok(()) };
+    let runner = reviewed_runner(runner)?;
+    journal.hooks.as_mut().expect("reviewed transaction was prepared").previous_started = true;
+    if let Err(error) = write_journal(&paths.journal, journal) {
+        journal.hooks.as_mut().expect("reviewed transaction was prepared").previous_started = false;
+        return Err(error);
+    }
+    hooks::invoke(&paths.root, previous, HookPhase::PreUninstall, runner)
+}
+
+fn start_candidate_hook(paths: &Paths, journal: &mut Journal, runner: Option<&dyn HookRunner>) -> io::Result<()> {
+    let Some(change) = journal.hooks.as_mut().filter(|change| change.candidate.is_some()) else { return Ok(()) };
+    let runner = reviewed_runner(runner)?;
+    change.candidate_started = true;
+    if let Err(error) = write_journal(&paths.journal, journal) {
+        journal.hooks.as_mut().expect("reviewed transaction was prepared").candidate_started = false;
+        return Err(error);
+    }
+    let candidate = journal.hooks.as_ref().and_then(|change| change.candidate.as_ref())
+        .expect("reviewed candidate was prepared");
+    hooks::invoke(&paths.root, candidate, HookPhase::PostInstall, runner)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +542,9 @@ fn launcher_candidate(journal: &Journal) -> io::Result<&Trial> {
 pub fn prepare_launcher_update(paths: &Paths, source: &Source<'_>) -> io::Result<()> {
     require_idle(paths)?;
     let record = record::load(&paths.record)?;
+    if !source.manifest.hooks.is_empty() || record.apps.get(LAUNCHER_ID).is_some_and(|app| !app.hooks.is_empty()) {
+        return Err(invalid_data("Launcher updates cannot use reviewed hooks".into()));
+    }
     let mut journal = journal_for_install(paths, &record, source)?;
     journal.state = State::Prepared;
     journal.trial = Some(Trial { candidate: installed_entry(source), attempts: 0 });
@@ -499,9 +647,17 @@ fn finish(paths: &Paths, journal: &Journal) -> io::Result<()> {
             prune_empty_parents(paths, &file.path);
         }
     }
-    remove_if_exists(&paths.journal)?;
-    let _ = fs::remove_dir_all(paths.staging.join(&journal.id));
-    Ok(())
+    let previous = journal.previous.as_ref().filter(|app| !app.hooks.is_empty());
+    let candidate = journal.hooks.as_ref().and_then(|change| change.candidate.as_ref());
+    if let Some(previous) = previous {
+        if !same_hooks(candidate, Some(previous))? {
+            hooks::purge(&paths.root, previous)?;
+        }
+    }
+    if journal.hooks.is_some() {
+        sync_hook_payload(paths, journal.obsolete.iter().chain(journal.done.iter().map(|file| &file.path)))?;
+    }
+    clear_journal(paths, journal)
 }
 
 fn prune_empty_parents(paths: &Paths, relative: &str) {
@@ -531,6 +687,32 @@ fn validate_journal(paths: &Paths, journal: &Journal, record: &Record) -> io::Re
     if !is_safe_relative(&journal.id) || journal.id.contains('/') {
         return Err(invalid_data("the Store journal has an invalid app id".into()));
     }
+    let previous = journal.previous.as_ref().filter(|app| !app.hooks.is_empty());
+    if let Some(previous) = previous {
+        if previous.id != journal.id || journal.hooks.is_none() {
+            return Err(invalid_data("invalid previous hook identity in the Store journal".into()));
+        }
+        hooks::validate(previous)?;
+    }
+    if let Some(change) = &journal.hooks {
+        let candidate = change.candidate.as_ref();
+        if matches!(journal.state, State::Prepared | State::Trial | State::Reverting)
+            || (change.previous_started && previous.is_none())
+            || (change.candidate_started && (candidate.is_none() || change.files_restored))
+        {
+            return Err(invalid_data("invalid hook operation in the Store journal".into()));
+        }
+        if let Some(candidate) = candidate {
+            if matches!(journal.state, State::Removing | State::Removed)
+                || candidate.id != journal.id || candidate.version != journal.version
+                || Some(candidate.dir.as_str()) != journal.dir.as_deref() || candidate.hooks.is_empty()
+            {
+                return Err(invalid_data("invalid candidate hook identity in the Store journal".into()));
+            }
+            hooks::validate(candidate)?;
+        }
+        same_hooks(candidate, previous)?;
+    }
     let dir = journal.dir.as_deref()
         .or_else(|| record.apps.get(&journal.id).map(|app| app.dir.as_str()))
         .or_else(|| journal.previous.as_ref().map(|app| app.dir.as_str()));
@@ -551,11 +733,23 @@ fn validate_journal(paths: &Paths, journal: &Journal, record: &Record) -> io::Re
 /// Called at every start: an install that did not finish is finished (if the record was saved) or undone (if not).
 /// Returns what was done, or `None` when there was nothing to do.
 pub fn recover(paths: &Paths) -> io::Result<Option<String>> {
-    let Some(journal) = read_journal(&paths.journal)? else {
+    recover_package(paths, None)
+}
+
+/// Recover a transaction whose reviewed system changes may need compensation on restart.
+pub fn recover_with_hooks(paths: &Paths, runner: &dyn HookRunner) -> io::Result<Option<String>> {
+    recover_package(paths, Some(runner))
+}
+
+fn recover_package(paths: &Paths, runner: Option<&dyn HookRunner>) -> io::Result<Option<String>> {
+    let Some(mut journal) = read_journal(&paths.journal)? else {
         return Ok(None);
     };
-    let mut rec = record::load(&paths.record)?;
+    let rec = record::load(&paths.record)?;
     validate_journal(paths, &journal, &rec)?;
+    if journal.hooks.is_some() && runner.is_none() {
+        return Err(invalid_data("Open Primitive Store to recover the reviewed system change.".into()));
+    }
     match journal.state {
         State::Recorded | State::Removed => {
             let description = if journal.state == State::Removed { "removal" } else { "update" };
@@ -564,28 +758,80 @@ pub fn recover(paths: &Paths) -> io::Result<Option<String>> {
         }
         State::Prepared | State::Trial => Ok(None),
         State::Moving | State::Removing | State::Reverting => {
-            undo(paths, &journal.done)?;
-            // Restore the record exactly as it was before this install.
-            match &journal.previous {
-                Some(prev) => {
-                    rec.apps.insert(journal.id.clone(), prev.clone());
-                }
-                None => {
-                    rec.apps.remove(&journal.id);
-                }
-            }
-            record::save(&paths.record, &rec)?;
-            remove_if_exists(&paths.journal)?;
-            let _ = fs::remove_dir_all(paths.staging.join(&journal.id));
+            rollback(paths, &mut journal, runner)?;
             let description = if journal.state == State::Removing { "removal" } else { "install" };
             Ok(Some(format!("undid the unfinished {description} of {} {}", journal.id, journal.version)))
         }
     }
 }
 
+fn rollback_error(paths: &Paths, journal: &mut Journal, runner: Option<&dyn HookRunner>, error: io::Error) -> InstallError {
+    match rollback(paths, journal, runner) {
+        Ok(()) => InstallError::RolledBack(error.to_string()),
+        Err(recovery) => InstallError::Io(io::Error::other(format!(
+            "the Store change failed: {error}. Recovery is still required: {recovery}"
+        ))),
+    }
+}
+
+fn rollback(paths: &Paths, journal: &mut Journal, runner: Option<&dyn HookRunner>) -> io::Result<()> {
+    if let Some(change) = &journal.hooks {
+        if change.previous_started {
+            hooks::preflight(&paths.root, journal.previous.as_ref().unwrap(), reviewed_runner(runner)?)?;
+        }
+        if change.candidate_started {
+            hooks::invoke(&paths.root, change.candidate.as_ref().unwrap(), HookPhase::PreUninstall, reviewed_runner(runner)?)?;
+            journal.hooks.as_mut().unwrap().candidate_started = false;
+            write_journal(&paths.journal, journal)?;
+        }
+    }
+
+    if !journal.hooks.as_ref().is_some_and(|change| change.files_restored) {
+        undo(paths, &journal.done)?;
+        let mut rec = record::load(&paths.record)?;
+        if rec.apps.get(&journal.id) != journal.previous.as_ref() {
+            if let Some(previous) = &journal.previous {
+                rec.apps.insert(journal.id.clone(), previous.clone());
+            } else {
+                rec.apps.remove(&journal.id);
+            }
+            record::save(&paths.record, &rec)?;
+        }
+        if let Some(change) = &mut journal.hooks {
+            sync_hook_payload(paths, journal.done.iter().map(|file| &file.path))?;
+            change.files_restored = true;
+            write_journal(&paths.journal, journal)?;
+        }
+    }
+
+    if let Some(change) = &journal.hooks {
+        if change.previous_started {
+            hooks::invoke(&paths.root, journal.previous.as_ref().unwrap(), HookPhase::PostInstall, reviewed_runner(runner)?)?;
+            journal.hooks.as_mut().unwrap().previous_started = false;
+            write_journal(&paths.journal, journal)?;
+        }
+        if let Some(candidate) = journal.hooks.as_ref().and_then(|change| change.candidate.as_ref()) {
+            let previous = journal.previous.as_ref().filter(|app| !app.hooks.is_empty());
+            if !same_hooks(Some(candidate), previous)? {
+                hooks::purge(&paths.root, candidate)?;
+            }
+        }
+    }
+    clear_journal(paths, journal)
+}
+
 /// Removes an installed app: exactly the files in its record, then the empty folders above them (never the root).
 /// Refused when another installed app requires it.
 pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
+    remove_package(paths, id, None)
+}
+
+/// Remove a reviewed package after its system cleanup hook succeeds.
+pub fn remove_with_hooks(paths: &Paths, id: &str, runner: &dyn HookRunner) -> Result<(), InstallError> {
+    remove_package(paths, id, Some(runner))
+}
+
+fn remove_package(paths: &Paths, id: &str, runner: Option<&dyn HookRunner>) -> Result<(), InstallError> {
     require_idle(paths)?;
     let mut rec = record::load(&paths.record)?;
     let deps = rec.dependents_of(id);
@@ -595,7 +841,14 @@ pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
     let Some(app) = rec.apps.get(id).cloned() else {
         return Ok(());
     };
+    if app.id != id {
+        return Err(invalid_data("the Store record does not identify the installed app".into()).into());
+    }
     validate_changes(paths, &rec, id, &app.dir, &app.files)?;
+    let uses_hooks = !app.hooks.is_empty();
+    if uses_hooks {
+        hooks::preflight(&paths.root, &app, reviewed_runner(runner)?)?;
+    }
     let mut journal = Journal {
         id: id.to_string(),
         version: app.version.clone(),
@@ -605,9 +858,11 @@ pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
         obsolete: Vec::new(),
         previous: Some(app.clone()),
         trial: None,
+        hooks: uses_hooks.then(HookChange::default),
     };
     write_journal(&paths.journal, &journal)?;
     let moved = (|| -> io::Result<()> {
+        start_previous_hook(paths, &mut journal, runner)?;
         for relative in &app.files {
             let target = paths.root.join(relative);
             if target.try_exists()? {
@@ -616,18 +871,17 @@ pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
                 fs::rename(&target, prev_of(&target))?;
             }
         }
+        if uses_hooks {
+            sync_hook_payload(paths, journal.done.iter().map(|file| &file.path))?;
+        }
         Ok(())
     })();
     if let Err(error) = moved {
-        undo(paths, &journal.done)?;
-        remove_if_exists(&paths.journal)?;
-        return Err(InstallError::RolledBack(error.to_string()));
+        return Err(rollback_error(paths, &mut journal, runner, error));
     }
     rec.apps.remove(id);
     if let Err(error) = record::save(&paths.record, &rec) {
-        undo(paths, &journal.done)?;
-        remove_if_exists(&paths.journal)?;
-        return Err(InstallError::RolledBack(error.to_string()));
+        return Err(rollback_error(paths, &mut journal, runner, error));
     }
     journal.state = State::Removed;
     write_journal(&paths.journal, &journal)?;
@@ -639,6 +893,7 @@ pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
 mod tests {
     use super::*;
     use crate::catalog::{Firmware, Manifest};
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
 
     struct World {
@@ -650,6 +905,212 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         World { paths: Paths::under(&root) }
+    }
+
+    struct ReviewFixture<'a> {
+        root: &'a Path,
+        approved: Cell<bool>,
+        calls: RefCell<Vec<(String, HookPhase)>>,
+        fail: RefCell<Vec<(String, HookPhase)>>,
+    }
+
+    impl<'a> ReviewFixture<'a> {
+        fn new(root: &'a Path) -> Self {
+            Self { root, approved: Cell::new(true), calls: RefCell::default(), fail: RefCell::default() }
+        }
+
+        fn effect(&self) -> PathBuf {
+            self.root.join("mock-system-setting")
+        }
+
+        fn fail_on(&self, version: &str, phase: HookPhase) {
+            self.fail.borrow_mut().push((version.into(), phase));
+        }
+    }
+
+    impl HookRunner for ReviewFixture<'_> {
+        fn approve(&self, _package: &Installed) -> io::Result<()> {
+            if self.approved.get() {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "fixture review denied"))
+            }
+        }
+
+        fn run(&self, package: &Installed, phase: HookPhase, script: &Path) -> io::Result<()> {
+            let bytes = hooks::verified_bytes(script, package.hooks.digest(phase).unwrap())?;
+            assert_eq!(bytes, script_body(&package.version, phase));
+            let app = fs::read_to_string(self.root.join(&package.files[0]))?;
+            assert!(app.starts_with(&package.version), "hook saw wrong payload: {app}");
+            let call = (package.version.clone(), phase);
+            self.calls.borrow_mut().push(call.clone());
+            match phase {
+                HookPhase::PostInstall => fs::write(self.effect(), package.version.as_bytes())?,
+                HookPhase::PreUninstall => remove_if_exists(&self.effect())?,
+            }
+            let mut fail = self.fail.borrow_mut();
+            if let Some(index) = fail.iter().position(|expected| *expected == call) {
+                fail.remove(index);
+                return Err(io::Error::other("fixture stopped after its first system effect"));
+            }
+            Ok(())
+        }
+    }
+
+    fn script_body(version: &str, phase: HookPhase) -> Vec<u8> {
+        format!("{} {version}", phase.file_name()).into_bytes()
+    }
+
+    fn stage_reviewed(paths: &Paths, manifest: &mut Manifest, label: &str) -> HookScripts {
+        manifest.hooks = vec![hooks::POST_INSTALL_PATH.into(), hooks::PRE_UNINSTALL_PATH.into()];
+        stage(paths, manifest, label);
+        let mut digests = HookScripts::default();
+        let staging = paths.staging.join(&manifest.id);
+        fs::create_dir_all(staging.join("hooks")).unwrap();
+        for phase in [HookPhase::PostInstall, HookPhase::PreUninstall] {
+            let bytes = script_body(&manifest.version, phase);
+            fs::write(staging.join(phase.manifest_path()), &bytes).unwrap();
+            match phase {
+                HookPhase::PostInstall => digests.post_install = Some(hooks::sha256(&bytes)),
+                HookPhase::PreUninstall => digests.pre_uninstall = Some(hooks::sha256(&bytes)),
+            }
+        }
+        digests
+    }
+
+    fn reviewed_source<'a>(manifest: &'a Manifest, asset_sha: &'a str) -> Source<'a> {
+        Source { sha256: asset_sha, ..src(manifest) }
+    }
+
+    fn retained_dir(paths: &Paths, digest: &str) -> PathBuf {
+        paths.root.join("launcher/store/hooks/notes").join(digest)
+    }
+
+    #[test]
+    fn reviewed_update_and_removal_keep_only_the_current_hook_pair() {
+        let w = world("reviewed-hooks");
+        let runner = ReviewFixture::new(&w.paths.root);
+        let mut old = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        let mut new = manifest("notes", "2.0.0", &["notes/app"], &[]);
+        let old_sha = "1".repeat(64);
+        let new_sha = "2".repeat(64);
+        let old_scripts = stage_reviewed(&w.paths, &mut old, "old");
+        install_with_hooks(&w.paths, &reviewed_source(&old, &old_sha), old_scripts.clone(), &runner, None).unwrap();
+        assert!(retained_dir(&w.paths, &old_sha).is_dir());
+        assert_eq!(record::load(&w.paths.record).unwrap().apps["notes"].hooks, old_scripts);
+
+        let new_scripts = stage_reviewed(&w.paths, &mut new, "new");
+        install_with_hooks(&w.paths, &reviewed_source(&new, &new_sha), new_scripts, &runner, None).unwrap();
+        assert!(!retained_dir(&w.paths, &old_sha).exists());
+        assert!(retained_dir(&w.paths, &new_sha).is_dir());
+        assert_eq!(fs::read_to_string(runner.effect()).unwrap(), "2.0.0");
+        assert!(remove(&w.paths, "notes").is_err());
+        assert!(!w.paths.journal.exists());
+        remove_with_hooks(&w.paths, "notes", &runner).unwrap();
+        assert!(!runner.effect().exists());
+        assert!(!retained_dir(&w.paths, &new_sha).exists());
+        assert_eq!(*runner.calls.borrow(), [
+            ("1.0.0".into(), HookPhase::PostInstall),
+            ("1.0.0".into(), HookPhase::PreUninstall),
+            ("2.0.0".into(), HookPhase::PostInstall),
+            ("2.0.0".into(), HookPhase::PreUninstall),
+        ]);
+    }
+
+    #[test]
+    fn recovery_retries_a_half_finished_hook_compensation_before_restoring_the_old_app() {
+        let w = world("reviewed-retry");
+        let runner = ReviewFixture::new(&w.paths.root);
+        let mut old = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        let mut new = manifest("notes", "2.0.0", &["notes/app"], &[]);
+        let old_sha = "1".repeat(64);
+        let new_sha = "2".repeat(64);
+        let scripts = stage_reviewed(&w.paths, &mut old, "old");
+        install_with_hooks(&w.paths, &reviewed_source(&old, &old_sha), scripts, &runner, None).unwrap();
+        let scripts = stage_reviewed(&w.paths, &mut new, "new");
+        runner.fail_on("2.0.0", HookPhase::PostInstall);
+        runner.fail_on("2.0.0", HookPhase::PreUninstall);
+        let error = install_with_hooks(&w.paths, &reviewed_source(&new, &new_sha), scripts, &runner, None).unwrap_err();
+        assert!(error.to_string().contains("Recovery is still required"));
+        assert!(recover(&w.paths).is_err());
+        assert_eq!(fs::read_to_string(w.paths.root.join("notes/app")).unwrap(), "2.0.0 new");
+
+        recover_with_hooks(&w.paths, &runner).unwrap().unwrap();
+        assert!(recover_with_hooks(&w.paths, &runner).unwrap().is_none());
+        assert_eq!(fs::read_to_string(w.paths.root.join("notes/app")).unwrap(), "1.0.0 old");
+        assert_eq!(fs::read_to_string(runner.effect()).unwrap(), "1.0.0");
+        assert_eq!(record::load(&w.paths.record).unwrap().apps["notes"].version, "1.0.0");
+        assert!(retained_dir(&w.paths, &old_sha).exists());
+        assert!(!retained_dir(&w.paths, &new_sha).exists());
+    }
+
+    #[test]
+    fn a_failed_removal_hook_reapplies_the_previous_system_setting() {
+        let w = world("reviewed-remove-rollback");
+        let runner = ReviewFixture::new(&w.paths.root);
+        let mut app = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        let sha = "1".repeat(64);
+        let scripts = stage_reviewed(&w.paths, &mut app, "old");
+        install_with_hooks(&w.paths, &reviewed_source(&app, &sha), scripts, &runner, None).unwrap();
+        runner.fail_on("1.0.0", HookPhase::PreUninstall);
+        assert!(matches!(remove_with_hooks(&w.paths, "notes", &runner), Err(InstallError::RolledBack(_))));
+        assert_eq!(fs::read_to_string(runner.effect()).unwrap(), "1.0.0");
+        assert!(w.paths.root.join("notes/app").is_file());
+        assert!(retained_dir(&w.paths, &sha).is_dir());
+        assert!(!w.paths.journal.exists());
+    }
+
+    #[test]
+    fn power_cut_between_record_and_commit_restores_both_payload_and_system_effects() {
+        let w = world("reviewed-record-before-commit");
+        let runner = ReviewFixture::new(&w.paths.root);
+        let mut old = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        let mut new = manifest("notes", "2.0.0", &["notes/app"], &[]);
+        let old_sha = "1".repeat(64);
+        let new_sha = "2".repeat(64);
+        let scripts = stage_reviewed(&w.paths, &mut old, "old");
+        install_with_hooks(&w.paths, &reviewed_source(&old, &old_sha), scripts, &runner, None).unwrap();
+
+        let scripts = stage_reviewed(&w.paths, &mut new, "new");
+        let mut record = record::load(&w.paths.record).unwrap();
+        let source = reviewed_source(&new, &new_sha);
+        let mut journal = journal_for_install(&w.paths, &record, &source).unwrap();
+        let mut candidate = installed_entry(&source);
+        candidate.hooks = scripts;
+        journal.hooks = Some(HookChange { candidate: Some(candidate.clone()), ..HookChange::default() });
+        write_journal(&w.paths.journal, &journal).unwrap();
+        hooks::retain(&w.paths.root, &w.paths.staging, &candidate, false).unwrap();
+        start_previous_hook(&w.paths, &mut journal, Some(&runner)).unwrap();
+        move_files(&w.paths, &mut journal, &new.dir, &new.files, None).unwrap();
+        start_candidate_hook(&w.paths, &mut journal, Some(&runner)).unwrap();
+        record.apps.insert(candidate.id.clone(), candidate);
+        record::save(&w.paths.record, &record).unwrap();
+
+        assert_eq!(fs::read_to_string(runner.effect()).unwrap(), "2.0.0");
+        recover_with_hooks(&w.paths, &runner).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(runner.effect()).unwrap(), "1.0.0");
+        assert_eq!(fs::read_to_string(w.paths.root.join("notes/app")).unwrap(), "1.0.0 old");
+        assert_eq!(record::load(&w.paths.record).unwrap().apps["notes"].version, "1.0.0");
+        assert!(!retained_dir(&w.paths, &new_sha).exists());
+    }
+
+    #[test]
+    fn denied_review_and_changed_bytes_stop_before_any_hook_or_payload_change() {
+        let w = world("reviewed-preflight");
+        let runner = ReviewFixture::new(&w.paths.root);
+        let mut app = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        let sha = "1".repeat(64);
+        let scripts = stage_reviewed(&w.paths, &mut app, "new");
+        let source = reviewed_source(&app, &sha);
+        runner.approved.set(false);
+        assert!(install_with_hooks(&w.paths, &source, scripts.clone(), &runner, None).is_err());
+        runner.approved.set(true);
+        fs::write(w.paths.staging.join("notes").join(hooks::PRE_UNINSTALL_PATH), "changed").unwrap();
+        assert!(install_with_hooks(&w.paths, &source, scripts, &runner, None).is_err());
+        assert!(runner.calls.borrow().is_empty());
+        assert!(!runner.effect().exists());
+        assert!(!w.paths.root.join("notes/app").exists());
+        assert!(!w.paths.journal.exists());
     }
 
     fn manifest(id: &str, version: &str, files: &[&str], requires: &[(&str, &str)]) -> Manifest {
@@ -748,6 +1209,7 @@ mod tests {
             obsolete: vec![],
             previous: Some(record::load(&w.paths.record).unwrap().apps["notes"].clone()),
             trial: None,
+            hooks: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
 
@@ -782,6 +1244,7 @@ mod tests {
             obsolete: vec!["notes/gone".into()],
             previous: None,
             trial: None,
+            hooks: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
 
@@ -807,6 +1270,7 @@ mod tests {
             obsolete: Vec::new(),
             previous: Some(previous),
             trial: None,
+            hooks: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
         recover(&w.paths).unwrap();
@@ -831,6 +1295,7 @@ mod tests {
             obsolete: Vec::new(),
             previous: Some(previous),
             trial: None,
+            hooks: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
         fs::rename(&file, prev_of(&file)).unwrap();

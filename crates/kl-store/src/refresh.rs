@@ -4,11 +4,13 @@
 //!
 //! Cache layout (under `launcher/store/cache`): `index.json`, `apps/<id>.json`, `icons/<id>.png`, `shots/<id>-<n>.png`.
 
-use crate::catalog::{valid_app_id, Card, CollectionIndex, Index, Listing};
+use crate::catalog::{valid_app_id, Asset, Card, CollectionIndex, Index, Listing};
+use crate::signatures::{self, PackageIdentity, TrustedKey, VerifiedIndex};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where the files come from. `text` reads a small document; `bytes` reads a picture, refused past `max` bytes.
 pub trait Source {
@@ -21,6 +23,144 @@ pub const MAX_LISTING: u64 = 256 * 1024;
 pub const MAX_PICTURE: u64 = 1024 * 1024;
 /// Screenshots shown per app (the product page has room for two).
 pub const SHOTS_PER_APP: usize = 2;
+const SIGNED_CURRENT: &str = "signed-current";
+
+fn read_limited(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the cached catalog file is too large"));
+    }
+    Ok(bytes)
+}
+
+fn index_from_bytes(bytes: &[u8]) -> Result<Index, String> {
+    if bytes.len() as u64 > MAX_INDEX {
+        return Err("the index is too large".into());
+    }
+    let index: Index = serde_json::from_slice(bytes).map_err(|e| format!("the index is not valid: {e}"))?;
+    if index.schema != 1 {
+        return Err(format!("the index has schema {}, this store reads schema 1", index.schema));
+    }
+    Ok(index)
+}
+
+fn verified_index(key: &TrustedKey, bytes: &[u8], sidecar: &[u8]) -> Result<(Index, VerifiedIndex), String> {
+    let proof = key.verify_index(bytes, sidecar).map_err(|error| error.to_string())?;
+    let index = index_from_bytes(bytes)?;
+    let mut ids = BTreeSet::new();
+    for card in &index.apps {
+        if !valid_app_id(&card.id) || !ids.insert(&card.id) || !proof.contains_listing(&card.id) {
+            return Err("the signed index has an invalid, duplicate, or unsigned app id".into());
+        }
+    }
+    if proof.listing_count() != ids.len() {
+        return Err("the signature contains listings absent from the index".into());
+    }
+    Ok((index, proof))
+}
+
+pub struct CachedCatalog {
+    directory: PathBuf,
+    proof: Option<VerifiedIndex>,
+}
+
+impl CachedCatalog {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn listing(&self, id: &str) -> Result<Listing, String> {
+        if !valid_app_id(id) {
+            return Err("the store listing has an invalid app id".into());
+        }
+        let path = self.directory.join("apps").join(format!("{id}.json"));
+        let bytes = read_limited(&path, MAX_LISTING).map_err(|error| error.to_string())?;
+        parse_listing(id, &bytes, self.proof.as_ref())
+    }
+}
+
+pub fn cached_catalog(cache: &Path, key: Option<&TrustedKey>) -> Result<CachedCatalog, String> {
+    let Some(key) = key else {
+        return Ok(CachedCatalog { directory: cache.to_path_buf(), proof: None });
+    };
+    let directory = read_current_snapshot(cache)?.ok_or("refresh the signed catalog first")?;
+    let index = read_limited(&directory.join("index.json"), MAX_INDEX).map_err(|error| error.to_string())?;
+    let sidecar = read_limited(&directory.join(signatures::INDEX_SIGNATURE_FILENAME), signatures::MAX_INDEX_SIDECAR_BYTES)
+        .map_err(|error| error.to_string())?;
+    let (_, proof) = verified_index(key, &index, &sidecar)?;
+    Ok(CachedCatalog { directory, proof: Some(proof) })
+}
+
+fn snapshot_name(name: &str) -> bool {
+    name.strip_prefix("signed-").is_some_and(|value| {
+        value.split_once('-').is_some_and(|(pid, stamp)| {
+            !pid.is_empty() && !stamp.is_empty() && pid.bytes().chain(stamp.bytes()).all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+fn read_current_snapshot(cache: &Path) -> Result<Option<PathBuf>, String> {
+    let bytes = match read_limited(&cache.join(SIGNED_CURRENT), 128) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let name = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?.trim_end();
+    if !snapshot_name(name) {
+        return Err("the signed catalog cache has an invalid snapshot name".into());
+    }
+    Ok(Some(cache.join(name)))
+}
+
+fn fetch_index_proof(base: &str, source: &dyn Source) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let bytes = source.bytes(&format!("{base}/index.json"), MAX_INDEX)?;
+    let sidecar = source.bytes(&format!("{base}/{}", signatures::INDEX_SIGNATURE_FILENAME), signatures::MAX_INDEX_SIDECAR_BYTES)?;
+    Ok((bytes, sidecar))
+}
+
+fn parse_listing(id: &str, bytes: &[u8], proof: Option<&VerifiedIndex>) -> Result<Listing, String> {
+    if bytes.len() as u64 > MAX_LISTING {
+        return Err("the listing is too large".into());
+    }
+    if let Some(proof) = proof {
+        proof.verify_listing(id, bytes).map_err(|error| error.to_string())?;
+    }
+    let listing: Listing = serde_json::from_slice(bytes).map_err(|e| format!("the listing is not valid: {e}"))?;
+    if listing.schema != 1 || listing.id != id {
+        return Err("the listing is for another app".into());
+    }
+    Ok(listing)
+}
+
+/// Loads one listing for Launcher bootstrap. Signed mode verifies the index before using any listing fields.
+pub fn fetch_listing(base: &str, id: &str, source: &dyn Source, key: Option<&TrustedKey>) -> Result<Listing, String> {
+    if !valid_app_id(id) {
+        return Err("the app id is invalid".into());
+    }
+    let base = base.trim_end_matches('/');
+    let proof = if let Some(key) = key {
+        let (index, signature) = fetch_index_proof(base, source)?;
+        let (index, proof) = verified_index(key, &index, &signature)?;
+        if !index.apps.iter().any(|card| card.id == id) {
+            return Err("the app is absent from the signed index".into());
+        }
+        Some(proof)
+    } else {
+        None
+    };
+    let listing = source.bytes(&format!("{base}/apps/{id}.json"), MAX_LISTING)?;
+    parse_listing(id, &listing, proof.as_ref())
+}
+
+/// Verifies the release signature over the expected ZIP identity. The download still checks its size and SHA-256.
+pub fn verify_asset_signature(source: &dyn Source, key: &TrustedKey, id: &str, version: &str, arch: &str, asset: &Asset) -> Result<(), String> {
+    let url = signatures::package_signature_url(&asset.url).map_err(|error| error.to_string())?;
+    let signature = source.bytes(&url, signatures::MAX_SIGNATURE_BYTES)?;
+    let signature = std::str::from_utf8(&signature).map_err(|_| "the package signature is not text")?;
+    key.verify_package(PackageIdentity { id, version, arch, sha256: &asset.sha256, size: asset.size }, signature.trim())
+        .map_err(|error| error.to_string())
+}
 
 /// Remove the offline catalog while preserving the installed app record and package staging.
 pub fn clear_cache(launcher: &Path) -> io::Result<()> {
@@ -54,12 +194,9 @@ fn is_png(bytes: &[u8]) -> bool {
 }
 
 /// Fetches one app's files and writes them, all or nothing: any failure leaves the app's cached files as they were.
-fn fetch_app(base: &str, cache: &Path, card: &Card, source: &dyn Source) -> Result<(), String> {
-    let text = source.text(&format!("{base}/apps/{}.json", card.id))?;
-    let listing: Listing = serde_json::from_str(&text).map_err(|e| format!("the listing is not valid: {e}"))?;
-    if listing.schema != 1 || listing.id != card.id {
-        return Err("the listing is for another app".into());
-    }
+fn fetch_app(base: &str, cache: &Path, card: &Card, source: &dyn Source, proof: Option<&VerifiedIndex>) -> Result<(), String> {
+    let bytes = source.bytes(&format!("{base}/apps/{}.json", card.id), MAX_LISTING)?;
+    let listing = parse_listing(&card.id, &bytes, proof)?;
     // The icon comes from this site's own folder, as the screenshots do, whatever URL the index gives.
     let icon = source.bytes(&format!("{base}/icons/{}.png", card.id), MAX_PICTURE)?;
     if !is_png(&icon) {
@@ -74,7 +211,7 @@ fn fetch_app(base: &str, cache: &Path, card: &Card, source: &dyn Source) -> Resu
         }
         shots.push((n, bytes));
     }
-    write_atomic(&cache.join("apps").join(format!("{}.json", card.id)), text.as_bytes()).map_err(|e| e.to_string())?;
+    write_atomic(&cache.join("apps").join(format!("{}.json", card.id)), &bytes).map_err(|e| e.to_string())?;
     write_atomic(&cache.join("icons").join(format!("{}.png", card.id)), &icon).map_err(|e| e.to_string())?;
     for (n, bytes) in &shots {
         write_atomic(&cache.join("shots").join(format!("{}-{n}.png", card.id)), bytes).map_err(|e| e.to_string())?;
@@ -99,15 +236,53 @@ fn cached_id(path: &Path) -> Option<String> {
 /// Refreshes the cache from the catalog at `base` (its `v1` site). Returns what happened to each app; an error only when
 /// the index itself cannot be read, in which case nothing is changed.
 pub fn refresh(base: &str, cache: &Path, source: &dyn Source) -> Result<Report, String> {
+    refresh_with_key(base, cache, source, None)
+}
+
+pub fn refresh_with_key(base: &str, cache: &Path, source: &dyn Source, key: Option<&TrustedKey>) -> Result<Report, String> {
     let base = base.trim_end_matches('/');
+    if let Some(key) = key {
+        return refresh_signed(base, cache, source, key);
+    }
     let index_text = source.text(&format!("{base}/index.json"))?;
-    if index_text.len() as u64 > MAX_INDEX {
-        return Err("the index is too large".into());
+    let index = index_from_bytes(index_text.as_bytes())?;
+    let report = refresh_files(base, cache, source, &index, None);
+    write_atomic(&cache.join("index.json"), index_text.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(report)
+}
+
+fn refresh_signed(base: &str, cache: &Path, source: &dyn Source, key: &TrustedKey) -> Result<Report, String> {
+    let (raw_index, signature) = fetch_index_proof(base, source)?;
+    let (index, proof) = verified_index(key, &raw_index, &signature)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let name = format!("signed-{}-{stamp}", std::process::id());
+    fs::create_dir_all(cache).map_err(|error| error.to_string())?;
+    let pending = cache.join(&name);
+    fs::create_dir(&pending).map_err(|error| error.to_string())?;
+
+    let pointer = pending.join(SIGNED_CURRENT);
+    let mut previous = None;
+    let publish = (|| {
+        let report = refresh_files(base, &pending, source, &index, Some(&proof));
+        if let Some((id, reason)) = report.failed.first() {
+            return Err(format!("the signed catalog was not replaced. {id}: {reason}"));
+        }
+        write_atomic(&pending.join("index.json"), &raw_index).map_err(|error| error.to_string())?;
+        write_atomic(&pending.join(signatures::INDEX_SIGNATURE_FILENAME), &signature).map_err(|error| error.to_string())?;
+        fs::write(&pointer, name.as_bytes()).map_err(|error| error.to_string())?;
+        previous = read_current_snapshot(cache).ok().flatten();
+        fs::rename(&pointer, cache.join(SIGNED_CURRENT)).map_err(|error| error.to_string())?;
+        Ok(report)
+    })();
+    if publish.is_err() {
+        let _ = fs::remove_dir_all(pending);
+    } else if let Some(previous) = previous.filter(|path| *path != pending) {
+        let _ = fs::remove_dir_all(previous);
     }
-    let index: Index = serde_json::from_str(&index_text).map_err(|e| format!("the index is not valid: {e}"))?;
-    if index.schema != 1 {
-        return Err(format!("the index has schema {}, this store reads schema 1", index.schema));
-    }
+    publish
+}
+
+fn refresh_files(base: &str, cache: &Path, source: &dyn Source, index: &Index, proof: Option<&VerifiedIndex>) -> Report {
 
     let mut report = Report::default();
     let mut listed: BTreeSet<String> = BTreeSet::new();
@@ -119,7 +294,7 @@ pub fn refresh(base: &str, cache: &Path, source: &dyn Source) -> Result<Report, 
         if !listed.insert(card.id.clone()) {
             continue;
         }
-        match fetch_app(base, cache, card, source) {
+        match fetch_app(base, cache, card, source, proof) {
             Ok(()) => report.refreshed += 1,
             Err(reason) => report.failed.push((card.id.clone(), reason)),
         }
@@ -146,8 +321,7 @@ pub fn refresh(base: &str, cache: &Path, source: &dyn Source) -> Result<Report, 
             }
         }
     }
-    write_atomic(&cache.join("index.json"), index_text.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(report)
+    report
 }
 
 #[cfg(test)]
@@ -214,6 +388,55 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kl-refresh-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    fn sign_site(site: &mut Fake, ids: &[&str]) -> TrustedKey {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let key = Ed25519KeyPair::from_seed_unchecked(&[37; 32]).unwrap();
+        let index = &site.docs[&format!("{BASE}/index.json")];
+        let listings = ids.iter().map(|id| {
+            ((*id).to_owned(), site.docs[&format!("{BASE}/apps/{id}.json")].clone())
+        }).collect();
+        let signature = signatures::sign_index(&key, index, &listings).unwrap();
+        site.docs.insert(format!("{BASE}/{}", signatures::INDEX_SIGNATURE_FILENAME), signature);
+        TrustedKey::from_hex(&signatures::encode_hex(key.public_key().as_ref())).unwrap()
+    }
+
+    #[test]
+    fn a_signed_refresh_publishes_only_a_complete_snapshot() {
+        let dir = cache("signed-snapshot");
+        let mut first = site(&["notes"], 0);
+        refresh(BASE, &dir, &first).unwrap();
+        let key = sign_site(&mut first, &["notes"]);
+        assert!(cached_catalog(&dir, Some(&key)).is_err(), "unsigned cache cannot satisfy the policy");
+
+        refresh_with_key(BASE, &dir, &first, Some(&key)).unwrap();
+        let accepted = cached_catalog(&dir, Some(&key)).unwrap();
+        assert_eq!(accepted.listing("notes").unwrap().id, "notes");
+        let mut next = site(&["notes", "words"], 0);
+        sign_site(&mut next, &["notes", "words"]);
+        next.docs.get_mut(&format!("{BASE}/apps/words.json")).unwrap().push(b' ');
+        assert!(refresh_with_key(BASE, &dir, &next, Some(&key)).is_err());
+        assert_eq!(cached_catalog(&dir, Some(&key)).unwrap().directory(), accepted.directory());
+
+        let offline = accepted.directory().join("apps/notes.json");
+        let mut tampered = fs::read(&offline).unwrap();
+        tampered.push(b' ');
+        fs::write(offline, tampered).unwrap();
+        assert!(accepted.listing("notes").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn signed_bootstrap_rejects_a_replaced_listing_and_missing_index_proof() {
+        let mut site = site(&["notes"], 0);
+        let key = sign_site(&mut site, &["notes"]);
+        assert_eq!(fetch_listing(BASE, "notes", &site, Some(&key)).unwrap().id, "notes");
+        site.docs.get_mut(&format!("{BASE}/apps/notes.json")).unwrap().push(b' ');
+        assert!(fetch_listing(BASE, "notes", &site, Some(&key)).is_err());
+        assert!(fetch_listing(BASE, "notes", &site, None).is_ok());
+        site.docs.remove(&format!("{BASE}/{}", signatures::INDEX_SIGNATURE_FILENAME));
+        assert!(fetch_listing(BASE, "notes", &site, Some(&key)).is_err());
     }
 
     #[test]
