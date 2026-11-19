@@ -13,7 +13,8 @@ pub const SIGNING_KEY_FILE: &str = "catalog-ed25519.pub";
 const MAX_POLICY_BYTES: usize = 128 * 1024;
 
 /// Read a fixed Store trust file under the boot mirror, with ownership and symlink checks.
-/// Only an absent path returns `None`. A present, unsafe path is an error.
+/// An absent signing key leaves catalog signing opt-in even on firmware with group-writable
+/// directories. A present trust file must have a secure path.
 pub fn read_store_policy_file(file_name: &str, max_len: usize) -> io::Result<Option<Vec<u8>>> {
     if !matches!(file_name, HOOK_POLICY_FILE | SIGNING_KEY_FILE)
         || max_len == 0
@@ -28,7 +29,7 @@ pub fn read_store_policy_file(file_name: &str, max_len: usize) -> io::Result<Opt
     #[cfg(target_os = "linux")]
     {
         let directory = Path::new("/var/local/primitive-launcher");
-        runner::read_policy(directory, file_name, max_len, 0)
+        runner::read_policy(std::fs::File::open("/")?, directory, file_name, max_len, 0)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -88,6 +89,9 @@ mod runner {
     use kl_store::hooks::{sha256, HookPhase, MAX_HOOK_SIZE};
     use kl_store::record::Installed;
     use serde::Deserialize;
+
+    const TRUST_OWNER_REQUIRED: &str =
+        "Store trust paths must be owned by root and writable only by the owner";
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -177,14 +181,9 @@ mod runner {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn check_owner(file: &File, expected_uid: libc::uid_t) -> io::Result<()> {
+    fn owner_controlled(file: &File, expected_uid: libc::uid_t) -> io::Result<bool> {
         let meta = file.metadata()?;
-        if meta.uid() != expected_uid || meta.mode() & 0o022 != 0 {
-            return Err(denied(
-                "Store trust paths must be owned by root and writable only by the owner",
-            ));
-        }
-        Ok(())
+        Ok(meta.uid() == expected_uid && meta.mode() & 0o022 == 0)
     }
 
     fn strict_components(path: &Path) -> io::Result<impl Iterator<Item = &OsStr>> {
@@ -203,18 +202,21 @@ mod runner {
         }))
     }
 
-    fn open_directory(path: &Path, owner: Option<libc::uid_t>) -> io::Result<File> {
-        let mut directory = File::open("/")?;
-        if let Some(uid) = owner {
-            check_owner(&directory, uid)?;
+    fn open_directory(
+        mut directory: File,
+        path: &Path,
+        mut check: impl FnMut(&File) -> io::Result<()>,
+    ) -> io::Result<Option<File>> {
+        let components = strict_components(path)?;
+        check(&directory)?;
+        for part in components {
+            directory = match open_at(&directory, part, libc::O_DIRECTORY) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                result => result?,
+            };
+            check(&directory)?;
         }
-        for part in strict_components(path)? {
-            directory = open_at(&directory, part, libc::O_DIRECTORY)?;
-            if let Some(uid) = owner {
-                check_owner(&directory, uid)?;
-            }
-        }
-        Ok(directory)
+        Ok(Some(directory))
     }
 
     fn read_bounded(file: File, max_len: usize) -> io::Result<Vec<u8>> {
@@ -241,33 +243,38 @@ mod runner {
         Ok(bytes)
     }
 
-    fn read_owned_file(
-        directory: &File,
-        file_name: &str,
-        max_len: usize,
-        owner: libc::uid_t,
-    ) -> io::Result<Option<Vec<u8>>> {
-        match open_at(directory, OsStr::new(file_name), libc::O_NONBLOCK) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            result => {
-                let file = result?;
-                check_owner(&file, owner)?;
-                read_bounded(file, max_len).map(Some)
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
     pub(super) fn read_policy(
+        root: File,
         path: &Path,
         file_name: &str,
         max_len: usize,
         owner: libc::uid_t,
     ) -> io::Result<Option<Vec<u8>>> {
-        match open_directory(path, Some(owner)) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            result => read_owned_file(&result?, file_name, max_len, owner),
+        let mut trusted_path = true;
+        let Some(directory) = open_directory(root, path, |directory| {
+            if !owner_controlled(directory, owner)? {
+                if file_name != super::SIGNING_KEY_FILE {
+                    return Err(denied(TRUST_OWNER_REQUIRED));
+                }
+                trusted_path = false;
+            }
+            Ok(())
+        })?
+        else {
+            return Ok(None);
+        };
+        let file = match open_at(
+            &directory,
+            OsStr::new(file_name),
+            libc::O_NONBLOCK | libc::O_NOCTTY,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            result => result?,
+        };
+        if !trusted_path || !owner_controlled(&file, owner)? {
+            return Err(denied(TRUST_OWNER_REQUIRED));
         }
+        read_bounded(file, max_len).map(Some)
     }
 
     fn verified_script(package: &Installed, phase: HookPhase, path: &Path) -> io::Result<Vec<u8>> {
@@ -283,7 +290,8 @@ mod runner {
         let parent = path
             .parent()
             .ok_or_else(|| denied("The hook has no containing directory"))?;
-        let directory = open_directory(parent, None)?;
+        let directory = open_directory(File::open("/")?, parent, |_| Ok(()))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Hook directory is missing"))?;
         let file = open_at(&directory, OsStr::new(file_name), libc::O_NONBLOCK)?;
         let bytes = read_bounded(file, MAX_HOOK_SIZE as usize)?;
         if bytes.is_empty() || bytes.contains(&0) || sha256(&bytes) != expected {
@@ -720,29 +728,95 @@ mod runner {
         #[test]
         fn policy_reads_only_single_link_owner_controlled_files() {
             let fixture = Fixture::new("approval");
-            let path = fixture.0.join("policy.json");
+            let file_name = crate::package_hooks::SIGNING_KEY_FILE;
+            let path = fixture.0.join(file_name);
             let directory = File::open(&fixture.0).unwrap();
             let owner = directory.metadata().unwrap().uid();
-            assert!(read_owned_file(&directory, "policy.json", 32, owner)
-                .unwrap()
-                .is_none());
+            let read = |max_len, owner| {
+                read_policy(
+                    directory.try_clone().unwrap(),
+                    Path::new("/"),
+                    file_name,
+                    max_len,
+                    owner,
+                )
+            };
+            assert!(read(32, owner).unwrap().is_none());
             fs::write(&path, b"approved").unwrap();
             fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
-            assert_eq!(
-                read_owned_file(&directory, "policy.json", 32, owner).unwrap(),
-                Some(b"approved".to_vec())
-            );
-            assert!(read_owned_file(&directory, "policy.json", 2, owner).is_err());
-            assert!(read_owned_file(&directory, "policy.json", 32, owner.wrapping_add(1)).is_err());
+            assert_eq!(read(32, owner).unwrap(), Some(b"approved".to_vec()));
+            assert!(read(2, owner).is_err());
+            assert!(read(32, owner.wrapping_add(1)).is_err());
 
             fs::set_permissions(&path, Permissions::from_mode(0o620)).unwrap();
-            assert!(read_owned_file(&directory, "policy.json", 32, owner).is_err());
+            assert!(read(32, owner).is_err());
             fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
             fs::hard_link(&path, fixture.0.join("hard-link")).unwrap();
-            assert!(read_owned_file(&directory, "policy.json", 32, owner).is_err());
+            assert!(read(32, owner).is_err());
             fs::remove_file(&path).unwrap();
             symlink("hard-link", &path).unwrap();
-            assert!(read_owned_file(&directory, "policy.json", 32, owner).is_err());
+            assert!(read(32, owner).is_err());
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(read(32, owner).is_err());
+        }
+
+        #[test]
+        fn absent_signing_key_allows_unsigned_catalog_on_stock_directory_modes() {
+            use crate::package_hooks::{HOOK_POLICY_FILE, SIGNING_KEY_FILE};
+
+            let fixture = Fixture::new("stock-trust-path");
+            let local = fixture.0.join("var/local");
+            let mirror = local.join("primitive-launcher");
+            fs::create_dir_all(&mirror).unwrap();
+            for directory in [&local, &mirror] {
+                fs::set_permissions(directory, Permissions::from_mode(0o2775)).unwrap();
+                assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o775);
+            }
+            let root = File::open(&fixture.0).unwrap();
+            let owner = root.metadata().unwrap().uid();
+            let path = "/var/local/primitive-launcher";
+            let read = |path, file_name, owner| {
+                read_policy(
+                    root.try_clone().unwrap(),
+                    Path::new(path),
+                    file_name,
+                    128,
+                    owner,
+                )
+            };
+            assert_eq!(read(path, SIGNING_KEY_FILE, owner).unwrap(), None);
+            assert_eq!(
+                read(path, SIGNING_KEY_FILE, owner.wrapping_add(1)).unwrap(),
+                None
+            );
+            assert_eq!(
+                read(path, HOOK_POLICY_FILE, owner).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert!(read("/var/local/./primitive-launcher", SIGNING_KEY_FILE, owner).is_err());
+            symlink("missing", local.join("alias")).unwrap();
+            assert!(read("/var/local/alias", SIGNING_KEY_FILE, owner).is_err());
+            fs::write(local.join("regular-file"), b"").unwrap();
+            assert!(read("/var/local/regular-file", SIGNING_KEY_FILE, owner).is_err());
+
+            let key = mirror.join(SIGNING_KEY_FILE);
+            symlink("missing", &key).unwrap();
+            assert!(read(path, SIGNING_KEY_FILE, owner).is_err());
+            fs::remove_file(&key).unwrap();
+            fs::write(&key, b"configured pin").unwrap();
+            fs::set_permissions(&key, Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                read(path, SIGNING_KEY_FILE, owner).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            fs::set_permissions(&mirror, Permissions::from_mode(0o755)).unwrap();
+            assert!(read(path, SIGNING_KEY_FILE, owner).is_err());
+            fs::set_permissions(&local, Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                read(path, SIGNING_KEY_FILE, owner).unwrap(),
+                Some(b"configured pin".to_vec())
+            );
         }
 
         #[test]
