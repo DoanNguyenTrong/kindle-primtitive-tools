@@ -71,6 +71,8 @@ pub struct StoreEntry {
     pub screenshots: usize,
     pub versions: Vec<VersionNotes>,
     pub availability: Option<String>,
+    /// A known launcher entry can be opened through the supervisor.
+    pub launchable: bool,
 }
 
 /// A size as the product page shows it: "4.5 MB", "640 KB", "900 bytes".
@@ -202,6 +204,7 @@ impl StoreEntry {
             screenshots: listing.screenshots.len().min(2),
             versions,
             availability,
+            launchable: installed.and_then(crate::store_open::entry_file).is_some(),
         }
     }
 
@@ -227,6 +230,7 @@ impl StoreEntry {
             screenshots: 0,
             versions: Vec::new(),
             availability: None,
+            launchable: crate::store_open::entry_file(app).is_some(),
         }
     }
 
@@ -238,6 +242,11 @@ impl StoreEntry {
         self.kind == Kind::Install
             && !matches!(self.id.as_str(), STORE_ID | LAUNCHER_ID)
             && matches!(self.status, Status::Installed(_) | Status::Update { .. })
+    }
+
+    pub fn can_open(&self) -> bool {
+        self.kind == Kind::Install && self.launchable && matches!(self.status, Status::Installed(_))
+            && !matches!(self.id.as_str(), STORE_ID | LAUNCHER_ID)
     }
 
     pub fn can_install(&self) -> bool {
@@ -289,6 +298,7 @@ impl StoreEntry {
             (Kind::Install, Status::NotInstalled) if self.latest.is_none() => "Unavailable",
             (Kind::Install, Status::NotInstalled) => "Get",
             (Kind::Install, Status::Update { .. }) => "Update",
+            (Kind::Install, Status::Installed(_)) if self.can_open() => "Open",
             (Kind::Install, Status::Installed(_)) => "Installed",
         }
     }
@@ -317,6 +327,7 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
         screenshots: 0,
         versions: Vec::new(),
         availability: None,
+        launchable: false,
     }
 }
 

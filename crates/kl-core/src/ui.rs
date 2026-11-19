@@ -78,6 +78,8 @@ pub enum DeviceCmd {
     StoreRefresh,
     /// Primitive Store: remove the installed entry at this index (after a second tap on Remove).
     StoreRemove(usize),
+    /// Open a Store-installed entry through the launcher.
+    StoreOpen(usize),
     StoreUpdateAll,
     StoreToggleDailyCheck,
     StoreClearCache,
@@ -1038,6 +1040,7 @@ impl Ui {
                             Action::Redraw { full: false }
                         }
                         _ if self.store_installing.is_some() => Action::None,
+                        (crate::store::Kind::Install, _) if entry.can_open() => Action::Device(DeviceCmd::StoreOpen(index)),
                         (crate::store::Kind::Install, crate::store::Status::Installed(_)) => Action::None,
                         (crate::store::Kind::Install, _) if !entry.can_install() => {
                             self.notice = Some(entry.status_line());
@@ -1753,6 +1756,21 @@ mod tests {
 
     fn centre(r: crate::Rect) -> Input {
         Input::Tap((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)
+    }
+
+    #[test]
+    fn an_installed_store_product_opens_only_with_a_launcher_entry() {
+        let mut u = ui(0);
+        let mut entry = crate::store::test_entry("example-app", "Example App", crate::store::Status::Installed("1.0.0".into()));
+        entry.launchable = true;
+        u.set_store(vec![entry]);
+        u.open_store();
+        u.store_open_entry(0);
+        assert_eq!(u.store[0].action_label(), "Open");
+        assert_eq!(u.handle(centre(u.layout.store_action(0))), Action::Device(DeviceCmd::StoreOpen(0)));
+        u.store[0].launchable = false;
+        assert_eq!(u.store[0].action_label(), "Installed");
+        assert_eq!(u.handle(centre(u.layout.store_action(0))), Action::None);
     }
 
     #[test]

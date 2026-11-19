@@ -12,6 +12,7 @@ pub mod rotation;
 pub mod scriptlet;
 pub mod settings;
 pub mod store;
+pub mod store_open;
 pub mod tz;
 pub mod ui;
 pub mod wifi;

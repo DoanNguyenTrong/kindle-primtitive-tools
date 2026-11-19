@@ -1042,7 +1042,7 @@ impl Renderer {
         let text_w = (r.w - 164 - 240) as f32;
         self.text(Text { text: &e.name, x: text_x, y: (r.y + 30) as f32, w: text_w, size: 40.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.text(Text { text: &e.subtitle, x: text_x, y: (r.y + 92) as f32, w: text_w, size: 28.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
-        let primary = e.can_install();
+        let primary = e.can_install() || e.can_open();
         let pill = Rect::new(r.right() - 190, r.y + (r.h - 76) / 2, 190, 76);
         self.store_capsule(pill, e.action_label(), primary, BLACK);
         self.hairline(r.bottom() - 1, r.x + 164, r.right());
@@ -1343,7 +1343,7 @@ impl Renderer {
         let sub = l.store_subtitle(scroll);
         self.text(Text { text: &e.subtitle, x: 40.0, y: sub.y as f32, w, size: 32.0, bold: false, align: Align::Center, lines: 2, gray: 85 });
         let label = if ui.store_installing.as_deref() == Some(e.id.as_str()) { "Installing" } else { e.action_label() };
-        self.store_capsule(l.store_action(scroll), label, e.can_install() || e.kind == kl_core::store::Kind::Link, BLACK);
+        self.store_capsule(l.store_action(scroll), label, e.can_install() || e.can_open() || e.kind == kl_core::store::Kind::Link, BLACK);
         let dev = l.store_developer(scroll);
         let caption = e.availability.clone().unwrap_or_else(|| {
             if e.developer.is_empty() { e.status_line() } else { format!("Offered by {}", e.developer) }
