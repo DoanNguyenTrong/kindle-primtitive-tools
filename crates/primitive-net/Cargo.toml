@@ -1,0 +1,10 @@
+[package]
+name = "primitive-net"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only OR PolyForm-Noncommercial-1.0.0"
+description = "HTTPS downloads for Primitive apps: an allow list of hosts, every redirect checked, a size limit, progress."
+
+[dependencies]
+# The same HTTP client as Primitive Browser (rustls, no default features), so the offline crate cache has it.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
