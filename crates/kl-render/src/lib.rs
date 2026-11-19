@@ -96,9 +96,20 @@ pub struct Renderer {
 }
 
 /// The sizes of a store icon's tiles (a row, the featured card, the product page), and a screenshot's size.
-pub const STORE_ICON_SIZES: [u32; 3] = [132, 200, 340];
+pub const STORE_ROW_ICON: u32 = 132;
+pub const STORE_FEATURE_ICON: u32 = 200;
+pub const STORE_PRODUCT_ICON: u32 = 340;
+pub const STORE_ICON_SIZES: [u32; 3] = [STORE_ROW_ICON, STORE_FEATURE_ICON, STORE_PRODUCT_ICON];
 pub const STORE_SHOT_W: u32 = 406;
 pub const STORE_SHOT_H: u32 = 540;
+
+pub fn store_icon_key(id: &str, size: u32) -> String {
+    format!("store-icon:{id}:{size}")
+}
+
+pub fn store_shot_key(id: &str, index: usize) -> String {
+    format!("store-shot:{id}:{index}")
+}
 
 /// The store's pictures in the cache: `icons/<id>.png` for each app, and `shots/<id>-<n>.png` (n from 0) for its
 /// screenshots. A picture that does not read is skipped; the store then shows the app's letter.
@@ -161,11 +172,7 @@ impl Renderer {
             icons: HashMap::new(),
             sleep_image: None,
             store_blits: Vec::new(),
-            usb_picture: image::decode_png(USB_PICTURE).ok().map(|img| {
-                let mut fitted = image::fit(&img, width - 120, height - 240);
-                image::solidify(&mut fitted.pixels);
-                fitted
-            }),
+            usb_picture: None,
         })
     }
 
@@ -178,7 +185,7 @@ impl Renderer {
     pub fn set_store_icon(&mut self, id: &str, png: &[u8]) -> Result<(), String> {
         for size in STORE_ICON_SIZES {
             let tile = image::icon_tile(png, size)?;
-            self.set_icon(&format!("store-icon:{id}:{size}"), tile);
+            self.set_icon(&store_icon_key(id, size), tile);
         }
         Ok(())
     }
@@ -186,7 +193,7 @@ impl Renderer {
     /// One screenshot of an app, fitted to the product page (`store-shot:<id>:<index>`).
     pub fn set_store_shot(&mut self, id: &str, index: usize, png: &[u8]) -> Result<(), String> {
         let tile = image::picture_tile(png, STORE_SHOT_W, STORE_SHOT_H)?;
-        self.set_icon(&format!("store-shot:{id}:{index}"), tile);
+        self.set_icon(&store_shot_key(id, index), tile);
         Ok(())
     }
 
@@ -386,6 +393,13 @@ impl Renderer {
     fn usb_drive_frame(&mut self, ui: &Ui) -> Vec<u8> {
         self.ctx.reset();
         let l = ui.layout;
+        if self.usb_picture.is_none() {
+            self.usb_picture = image::decode_png(USB_PICTURE).ok().map(|img| {
+                let mut fitted = image::fit(&img, (l.width as u32).saturating_sub(120), (l.height as u32).saturating_sub(240));
+                image::solidify(&mut fitted.pixels);
+                fitted
+            });
+        }
         self.fill(l.screen(), WHITE);
         let mut out = self.finish_gray();
         // The picture, centred on the white screen.
@@ -933,9 +947,9 @@ impl Renderer {
             kl_core::store::StoreTab::Today => self.store_today(ui),
             kl_core::store::StoreTab::Apps => {
                 let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "There are no apps in this group." };
-                self.store_rows(ui, &ui.store_apps(), empty);
+                self.store_rows(ui, &ui.store_list_indices(), empty);
             }
-            kl_core::store::StoreTab::Updates => self.store_rows(ui, &ui.store_updates(), "Nothing from the store yet. Apps you get here, and their updates, are listed here."),
+            kl_core::store::StoreTab::Updates => self.store_rows(ui, &ui.store_list_indices(), "Nothing from the store yet. Apps you get here, and their updates, are listed here."),
             kl_core::store::StoreTab::Search => self.store_search(ui),
         }
         if !ui.store_search_keyboard {
@@ -958,7 +972,7 @@ impl Renderer {
             self.fill(Rect::new(x, inner.y + 2, 3, inner.h - 4), BLACK);
         }
         let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "No apps match your search." };
-        self.store_rows(ui, &ui.store_search(&query), empty);
+        self.store_rows(ui, &ui.store_list_indices(), empty);
         if ui.store_search_keyboard {
             let area = l.keyboard_area();
             self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
@@ -990,7 +1004,8 @@ impl Renderer {
         self.text(Text { text: "Featured", x: (f.x + 56) as f32, y: (f.y + 56) as f32, w: 600.0, size: 26.0, bold: true, align: Align::Start, lines: 1, gray: WHITE });
         self.text(Text { text: &e.name, x: (f.x + 56) as f32, y: (f.y + 100) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 68.0, bold: true, align: Align::Start, lines: 2, gray: WHITE });
         self.text(Text { text: &e.subtitle, x: (f.x + 56) as f32, y: (f.y + 290) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: WHITE });
-        let tile = Rect::new(f.right() - 56 - 200, f.y + 56, 200, 200);
+        let size = STORE_FEATURE_ICON as i32;
+        let tile = Rect::new(f.right() - 56 - size, f.y + 56, size, size);
         self.store_tile(tile, e, WHITE, BLACK);
         let pill = Rect::new(f.x + 56, f.bottom() - 56 - 84, 200, 84);
         // White on the black card: a white pill with a black label.
@@ -1052,7 +1067,8 @@ impl Renderer {
 
     /// One app's row: its icon, name and summary, and its action on the right.
     fn store_row(&mut self, e: &kl_core::store::StoreEntry, r: Rect) {
-        let tile = Rect::new(r.x, r.y + (r.h - 132) / 2, 132, 132);
+        let size = STORE_ROW_ICON as i32;
+        let tile = Rect::new(r.x, r.y + (r.h - size) / 2, size, size);
         self.store_tile(tile, e, BLACK, WHITE);
         let text_x = (r.x + 164) as f32;
         let text_w = (r.w - 164 - 240) as f32;
@@ -1080,7 +1096,7 @@ impl Renderer {
     /// An app's icon tile: its picture when the store has it at this size, else a black or white tile with the
     /// app's first letter. A picture scrolled under the header is not drawn (the header covers it).
     fn store_tile(&mut self, tile: Rect, e: &kl_core::store::StoreEntry, bg: u8, ink: u8) {
-        let key = format!("store-icon:{}:{}", e.id, tile.w);
+        let key = store_icon_key(&e.id, tile.w as u32);
         if self.icons.contains_key(&key) {
             if tile.y >= 170 {
                 self.store_blits.push((tile, key));
@@ -1393,7 +1409,7 @@ impl Renderer {
 
         // Screenshots, when the store has them for this app (from the cache, or the desktop preview).
         if e.screenshots > 0 {
-            let key = format!("store-shot:{}:{}", e.id, ui.store_shot_index);
+            let key = store_shot_key(&e.id, ui.store_shot_index);
             let r = l.store_shot(scroll);
             if self.icons.contains_key(&key) && r.y < l.height - 120 && r.bottom() > 170 {
                 self.store_blits.push((r, key));

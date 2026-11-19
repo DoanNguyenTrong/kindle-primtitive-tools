@@ -10,7 +10,7 @@ pub use primitive_device::{
     accelerometer_turn, available_storage_bytes, check_ssh, forget_network, free_storage,
     join_network, launcher_dir, local_time, power_event, refresh_screen_timeout, restart_launcher,
     set_autostart, set_light, set_public_dns, set_ssh, set_ssh_password, set_warmth, set_wifi,
-    status, system_command, unload_stock_screensaver, usb_state, wifi_info, wlan_ip, LEVEL_MAX,
+    status, system_command, unload_stock_screensaver, usb_state, wifi_info, wifi_status, wlan_ip, LEVEL_MAX,
 };
 
 pub fn orientation_loop(tx: Sender<Ev>, start: Rotation) {

@@ -27,8 +27,8 @@ pub enum Ev {
     WifiResult { ok: bool, message: String },
     /// A background SSH job finished (set the password, check the server): what to tell the user.
     Notice(String),
-    /// The store's catalog refresh finished: the store's entries again, and what to tell the user.
-    StoreRefreshed { entries: Vec<kl_core::store::StoreEntry>, message: String },
+    /// The catalog refresh finished. A failed refresh leaves the currently displayed catalog in place.
+    StoreRefreshed { entries: Option<Vec<kl_core::store::StoreEntry>>, message: String, artwork_changed: bool },
     /// An app from the store was installed (or not): the store's entries, the library's apps again, and the message.
     StoreInstalled { entries: Vec<kl_core::store::StoreEntry>, message: String },
     /// The store's install sheet changed stage or crossed another progress step.

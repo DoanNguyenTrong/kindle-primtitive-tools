@@ -626,7 +626,7 @@ impl Ui {
     }
 
     /// The paged list of the current tab.
-    fn store_list_indices(&self) -> Vec<usize> {
+    pub fn store_list_indices(&self) -> Vec<usize> {
         match self.store_tab {
             crate::store::StoreTab::Updates => self.store_updates(),
             crate::store::StoreTab::Search => self.store_search(&self.store_query.string()),
