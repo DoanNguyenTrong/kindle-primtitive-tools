@@ -750,7 +750,7 @@ fn recover_package(paths: &Paths, runner: Option<&dyn HookRunner>) -> io::Result
     let rec = record::load(&paths.record)?;
     validate_journal(paths, &journal, &rec)?;
     if journal.hooks.is_some() && runner.is_none() {
-        return Err(invalid_data("Open Primitive Store to recover the reviewed system change.".into()));
+        return Err(invalid_data("Open Store to recover the reviewed system change.".into()));
     }
     match journal.state {
         State::Recorded | State::Removed => {

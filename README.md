@@ -1,7 +1,7 @@
-# doannt-kindle-tools
+# PrimitiveOS shared tools
 
-Code shared by the Kindle projects of the same author: [Primitive Launcher](../doannt-kindle-launcher) and
-[Primitive Browser](../doannt-kindle-browser). Each project includes this repository as a git submodule under `tools/`.
+Shared Rust code for PrimitiveOS apps, including [Primitive Launcher](../doannt-kindle-launcher) and
+[Primitive Browser](../doannt-kindle-browser). These projects include this repository as a git submodule under `tools/`.
 
 | Crate | What |
 |---|---|

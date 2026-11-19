@@ -3,7 +3,7 @@ name = "primitive-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared Primitive e-ink interface components and editor layouts."
+description = "Shared PrimitiveOS e-ink interface components and editor layouts."
 
 [dependencies]
 kl-core = { path = "../kl-core" }

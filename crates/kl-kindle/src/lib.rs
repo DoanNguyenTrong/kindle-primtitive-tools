@@ -1,4 +1,4 @@
-//! The Kindle device layer, shared by Primitive Launcher and Primitive Store: the e-ink panel, the touch and button
+//! The Kindle device layer, shared by Primitive Launcher and Store: the e-ink panel, the touch and button
 //! input, the device's status, and the events an app's loop reads.
 
 pub mod device;

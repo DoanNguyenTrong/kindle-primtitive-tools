@@ -1,4 +1,4 @@
-//! Downloads for the Primitive apps. A download goes only to hosts on an allow list, over HTTPS; every redirect is
+//! Downloads for PrimitiveOS apps. A download goes only to hosts on an allow list, over HTTPS; every redirect is
 //! checked against the same list before it is followed (the client's own redirects are off); the size is limited, both
 //! by the announced length and while reading; and progress is reported as the bytes arrive.
 

@@ -1,4 +1,4 @@
-//! Common geometry and components for native Primitive apps.
+//! Common geometry and components for native PrimitiveOS apps.
 
 pub mod editor;
 mod widgets;

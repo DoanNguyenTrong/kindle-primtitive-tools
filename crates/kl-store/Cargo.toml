@@ -3,7 +3,7 @@ name = "kl-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Primitive Store engine: catalog, resolver, verified and safe unpacking, install journal, installed record."
+description = "Store engine for PrimitiveOS: catalog, resolver, verified and safe unpacking, install journal, installed record."
 
 [dependencies]
 http = "1"
