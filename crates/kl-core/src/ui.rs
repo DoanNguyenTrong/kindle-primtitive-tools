@@ -719,6 +719,42 @@ impl Ui {
         self.go(Screen::StoreApp)
     }
 
+    fn store_tap_entry(&mut self, index: usize, row: Rect, x: f32, y: f32) -> Action {
+        if Layout::store_row_action(row).inset(-12).contains(x, y) {
+            let entry = &self.store[index];
+            if entry.can_open() {
+                return self.store_app_action(index);
+            }
+            if entry.can_install() {
+                self.store_open_entry(index);
+                return self.store_app_action(index);
+            }
+        }
+        self.store_open_entry(index)
+    }
+
+    fn store_app_action(&mut self, index: usize) -> Action {
+        use crate::store::{Kind, Status};
+        let entry = &self.store[index];
+        match (entry.kind, &entry.status) {
+            (Kind::Link, _) => {
+                self.notice = Some(format!("{} is on its own website: {}", entry.name, entry.repo));
+                Action::Redraw { full: false }
+            }
+            _ if self.store_operation_running() => Action::None,
+            (Kind::Install, _) if entry.can_open() => Action::Device(DeviceCmd::StoreOpen(index)),
+            (Kind::Install, Status::Installed(_)) => Action::None,
+            (Kind::Install, _) if !entry.can_install() => {
+                self.notice = Some(entry.status_line());
+                Action::Redraw { full: false }
+            }
+            (Kind::Install, _) => {
+                self.store_sheet = Some(index);
+                Action::Redraw { full: false }
+            }
+        }
+    }
+
     fn set_store_tab(&mut self, tab: crate::store::StoreTab) -> Action {
         self.store_tab = tab;
         self.store_page = 0;
@@ -925,7 +961,7 @@ impl Ui {
                     }
                     let rows = self.store_today_rows();
                     let Some(row) = (0..rows.len()).find(|&i| l.store_today_row(i).contains(x, y)) else { return Action::None };
-                    return self.store_open_entry(rows[row]);
+                    return self.store_tap_entry(rows[row], l.store_today_row(row), x, y);
                 }
                 if self.store_has_toolbar() && l.store_toolbar_button().contains(x, y) {
                     match self.store_tab {
@@ -947,7 +983,7 @@ impl Ui {
                 let on_page = list.len().saturating_sub(self.store_page * per).min(per);
                 let Some(row) = (0..on_page).find(|&i| self.store_list_row(i).contains(x, y)) else { return Action::None };
                 match list.get(self.store_page * per + row) {
-                    Some(&index) => self.store_open_entry(index),
+                    Some(&index) => self.store_tap_entry(index, self.store_list_row(row), x, y),
                     None => Action::None,
                 }
             }
@@ -1044,23 +1080,7 @@ impl Ui {
                     }
                 }
                 if content_visible && l.store_action(self.store_scroll).inset(-12).contains(x, y) {
-                    return match (entry.kind, &entry.status) {
-                        (crate::store::Kind::Link, _) => {
-                            self.notice = Some(format!("{} is on its own website: {}", entry.name, entry.repo));
-                            Action::Redraw { full: false }
-                        }
-                        _ if self.store_installing.is_some() => Action::None,
-                        (crate::store::Kind::Install, _) if entry.can_open() => Action::Device(DeviceCmd::StoreOpen(index)),
-                        (crate::store::Kind::Install, crate::store::Status::Installed(_)) => Action::None,
-                        (crate::store::Kind::Install, _) if !entry.can_install() => {
-                            self.notice = Some(entry.status_line());
-                            Action::Redraw { full: false }
-                        }
-                        (crate::store::Kind::Install, _) => {
-                            self.store_sheet = Some(index);
-                            Action::Redraw { full: false }
-                        }
-                    };
+                    return self.store_app_action(index);
                 }
                 // The last row of an installed app opens its Remove confirmation.
                 let rows = entry.page_rows();
@@ -1809,6 +1829,32 @@ mod tests {
         u.store[0].launchable = false;
         assert_eq!(u.store[0].action_label(), "Installed");
         assert_eq!(u.handle(centre(u.layout.store_action(0))), Action::None);
+    }
+
+    #[test]
+    fn store_row_actions_open_an_app_or_show_the_install_review() {
+        use crate::store::{Status, StoreTab};
+        let mut u = ui(0);
+        let mut entry = crate::store::test_entry("example-app", "Example App", Status::Installed("1.0.0".into()));
+        entry.launchable = true;
+        u.set_store(vec![entry]);
+        u.open_store();
+        u.set_store_tab(StoreTab::Apps);
+        let row = u.store_list_row(0);
+        let action = centre(Layout::store_row_action(row));
+        assert_eq!(u.handle(action), Action::Device(DeviceCmd::StoreOpen(0)));
+        assert_eq!(u.screen, Screen::Store);
+        u.handle(centre(row));
+        assert_eq!(u.screen, Screen::StoreApp);
+        u.open_store();
+        u.set_store_tab(StoreTab::Apps);
+        u.store[0].status = Status::Update { installed: "1.0.0".into(), latest: "2.0.0".into() };
+        u.store[0].latest = Some("2.0.0".into());
+        let row = u.store_list_row(0);
+        u.handle(centre(Layout::store_row_action(row)));
+        assert_eq!(u.screen, Screen::StoreApp);
+        assert_eq!(u.store_sheet, Some(0));
+        assert!(u.store_installing.is_none());
     }
 
     #[test]

@@ -1045,7 +1045,7 @@ impl Renderer {
         self.text(Text { text: &e.name, x: text_x, y: (r.y + 30) as f32, w: text_w, size: 40.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.text(Text { text: &e.subtitle, x: text_x, y: (r.y + 92) as f32, w: text_w, size: 28.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
         let primary = e.can_install() || e.can_open();
-        let pill = Rect::new(r.right() - 190, r.y + (r.h - 76) / 2, 190, 76);
+        let pill = Layout::store_row_action(r);
         self.store_capsule(pill, e.action_label(), primary, BLACK);
         self.hairline(r.bottom() - 1, r.x + 164, r.right());
     }

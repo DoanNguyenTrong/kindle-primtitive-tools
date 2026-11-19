@@ -938,6 +938,10 @@ impl Layout {
         ((self.store_body_bottom() - 200 - 200) / STORE_ROW_H).max(1) as usize
     }
 
+    pub fn store_row_action(row: Rect) -> Rect {
+        Rect::new(row.right() - 190, row.y + (row.h - 76) / 2, 190, 76)
+    }
+
     pub fn store_pages(&self, n: usize) -> usize {
         n.div_ceil(self.store_rows_per_page()).max(1)
     }
