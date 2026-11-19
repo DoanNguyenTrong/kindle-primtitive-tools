@@ -11,6 +11,9 @@ Code shared by the Kindle projects of the same author: [Primitive Launcher](../d
 Each app draws its own screens (the launcher with vello, the browser as HTML); both read the same definitions from
 here, so a key or an icon looks and sits the same in both.
 
-Licence: AGPL-3.0, as the projects that use it.
+Licence: your choice of the GNU Affero General Public License v3.0 ([LICENSE-AGPL](LICENSE-AGPL)) or the PolyForm
+Noncommercial License 1.0.0 ([LICENSE-POLYFORM](LICENSE-POLYFORM)), so each app that uses it can take it under its own
+licence: Primitive Launcher and Primitive Browser under PolyForm Noncommercial, Primitive Terminal under AGPL-3.0.
+Copyright (C) 2026 Doan Nguyen.
 
 Test: `cargo test --workspace`.

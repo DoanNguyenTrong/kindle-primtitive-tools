@@ -2,7 +2,7 @@
 name = "primitive-keyboard"
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-only OR PolyForm-Noncommercial-1.0.0"
 description = "The on-screen keyboard shared by Primitive Launcher and Primitive Browser: layers, rows and text editing."
 
 [dependencies]
