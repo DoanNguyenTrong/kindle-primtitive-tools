@@ -14,4 +14,4 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
-      - run: cargo clippy --locked -p kl-core -p kl-render -p kl-store -p primitive-app -p primitive-ui -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
