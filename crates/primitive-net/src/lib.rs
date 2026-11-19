@@ -8,6 +8,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+mod resume;
+pub use resume::download_resumable;
+
 /// What a download may reach.
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -50,6 +53,10 @@ pub enum NetError {
     Timeout,
     Transport(String),
     Io(std::io::Error),
+    InvalidChecksum,
+    ChecksumMismatch,
+    UnexpectedLength { expected: u64, found: u64 },
+    Incomplete { expected: u64, received: u64 },
 }
 
 impl fmt::Display for NetError {
@@ -62,6 +69,10 @@ impl fmt::Display for NetError {
             NetError::Timeout => write!(f, "the download took too long"),
             NetError::Transport(e) => write!(f, "the download failed: {e}"),
             NetError::Io(e) => write!(f, "cannot write the download: {e}"),
+            NetError::InvalidChecksum => write!(f, "the catalog does not provide a valid SHA-256"),
+            NetError::ChecksumMismatch => write!(f, "the download does not match its SHA-256 in the catalog"),
+            NetError::UnexpectedLength { expected, found } => write!(f, "the server announced {found} bytes, expected {expected}"),
+            NetError::Incomplete { expected, received } => write!(f, "the download stopped after {received} of {expected} bytes"),
         }
     }
 }
@@ -144,13 +155,28 @@ fn agent(policy: &Policy) -> ureq::Agent {
 /// Opens `url`, following redirects by hand so each target is checked. Returns the final response's status, its URL and
 /// its body reader source.
 fn open(url: &str, policy: &Policy) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
+    let (final_url, resp) = request(url, policy, None)?;
+    if resp.status().as_u16() != 200 {
+        return Err(NetError::Status(resp.status().as_u16()));
+    }
+    Ok((final_url, resp))
+}
+
+fn request(url: &str, policy: &Policy, verified_offset: Option<u64>) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
     let agent = agent(policy);
     let mut current = url.to_string();
     for _ in 0..=policy.max_redirects {
         if !allowed(&current, policy) {
             return Err(NetError::NotAllowed(current));
         }
-        let resp = agent.get(&current).call().map_err(|error| match error {
+        let mut request = agent.get(&current);
+        if let Some(offset) = verified_offset {
+            request = request.header("accept-encoding", "identity");
+            if offset > 0 {
+                request = request.header("range", format!("bytes={offset}-"));
+            }
+        }
+        let resp = request.call().map_err(|error| match error {
             ureq::Error::Timeout(_) => NetError::Timeout,
             _ => NetError::Transport(error.to_string()),
         })?;
@@ -164,9 +190,6 @@ fn open(url: &str, policy: &Policy) -> Result<(String, ureq::http::Response<ureq
                 .ok_or(NetError::Status(status))?;
             current = resolve(&current, &location);
             continue;
-        }
-        if status != 200 {
-            return Err(NetError::Status(status));
         }
         return Ok((current, resp));
     }
