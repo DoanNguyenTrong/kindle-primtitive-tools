@@ -103,6 +103,7 @@ pub const STORE_SHOT_H: u32 = 540;
 /// The store's pictures in the cache: `icons/<id>.png` for each app, and `shots/<id>-<n>.png` (n from 0) for its
 /// screenshots. A picture that does not read is skipped; the store then shows the app's letter.
 pub fn load_store_pictures(renderer: &mut Renderer, cache: &std::path::Path) {
+    renderer.icons.retain(|key, _| !key.starts_with("store-icon:") && !key.starts_with("store-shot:"));
     if let Ok(read) = std::fs::read_dir(cache.join("icons")) {
         for e in read.flatten() {
             let path = e.path();
@@ -438,8 +439,20 @@ impl Renderer {
         let mut pictures = Vec::new();
         for (rect, id) in icon_blits {
             if let Some(tile) = self.icons.get(&id) {
-                blit(&mut out, width, rect, tile);
-                pictures.push(((rect.x, rect.y, rect.w, rect.h), rect.w as f32 * image::ICON_RADIUS));
+                if id.starts_with("store-shot:") {
+                    let top = rect.y.max(170);
+                    let bottom = rect.bottom().min(l.height - 120);
+                    for y in top..bottom {
+                        let source = (y - rect.y) as usize * tile.width as usize;
+                        let destination = y as usize * width + rect.x as usize;
+                        let count = tile.width as usize;
+                        out[destination..destination + count].copy_from_slice(&tile.pixels[source..source + count]);
+                    }
+                    pictures.push(((rect.x, top, rect.w, bottom - top), 0.0));
+                } else {
+                    blit(&mut out, width, rect, tile);
+                    pictures.push(((rect.x, rect.y, rect.w, rect.h), rect.w as f32 * image::ICON_RADIUS));
+                }
             }
         }
         if ui.screen == Screen::Sleep && ui.battery_message().is_none() {
@@ -458,6 +471,8 @@ impl Renderer {
             Screen::QuickSettings => Some(l.quick_panel()),
             Screen::StoreApp if ui.store_sheet.is_some() => Some(l.store_sheet()),
             Screen::StoreApp if ui.store_remove_armed.is_some() => Some(l.confirm_box()),
+            Screen::Store if ui.store_settings_open => Some(l.store_settings_box()),
+            Screen::Store if ui.store_category_picker || ui.store_batch_confirm => Some(l.store_sheet()),
             _ => None,
         };
         // Quick settings is a sheet from the top edge: square, with no margin.
@@ -472,6 +487,9 @@ impl Renderer {
                 Screen::QuickSettings => self.quick_panel(&l, status),
                 Screen::StoreApp if ui.store_sheet.is_some() => self.store_install_sheet(ui),
                 Screen::StoreApp => self.store_remove_dialog(ui),
+                Screen::Store if ui.store_settings_open => self.store_settings_dialog(ui),
+                Screen::Store if ui.store_category_picker => self.store_category_dialog(ui),
+                Screen::Store => self.store_batch_dialog(ui),
                 _ => self.app_menu_box(ui),
             }
             let layer = self.finish_gray();
@@ -867,9 +885,32 @@ impl Renderer {
         let refresh = if ui.store_busy { "Updating" } else { "Refresh" };
         self.store_capsule(l.store_refresh(), refresh, false, BLACK);
         self.store_capsule(l.store_done(), "Done", true, BLACK);
+        let settings = l.store_settings_button();
+        self.rounded_frame(settings, 50.0, 3, BLACK, WHITE);
+        self.draw_icon(primitive_quick::icons::SETTINGS, (settings.x + 25) as f64, (settings.y + 25) as f64, 50.0, BLACK);
+        if ui.store_has_toolbar() {
+            use kl_core::store::StoreTab;
+            let toolbar = l.store_toolbar_button();
+            let (heading, action) = match ui.store_tab {
+                StoreTab::Updates => {
+                    let count = ui.store_pending_updates().count();
+                    (format!("{count} {} ready", if count == 1 { "update" } else { "updates" }), "Update all")
+                }
+                StoreTab::Apps => match ui.store_selected_collection() {
+                    Some(collection) => (collection.title.clone(), "All apps"),
+                    None => (ui.store_category.as_deref().map(capitalise).unwrap_or_else(|| "All apps".to_string()), "Categories"),
+                },
+                _ => unreachable!("this tab has no toolbar"),
+            };
+            self.text(Text { text: &heading, x: 40.0, y: (toolbar.y + 26) as f32, w: (toolbar.x - 60) as f32, size: 42.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.store_capsule(toolbar, action, ui.store_tab == StoreTab::Updates, BLACK);
+        }
         match ui.store_tab {
             kl_core::store::StoreTab::Today => self.store_today(ui),
-            kl_core::store::StoreTab::Apps => self.store_rows(ui, &ui.store_apps(), "No apps yet. The store lists the apps once its catalog has been downloaded."),
+            kl_core::store::StoreTab::Apps => {
+                let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "There are no apps in this group." };
+                self.store_rows(ui, &ui.store_apps(), empty);
+            }
             kl_core::store::StoreTab::Updates => self.store_rows(ui, &ui.store_updates(), "Nothing from the store yet. Apps you get here, and their updates, are listed here."),
             kl_core::store::StoreTab::Search => self.store_search(ui),
         }
@@ -921,7 +962,7 @@ impl Renderer {
         let e = &ui.store[index];
         let f = l.store_feature();
         self.rounded(f, 48.0, BLACK);
-        self.text(Text { text: "FEATURED", x: (f.x + 56) as f32, y: (f.y + 56) as f32, w: 600.0, size: 26.0, bold: true, align: Align::Start, lines: 1, gray: WHITE });
+        self.text(Text { text: "Featured", x: (f.x + 56) as f32, y: (f.y + 56) as f32, w: 600.0, size: 26.0, bold: true, align: Align::Start, lines: 1, gray: WHITE });
         self.text(Text { text: &e.name, x: (f.x + 56) as f32, y: (f.y + 100) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 68.0, bold: true, align: Align::Start, lines: 2, gray: WHITE });
         self.text(Text { text: &e.subtitle, x: (f.x + 56) as f32, y: (f.y + 290) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: WHITE });
         let tile = Rect::new(f.right() - 56 - 200, f.y + 56, 200, 200);
@@ -932,10 +973,23 @@ impl Renderer {
         self.text(Text { text: e.action_label(), x: pill.x as f32, y: pill.y as f32 + (pill.h as f32 - 30.0 * 1.25) / 2.0, w: pill.w as f32, size: 30.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
 
         let see = l.store_see_all();
-        self.text(Text { text: "See All", x: see.x as f32, y: (see.y + 12) as f32, w: see.w as f32, size: 34.0, bold: true, align: Align::End, lines: 1, gray: BLACK });
-        self.text(Text { text: "Apps", x: 40.0, y: (f.bottom() + 40) as f32, w: 400.0, size: 52.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        for (i, &idx) in ui.store_today_rows().iter().enumerate() {
-            self.store_row(&ui.store[idx], l.store_today_row(i));
+        self.text(Text { text: "See all apps", x: see.x as f32, y: (see.y + 12) as f32, w: see.w as f32, size: 34.0, bold: true, align: Align::End, lines: 1, gray: BLACK });
+        let collections = ui.store_today_collection_page();
+        let heading = if collections.is_empty() { "Apps" } else { "Collections" };
+        self.text(Text { text: heading, x: 40.0, y: (f.bottom() + 40) as f32, w: 400.0, size: 52.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        if collections.is_empty() {
+            for (i, &idx) in ui.store_today_rows().iter().enumerate() {
+                self.store_row(&ui.store[idx], l.store_today_row(i));
+            }
+        } else {
+            for (i, collection) in collections.iter().enumerate() {
+                let card = l.store_collection_card(i);
+                self.card(card);
+                let r = card.inset(30);
+                self.text(Text { text: &collection.title, x: r.x as f32, y: r.y as f32, w: r.w as f32, size: 36.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+                self.text(Text { text: &collection.description, x: r.x as f32, y: (r.y + 66) as f32, w: r.w as f32, size: 28.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+            }
+            self.store_pager(ui);
         }
     }
 
@@ -949,6 +1003,10 @@ impl Renderer {
         for (i, &idx) in indices.iter().skip(ui.store_page * per).take(per).enumerate() {
             self.store_row(&ui.store[idx], ui.store_list_row(i));
         }
+        self.store_pager(ui);
+    }
+
+    fn store_pager(&mut self, ui: &Ui) {
         let pages = ui.store_pages();
         if pages > 1 {
             let label = format!("{} of {}", ui.store_page + 1, pages);
@@ -975,7 +1033,7 @@ impl Renderer {
         let text_w = (r.w - 164 - 240) as f32;
         self.text(Text { text: &e.name, x: text_x, y: (r.y + 30) as f32, w: text_w, size: 40.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.text(Text { text: &e.subtitle, x: text_x, y: (r.y + 92) as f32, w: text_w, size: 28.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
-        let primary = matches!(e.status, kl_core::store::Status::NotInstalled | kl_core::store::Status::Update { .. }) && e.kind == kl_core::store::Kind::Install;
+        let primary = e.can_install();
         let pill = Rect::new(r.right() - 190, r.y + (r.h - 76) / 2, 190, 76);
         self.store_capsule(pill, e.action_label(), primary, BLACK);
         self.hairline(r.bottom() - 1, r.x + 164, r.right());
@@ -1097,20 +1155,7 @@ impl Renderer {
         let w = inner.w as f32;
         self.text(Text { text: &entry.name, x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         if let Some(progress) = &ui.store_progress {
-            self.text(Text { text: progress, x, y: y + 136.0, w, size: 38.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
-            if let Some(percent) = ui.store_progress_percent {
-                let gap = 12;
-                let width = (inner.w - 9 * gap) / 10;
-                for i in 0..10 {
-                    let segment = Rect::new(inner.x + i * (gap + width), inner.y + 264, width, 36);
-                    if i < i32::from(percent / 10) {
-                        self.rounded(segment, 8.0, BLACK);
-                    } else {
-                        self.rounded_frame(segment, 8.0, 2, BLACK, WHITE);
-                    }
-                }
-            }
-            self.text(Text { text: "Keep this screen open until the install finishes.", x, y: y + 362.0, w, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+            self.store_progress(inner, progress, ui.store_progress_percent);
             return;
         }
         if let Some(size) = entry.size {
@@ -1123,10 +1168,97 @@ impl Renderer {
         if entry.system_changes {
             self.text(Text { text: "This app may change how your Kindle starts or runs.", x, y: y + 500.0, w, size: 30.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         }
+        if let Some(notice) = &ui.notice {
+            self.text(Text { text: notice, x, y: y + 548.0, w, size: 28.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        }
         let [cancel, install] = l.store_sheet_buttons();
         let label = if matches!(entry.status, kl_core::store::Status::Update { .. }) { "Update" } else { "Install" };
         self.button(cancel, "Cancel", false);
         self.button(install, label, true);
+    }
+
+    fn store_progress(&mut self, inner: Rect, message: &str, percent: Option<u8>) {
+        self.text(Text { text: message, x: inner.x as f32, y: (inner.y + 136) as f32, w: inner.w as f32, size: 38.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+        if let Some(percent) = percent {
+            let gap = 12;
+            let width = (inner.w - 9 * gap) / 10;
+            for i in 0..10 {
+                let segment = Rect::new(inner.x + i * (gap + width), inner.y + 264, width, 36);
+                if i < i32::from(percent / 10) {
+                    self.rounded(segment, 8.0, BLACK);
+                } else {
+                    self.rounded_frame(segment, 8.0, 2, BLACK, WHITE);
+                }
+            }
+        }
+        self.text(Text { text: "Keep this screen open until the install finishes.", x: inner.x as f32, y: (inner.y + 362) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+    }
+
+    fn store_settings_dialog(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let panel = l.store_settings_box();
+        let inner = panel.inset(48);
+        self.rounded_frame(panel, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        let (x, y, w) = (inner.x as f32, inner.y as f32, inner.w as f32);
+        let [(_, cancel), (_, done)] = l.confirm_buttons();
+        let title = if ui.store_clear_confirm { "Clear saved catalog?" } else { "Store settings" };
+        self.text(Text { text: title, x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        if ui.store_clear_confirm {
+            let explanation = "The store will download the catalog again the next time it refreshes. Installed apps stay on this Kindle.";
+            self.text(Text { text: explanation, x, y: y + 120.0, w, size: 34.0, bold: false, align: Align::Start, lines: 4, gray: BLACK });
+            self.button(cancel, "Cancel", false);
+            self.button(done, "Clear catalog", true);
+        } else {
+            let row = l.store_daily_check_button();
+            self.card(row);
+            self.text(Text { text: "Check for updates daily", x: (row.x + 32) as f32, y: (row.y + 34) as f32, w: (row.w - 230) as f32, size: 34.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.switch(switch_rect(row), ui.store_daily_check);
+            self.button(l.store_clear_button(), "Clear saved catalog", false);
+            if let Some(notice) = &ui.notice {
+                self.text(Text { text: notice, x, y: y + 344.0, w, size: 28.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            }
+            self.button(done, "Done", true);
+        }
+    }
+
+    fn store_category_dialog(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let panel = l.store_sheet();
+        let inner = panel.inset(48);
+        self.rounded_frame(panel, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        self.text(Text { text: "Categories", x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        self.store_capsule(l.store_category_cell(0).inset(3), "All apps", ui.store_category.is_none(), BLACK);
+        for (i, category) in ui.store_categories().into_iter().enumerate() {
+            let selected = ui.store_category.as_deref() == Some(category);
+            self.store_capsule(l.store_category_cell(i + 1).inset(3), &capitalise(category), selected, BLACK);
+        }
+        let [_, done] = l.store_sheet_buttons();
+        self.button(done, "Done", true);
+    }
+
+    fn store_batch_dialog(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let panel = l.store_sheet();
+        let inner = panel.inset(48);
+        self.rounded_frame(panel, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        let (x, y, w) = (inner.x as f32, inner.y as f32, inner.w as f32);
+        self.text(Text { text: "Update all apps", x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        if let Some(progress) = &ui.store_progress {
+            self.store_progress(inner, progress, ui.store_progress_percent);
+            return;
+        }
+        let mut text = ui.store_pending_updates().map(|app| app.name.as_str()).collect::<Vec<_>>().join(", ");
+        text.insert_str(0, "Update these apps?\n\n");
+        self.text(Text { text: &text, x, y: y + 114.0, w, size: 38.0, bold: false, align: Align::Start, lines: 6, gray: BLACK });
+        if ui.store_pending_updates().any(|app| app.system_changes) {
+            self.text(Text { text: "Some updates may change how your Kindle starts or runs.", x, y: y + 425.0, w, size: 30.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+        }
+        if let Some(notice) = &ui.notice {
+            self.text(Text { text: notice, x, y: y + 540.0, w, size: 28.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        }
+        let [cancel, update] = l.store_sheet_buttons();
+        self.button(cancel, "Cancel", false);
+        self.button(update, "Update all", true);
     }
 
     fn store_remove_dialog(&mut self, ui: &Ui) {
@@ -1157,17 +1289,19 @@ impl Renderer {
         self.text(Text { text: &e.name, x: 40.0, y: name.y as f32, w, size: 56.0, bold: true, align: Align::Center, lines: 2, gray: BLACK });
         let sub = l.store_subtitle(scroll);
         self.text(Text { text: &e.subtitle, x: 40.0, y: sub.y as f32, w, size: 32.0, bold: false, align: Align::Center, lines: 2, gray: 85 });
-        let installed = matches!(e.status, kl_core::store::Status::Installed(_));
         let label = if ui.store_installing.as_deref() == Some(e.id.as_str()) { "Installing" } else { e.action_label() };
-        self.store_capsule(l.store_action(scroll), label, !installed, BLACK);
+        self.store_capsule(l.store_action(scroll), label, e.can_install() || e.kind == kl_core::store::Kind::Link, BLACK);
         let dev = l.store_developer(scroll);
-        self.text(Text { text: &format!("Offered by {}", e.developer), x: 40.0, y: dev.y as f32, w, size: 26.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
+        let caption = e.availability.clone().unwrap_or_else(|| {
+            if e.developer.is_empty() { e.status_line() } else { format!("Offered by {}", e.developer) }
+        });
+        self.text(Text { text: &caption, x: 40.0, y: dev.y as f32, w, size: 26.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
 
         // The information strip: version, size, firmware, split by hairlines.
         let cells = l.store_info_cells(scroll);
         let version = e.latest.clone().unwrap_or_else(|| "—".to_string());
         let size = e.size.map(kl_core::store::format_size).unwrap_or_else(|| "—".to_string());
-        let firmware = format!("{}+", e.firmware_min);
+        let firmware = if e.firmware_min.is_empty() { "—".to_string() } else { format!("{}+", e.firmware_min) };
         let strip = [("VERSION", version), ("SIZE", size), ("FIRMWARE", firmware)];
         self.hairline(cells[0].y, 40, l.width - 40);
         self.hairline(cells[0].bottom() - 1, 40, l.width - 40);
@@ -1180,14 +1314,17 @@ impl Renderer {
         }
 
         // Screenshots, when the store has them for this app (from the cache, or the desktop preview).
-        for i in 0..e.screenshots {
-            let key = format!("store-shot:{}:{}", e.id, i);
-            if !self.icons.contains_key(&key) {
-                continue;
-            }
-            let r = l.store_shot(i, scroll);
-            if r.y >= 170 {
+        if e.screenshots > 0 {
+            let key = format!("store-shot:{}:{}", e.id, ui.store_shot_index);
+            let r = l.store_shot(scroll);
+            if self.icons.contains_key(&key) && r.y < l.height - 120 && r.bottom() > 170 {
                 self.store_blits.push((r, key));
+            }
+            if ui.store_shot_index > 0 {
+                self.store_capsule(l.store_shot_button(scroll, false), "Previous", false, BLACK);
+            }
+            if ui.store_shot_index + 1 < e.screenshots {
+                self.store_capsule(l.store_shot_button(scroll, true), "Next", false, BLACK);
             }
         }
 
@@ -1195,13 +1332,23 @@ impl Renderer {
         self.text(Text { text: "About", x: 40.0, y: (about.y - 74) as f32, w, size: 48.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.text(Text { text: &e.description, x: 40.0, y: about.y as f32, w, size: 30.0, bold: false, align: Align::Start, lines: 7, gray: BLACK });
 
+        for (i, version) in e.versions.iter().enumerate() {
+            let r = l.store_version_row(i, scroll, e.screenshots);
+            if i <= 1 {
+                let heading = if i == 0 { "What's new" } else { "Version history" };
+                self.text(Text { text: heading, x: r.x as f32, y: (r.y - 74) as f32, w, size: 48.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            }
+            let label = format!("Version {} · {}", version.version, version.date);
+            self.text(Text { text: &label, x: r.x as f32, y: r.y as f32, w, size: 32.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.text(Text { text: &version.notes, x: r.x as f32, y: (r.y + 56) as f32, w, size: 28.0, bold: false, align: Align::Start, lines: 4, gray: 85 });
+        }
         let rows = e.page_rows();
         if !rows.is_empty() {
-            let first = l.store_info_row(0, scroll, e.screenshots);
+            let first = l.store_info_row(0, scroll, e.screenshots, e.versions.len());
             self.text(Text { text: "Information", x: 40.0, y: (first.y - 74) as f32, w, size: 48.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         }
         for (i, (label, value)) in rows.iter().enumerate() {
-            let r = l.store_info_row(i, scroll, e.screenshots);
+            let r = l.store_info_row(i, scroll, e.screenshots, e.versions.len());
             let remove = label == kl_core::store::StoreEntry::REMOVE_LABEL;
             self.text(Text { text: label, x: r.x as f32, y: (r.y + 34) as f32, w: (r.w * 2 / 3) as f32, size: 30.0, bold: remove, align: Align::Start, lines: 1, gray: BLACK });
             if !value.is_empty() {
@@ -1481,6 +1628,10 @@ impl Renderer {
             self.about_card(ui, s);
             return;
         }
+        if page == kl_core::layout::Page::FileTransfer {
+            self.file_transfer_page(ui);
+            return;
+        }
         for section in l.page_sections(page) {
             self.section_header(section.card.x, section.header_y, section.header);
             self.card(section.card);
@@ -1502,6 +1653,24 @@ impl Renderer {
         if let Some(notice) = ui.notice.clone() {
             let width = (l.width - 2 * MARGIN_X) as f32;
             self.text(Text { text: &notice, x: MARGIN_X as f32, y: (l.height - 84) as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+        }
+    }
+
+    fn file_transfer_page(&mut self, ui: &Ui) {
+        let width = (ui.layout.width - 2 * MARGIN_X) as f32;
+        let x = MARGIN_X as f32;
+        if let Some((address, code)) = &ui.file_transfer {
+            self.text(Text { text: "From a phone or computer on the same Wi-Fi, open this address and enter the code.", x, y: 210.0, w: width, size: 36.0, bold: false, align: Align::Start, lines: 3, gray: BLACK });
+            let card = Rect::new(MARGIN_X, 396, width as i32, 315);
+            self.card(card);
+            let inner = card.inset(40);
+            self.text(Text { text: address, x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 38.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.text(Text { text: "Transfer code", x: inner.x as f32, y: (inner.y + 88) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+            self.text(Text { text: code, x: inner.x as f32, y: (inner.y + 138) as f32, w: inner.w as f32, size: 54.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.text(Text { text: "Keep this page open while you send files.", x, y: 780.0, w: width, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+        }
+        if let Some(notice) = &ui.notice {
+            self.text(Text { text: notice, x, y: 980.0, w: width, size: 32.0, bold: true, align: Align::Start, lines: 3, gray: BLACK });
         }
     }
 
@@ -1761,6 +1930,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
         Page::Sleep => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },
         Page::Apps => format!("{} hidden", ui.hidden_count()),
         Page::Connection => format!("SSH {} · Public DNS {}", onoff(s.ssh), onoff(s.public_dns)),
+        Page::FileTransfer => "Send documents from another device".into(),
         Page::Device => format!("Start with the Kindle {}", onoff(s.autostart)),
         Page::About => format!("Version {}", ui.version),
     }

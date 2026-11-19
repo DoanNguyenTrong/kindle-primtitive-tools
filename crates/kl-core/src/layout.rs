@@ -51,6 +51,7 @@ pub fn zoom_steps(from: Rect, to: Rect, n: usize) -> Vec<Rect> {
 pub enum Page {
     Wifi,
     Connection,
+    FileTransfer,
     Display,
     Sleep,
     Apps,
@@ -66,12 +67,13 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [Page::Wifi, Page::Connection, Page::Display, Page::Sleep, Page::Apps, Page::Device, Page::About];
+    pub const ALL: [Page; 8] = [Page::Wifi, Page::Connection, Page::FileTransfer, Page::Display, Page::Sleep, Page::Apps, Page::Device, Page::About];
 
     pub fn title(self) -> &'static str {
         match self {
             Page::Wifi => "Wi-Fi & network",
             Page::Connection => "SSH & DNS",
+            Page::FileTransfer => "Wi-Fi file transfer",
             Page::Display => "Display",
             Page::Sleep => "Sleep",
             Page::Apps => "Apps",
@@ -113,17 +115,16 @@ impl Page {
                 Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
                 Group { header: "Kindle", rows: &[Row::KindleUi], footer: "Opens the stock Kindle UI. It takes about a minute to start." },
             ],
-            Page::About => &[],
+            Page::About | Page::FileTransfer => &[],
         }
     }
 }
 
 /// The Settings list: its groups, each a header, a card of pages, and nothing under it.
 pub const HOME_GROUPS: &[(&str, &[Page])] = &[
-    ("Network", &[Page::Wifi, Page::Connection]),
+    ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
     ("Display", &[Page::Display, Page::Sleep]),
-    ("System", &[Page::Apps, Page::Device]),
-    ("About", &[Page::About]),
+    ("System", &[Page::Apps, Page::Device, Page::About]),
 ];
 
 /// A group of the Settings list: its header, its card, and the page rows in it.
@@ -823,6 +824,51 @@ impl Layout {
         Rect::new(40, 50, self.width - 80, 110)
     }
 
+    pub fn store_settings_button(&self) -> Rect {
+        let refresh = self.store_refresh();
+        Rect::new(refresh.x - 134, refresh.y - 8, 100, 100)
+    }
+
+    pub fn store_settings_box(&self) -> Rect {
+        self.confirm_box()
+    }
+
+    pub fn store_daily_check_button(&self) -> Rect {
+        let panel = self.store_settings_box();
+        Rect::new(panel.x + 40, panel.y + 140, panel.w - 80, 120)
+    }
+
+    pub fn store_clear_button(&self) -> Rect {
+        let panel = self.store_settings_box();
+        Rect::new(panel.x + 40, panel.y + 280, panel.w - 80, BUTTON_H)
+    }
+
+    pub fn store_collection_card(&self, index: usize) -> Rect {
+        let left = self.store_feature().x;
+        let width = (self.width - 104) / 2;
+        let top = self.store_feature().bottom() + 120;
+        Rect::new(left + (index % 2) as i32 * (width + 24), top + (index / 2) as i32 * 248, width, 224)
+    }
+
+    pub fn store_category_cell(&self, index: usize) -> Rect {
+        let panel = self.store_sheet();
+        let width = (panel.w - 104) / 2;
+        Rect::new(panel.x + 40 + (index % 2) as i32 * (width + 24), panel.y + 116 + (index / 2) as i32 * 100, width, 100)
+    }
+
+    pub fn store_toolbar_button(&self) -> Rect {
+        Rect::new(self.width - 40 - 260, 200, 260, 100)
+    }
+
+    pub fn store_toolbar_row(&self, i: usize) -> Rect {
+        let row = self.store_list_row(i);
+        Rect::new(row.x, row.y + 120, row.w, row.h)
+    }
+
+    pub fn store_toolbar_rows(&self) -> usize {
+        ((self.store_body_bottom() - self.store_toolbar_row(0).y - 170) / STORE_ROW_H).max(1) as usize
+    }
+
     /// Where a tab's content ends: above the tab bar.
     pub fn store_body_bottom(&self) -> i32 {
         self.store_tabs().y - 30
@@ -881,7 +927,7 @@ impl Layout {
 
     /// The page label under the rows: its left half turns back, its right half turns forward.
     pub fn store_page_label(&self) -> Rect {
-        Rect::new(0, self.store_body_bottom() - 60, self.width, 60)
+        Rect::new(0, self.store_tabs().y - 200, self.width, 76)
     }
 
     /// The index of the row under a point, among `rows` rows of a list or of Today.
@@ -926,11 +972,18 @@ impl Layout {
         [0, 1, 2].map(|i| Rect::new(40 + i * w, y, w, 150))
     }
 
-    /// Screenshot `i`: 632 × 840 pictures shown at 540 px high, side by side.
-    pub fn store_shot(&self, i: usize, scroll: i32) -> Rect {
+    /// A 632 × 840 screenshot shown at 540 px high.
+    pub fn store_shot(&self, scroll: i32) -> Rect {
         let h = 540;
         let w = h * 632 / 840;
-        Rect::new(40 + i as i32 * (w + 24), 1190 - scroll, w, h)
+        Rect::new((self.width - w) / 2, 1190 - scroll, w, h)
+    }
+
+    pub fn store_shot_button(&self, scroll: i32, forward: bool) -> Rect {
+        let shot = self.store_shot(scroll);
+        let width = 200;
+        let x = if forward { shot.right() + 48 } else { shot.x - 48 - width };
+        Rect::new(x, shot.y + (shot.h - BUTTON_H) / 2, width, BUTTON_H)
     }
 
     /// Where the About text starts: below the screenshots when there are any (`shots` 1 or 2), else up under the strip.
@@ -940,14 +993,26 @@ impl Layout {
     }
 
     /// Information row `i` (developer, licence, category, firmware, tested on, repository, then the changes).
-    pub fn store_info_row(&self, i: usize, scroll: i32, shots: usize) -> Rect {
-        let top = store_about_top(shots) + 426 - scroll;
+    pub fn store_version_row(&self, i: usize, scroll: i32, shots: usize) -> Rect {
+        let gap = if i > 0 { 76 } else { 0 };
+        let top = store_about_top(shots) + 418 + gap + i as i32 * 210 - scroll;
+        Rect::new(40, top, self.width - 80, 210)
+    }
+
+    fn store_information_top(shots: usize, versions: usize) -> i32 {
+        store_about_top(shots) + 426 + if versions == 0 { 0 } else {
+            versions as i32 * 210 + 70 + if versions > 1 { 76 } else { 0 }
+        }
+    }
+
+    pub fn store_info_row(&self, i: usize, scroll: i32, shots: usize, versions: usize) -> Rect {
+        let top = Self::store_information_top(shots, versions) - scroll;
         Rect::new(40, top + i as i32 * STORE_INFO_ROW_H, self.width - 80, STORE_INFO_ROW_H)
     }
 
     /// The height of a product page's content (for the scroll limit), with `rows` information rows.
-    pub fn store_page_height(&self, rows: usize, shots: usize) -> i32 {
-        store_about_top(shots) + 426 + rows as i32 * STORE_INFO_ROW_H + 130
+    pub fn store_page_height(&self, rows: usize, shots: usize, versions: usize) -> i32 {
+        Self::store_information_top(shots, versions) + rows as i32 * STORE_INFO_ROW_H + 130
     }
 
     pub fn confirm_buttons(&self) -> [(Button, Rect); 2] {

@@ -19,6 +19,25 @@ pub struct Category {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CollectionIndex {
+    pub schema: u32,
+    pub collections: Vec<Collection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Collection {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub apps: Vec<String>,
+}
+
+pub fn valid_app_id(id: &str) -> bool {
+    (2..=40).contains(&id.len()) && id.as_bytes()[0] != b'-'
+        && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// One app's card in the index: enough to show it in a list.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Card {

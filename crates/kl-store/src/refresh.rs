@@ -4,7 +4,7 @@
 //!
 //! Cache layout (under `launcher/store/cache`): `index.json`, `apps/<id>.json`, `icons/<id>.png`, `shots/<id>-<n>.png`.
 
-use crate::catalog::{Card, Index, Listing};
+use crate::catalog::{valid_app_id, Card, CollectionIndex, Index, Listing};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
@@ -49,7 +49,7 @@ fn is_png(bytes: &[u8]) -> bool {
 fn fetch_app(base: &str, cache: &Path, card: &Card, source: &dyn Source) -> Result<(), String> {
     let text = source.text(&format!("{base}/apps/{}.json", card.id))?;
     let listing: Listing = serde_json::from_str(&text).map_err(|e| format!("the listing is not valid: {e}"))?;
-    if listing.id != card.id {
+    if listing.schema != 1 || listing.id != card.id {
         return Err("the listing is for another app".into());
     }
     // The icon comes from this site's own folder, as the screenshots do, whatever URL the index gives.
@@ -104,10 +104,25 @@ pub fn refresh(base: &str, cache: &Path, source: &dyn Source) -> Result<Report, 
     let mut report = Report::default();
     let mut listed: BTreeSet<String> = BTreeSet::new();
     for card in &index.apps {
-        listed.insert(card.id.clone());
+        if !valid_app_id(&card.id) {
+            report.failed.push((card.id.clone(), "the app id is invalid".to_string()));
+            continue;
+        }
+        if !listed.insert(card.id.clone()) {
+            continue;
+        }
         match fetch_app(base, cache, card, source) {
             Ok(()) => report.refreshed += 1,
             Err(reason) => report.failed.push((card.id.clone(), reason)),
+        }
+    }
+
+    // Older catalog deployments have no collections endpoint.
+    if let Ok(text) = source.text(&format!("{base}/collections.json")) {
+        if text.len() as u64 <= MAX_LISTING
+            && serde_json::from_str::<CollectionIndex>(&text).is_ok_and(|index| index.schema == 1)
+        {
+            let _ = write_atomic(&cache.join("collections.json"), text.as_bytes());
         }
     }
 

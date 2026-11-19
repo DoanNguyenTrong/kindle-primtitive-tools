@@ -1,8 +1,9 @@
 //! The store's entries as the screens show them: one per listing in the catalog cache, with what is installed and
 //! what the store would do for it. Built from `kl-store`'s listing and the installed record; no device code here.
 
-use kl_store::catalog::{Changes, Listing, Source};
+use kl_store::catalog::{Changes, Listing, Source, VersionEntry};
 use kl_store::record::Installed;
+use kl_store::resolve::{self, Device};
 use kl_store::Version;
 
 /// Whether an entry is installed, and whether a newer version is ready.
@@ -27,6 +28,14 @@ impl StoreTab {
 }
 
 pub const STORE_ID: &str = "primitive-store";
+pub const LAUNCHER_ID: &str = "primitive-launcher";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionNotes {
+    pub version: String,
+    pub date: String,
+    pub notes: String,
+}
 
 /// What the action button does: install from the store (hosted or upstream), or show the page to read (link).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +69,8 @@ pub struct StoreEntry {
     pub tested_on: Vec<String>,
     /// How many screenshots the listing has (at most two are shown on the product page).
     pub screenshots: usize,
+    pub versions: Vec<VersionNotes>,
+    pub availability: Option<String>,
 }
 
 /// A size as the product page shows it: "4.5 MB", "640 KB", "900 bytes".
@@ -130,7 +141,20 @@ pub fn change_lines(c: &Changes) -> Vec<String> {
 impl StoreEntry {
     /// The entry for a listing, given what is installed under its id.
     pub fn from_listing(listing: &Listing, installed: Option<&Installed>) -> StoreEntry {
-        let newest = newest_live_entry(listing);
+        Self::from_selection(listing, installed, newest_live_entry(listing), None, None)
+    }
+
+    pub fn for_device(listing: &Listing, installed: Option<&Installed>, device: &Device) -> StoreEntry {
+        if listing.source == Source::Link {
+            return Self::from_listing(listing, installed);
+        }
+        match resolve::pick_version(listing, device) {
+            Ok(version) => Self::from_selection(listing, installed, Some(version), Some(&device.arch), None),
+            Err(error) => Self::from_selection(listing, installed, None, None, Some(error.to_string())),
+        }
+    }
+
+    fn from_selection(listing: &Listing, installed: Option<&Installed>, newest: Option<&VersionEntry>, arch: Option<&str>, availability: Option<String>) -> StoreEntry {
         let latest = newest.map(|v| v.version.clone());
         let status = match (installed, &latest) {
             (None, _) => Status::NotInstalled,
@@ -139,6 +163,20 @@ impl StoreEntry {
             }
             (Some(i), _) => Status::Installed(i.version.clone()),
         };
+        let mut version_entries: Vec<_> = listing.versions.iter()
+            .filter(|v| v.withdrawn.is_none())
+            .filter_map(|v| Version::parse(&v.version).map(|number| (number, v)))
+            .collect();
+        version_entries.sort_by(|(a, _), (b, _)| b.cmp(a));
+        if let Some(selected) = newest {
+            if let Some(index) = version_entries.iter().position(|(_, version)| version.version == selected.version) {
+                let primary = version_entries.remove(index);
+                version_entries.insert(0, primary);
+            }
+        }
+        let versions = version_entries.iter().map(|(_, version)| VersionNotes {
+            version: version.version.clone(), date: version.date.clone(), notes: version.notes.clone(),
+        }).collect();
         StoreEntry {
             id: listing.id.clone(),
             name: listing.name.clone(),
@@ -155,10 +193,40 @@ impl StoreEntry {
             system_changes: listing.categories.iter().any(|category| category == "system")
                 || listing.changes.starts_at_boot
                 || listing.changes.root_filesystem,
-            size: newest.and_then(|v| v.assets.values().next()).map(|a| a.size),
+            size: newest.and_then(|v| match arch {
+                Some(arch) => v.assets.get(arch),
+                None => v.assets.get("armhf").or_else(|| v.assets.values().next()),
+            }).map(|a| a.size),
             firmware_min: newest.map(|v| v.firmware.min.clone()).unwrap_or_default(),
             tested_on: newest.map(|v| v.tested_on.clone()).unwrap_or_default(),
             screenshots: listing.screenshots.len().min(2),
+            versions,
+            availability,
+        }
+    }
+
+    /// An installed app remains manageable if its catalog listing has gone away.
+    pub fn from_installed(app: &Installed) -> StoreEntry {
+        Self {
+            id: app.id.clone(),
+            name: app.id.split('-').map(capitalise).collect::<Vec<_>>().join(" "),
+            subtitle: "Installed from the store".to_string(),
+            developer: String::new(),
+            description: "The store has no listing for this app.".to_string(),
+            categories: Vec::new(),
+            licence: String::new(),
+            repo: String::new(),
+            kind: Kind::Install,
+            latest: None,
+            status: Status::Installed(app.version.clone()),
+            changes: Vec::new(),
+            system_changes: false,
+            size: None,
+            firmware_min: String::new(),
+            tested_on: Vec::new(),
+            screenshots: 0,
+            versions: Vec::new(),
+            availability: None,
         }
     }
 
@@ -168,8 +236,12 @@ impl StoreEntry {
     /// Whether the store installed this app (so the page offers Remove).
     pub fn can_remove(&self) -> bool {
         self.kind == Kind::Install
-            && self.id != STORE_ID
+            && !matches!(self.id.as_str(), STORE_ID | LAUNCHER_ID)
             && matches!(self.status, Status::Installed(_) | Status::Update { .. })
+    }
+
+    pub fn can_install(&self) -> bool {
+        self.kind == Kind::Install && self.latest.is_some() && !matches!(self.status, Status::Installed(_))
     }
 
     /// The rows the product page shows: the information rows, and Remove when the app is installed.
@@ -187,7 +259,7 @@ impl StoreEntry {
             ("Developer".to_string(), self.developer.clone()),
             ("Licence".to_string(), self.licence.clone()),
             ("Category".to_string(), self.categories.iter().map(|c| capitalise(c)).collect::<Vec<_>>().join(", ")),
-            ("Kindle firmware".to_string(), format!("{} or later", self.firmware_min)),
+            ("Kindle firmware".to_string(), if self.firmware_min.is_empty() { String::new() } else { format!("{} or later", self.firmware_min) }),
             ("Tested on".to_string(), if self.tested_on.is_empty() { "Not yet".to_string() } else { self.tested_on.join(", ") }),
             ("Repository".to_string(), self.repo.trim_start_matches("https://").to_string()),
         ];
@@ -204,7 +276,7 @@ impl StoreEntry {
         }
         match (&self.status, &self.latest) {
             (Status::NotInstalled, Some(v)) => format!("Version {v}"),
-            (Status::NotInstalled, None) => "No version for this Kindle".to_string(),
+            (Status::NotInstalled, None) => self.availability.clone().unwrap_or_else(|| "No version for this Kindle.".to_string()),
             (Status::Installed(v), _) => format!("Installed: version {v}"),
             (Status::Update { installed, latest }, _) => format!("Update ready: {installed} to {latest}"),
         }
@@ -214,6 +286,7 @@ impl StoreEntry {
     pub fn action_label(&self) -> &'static str {
         match (self.kind, &self.status) {
             (Kind::Link, _) => "View",
+            (Kind::Install, Status::NotInstalled) if self.latest.is_none() => "Unavailable",
             (Kind::Install, Status::NotInstalled) => "Get",
             (Kind::Install, Status::Update { .. }) => "Update",
             (Kind::Install, Status::Installed(_)) => "Installed",
@@ -242,6 +315,8 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
         firmware_min: "5.16.3".into(),
         tested_on: vec!["KindleOasis3".into()],
         screenshots: 0,
+        versions: Vec::new(),
+        availability: None,
     }
 }
 
