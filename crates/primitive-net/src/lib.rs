@@ -229,6 +229,23 @@ pub fn fetch_text(url: &str, policy: &Policy) -> Result<String, NetError> {
     Ok(text)
 }
 
+/// Reads a file (an icon, a screenshot) into memory under the same policy and size limit.
+pub fn fetch_bytes(url: &str, policy: &Policy) -> Result<Vec<u8>, NetError> {
+    let (_, resp) = open(url, policy)?;
+    let mut body = resp.into_body();
+    let mut reader = body.with_config().limit(policy.max_bytes).reader();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("limit") {
+            NetError::TooLarge { limit: policy.max_bytes }
+        } else {
+            NetError::Transport(msg)
+        }
+    })?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +350,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pn-redir-{}", std::process::id()));
         let r = download(&format!("{base}/redirect-out"), &dir.join("x"), &local_policy(), |_, _| {});
         assert!(matches!(r, Err(NetError::NotAllowed(_))), "{r:?}");
+    }
+
+    #[test]
+    fn fetches_bytes_from_the_local_server() {
+        let (base, _h) = server();
+        let got = fetch_bytes(&format!("{base}/file"), &local_policy()).unwrap();
+        assert_eq!(got, b"hello from the test server, twelve bytes or more".to_vec());
+        let too_big = Policy { max_bytes: 10, ..local_policy() };
+        assert!(matches!(fetch_bytes(&format!("{base}/file"), &too_big), Err(NetError::TooLarge { .. })));
     }
 
     #[test]
