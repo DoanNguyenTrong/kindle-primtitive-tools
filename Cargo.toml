@@ -4,6 +4,8 @@ members = [
     "crates/primitive-keyboard",
     "crates/primitive-quick",
     "crates/primitive-net",
+    "crates/primitive-ui",
+    "crates/primitive-app",
     "crates/kl-store",
     "crates/kl-core",
     "crates/kl-render",

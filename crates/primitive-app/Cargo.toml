@@ -1,0 +1,12 @@
+[package]
+name = "primitive-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Foreground app lifecycle shared by native Primitive Kindle apps."
+
+[dependencies]
+kl-core = { path = "../kl-core" }
+kl-kindle = { path = "../kl-kindle" }
+primitive-ui = { path = "../primitive-ui" }
+png.workspace = true
