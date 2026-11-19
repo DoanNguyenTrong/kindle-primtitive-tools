@@ -1162,6 +1162,12 @@ impl Renderer {
         let x = inner.x as f32;
         let y = inner.y as f32;
         let w = inner.w as f32;
+        if ui.store_progress.is_none() {
+            if let Some(review) = &ui.store_requirements {
+                self.store_requirements_dialog(ui, entry, inner, review);
+                return;
+            }
+        }
         self.text(Text { text: &entry.name, x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         if let Some(progress) = &ui.store_progress {
             self.store_progress(inner, progress, ui.store_progress_percent);
@@ -1184,6 +1190,44 @@ impl Renderer {
         let label = if matches!(entry.status, kl_core::store::Status::Update { .. }) { "Update" } else { "Install" };
         self.button(cancel, "Cancel", false);
         self.button(install, label, true);
+    }
+
+    fn store_requirements_dialog(&mut self, ui: &Ui, entry: &kl_core::store::StoreEntry, inner: Rect, review: &kl_core::ui::StoreRequirementReview) {
+        let (x, y, w) = (inner.x as f32, inner.y as f32, inner.w as f32);
+        self.text(Text { text: "Install required apps?", x, y, w, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        let explanation = format!("The store will install or update these apps before installing {}.", entry.name);
+        self.text(Text { text: &explanation, x, y: y + 82.0, w, size: 30.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+        for (i, app) in review.visible_apps().iter().enumerate() {
+            let top = inner.y + 170 + i as i32 * 102;
+            let version = app.latest.as_deref().unwrap_or_default();
+            let action = app.action_label();
+            let action = if action == "Get" { "Install" } else { action };
+            let title = format!("{action} {} {version}", app.name);
+            self.text(Text { text: &title, x, y: top as f32, w, size: 33.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            let size = app.size.map(kl_core::store::format_size).unwrap_or_default();
+            let change = if app.system_changes {
+                "May change how your Kindle starts or runs."
+            } else {
+                app.changes.first().map(String::as_str).unwrap_or_default()
+            };
+            let details = format!("{size} · {change}");
+            self.text(Text { text: &details, x, y: (top + 44) as f32, w, size: 26.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+            self.hairline(top + 91, inner.x, inner.right());
+        }
+        if review.pages() > 1 {
+            let [previous, next] = ui.layout.store_requirements_nav();
+            if review.page > 0 {
+                self.store_capsule(previous, "Previous", false, BLACK);
+            }
+            if review.page + 1 < review.pages() {
+                self.store_capsule(next, "Next", false, BLACK);
+            }
+            let page = format!("{} of {}", review.page + 1, review.pages());
+            self.text(Text { text: &page, x, y: (previous.y + 23) as f32, w, size: 28.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
+        }
+        let [cancel, install] = ui.layout.store_sheet_buttons();
+        self.button(cancel, "Cancel", false);
+        self.button(install, "Install apps", true);
     }
 
     fn store_progress(&mut self, inner: Rect, message: &str, percent: Option<u8>) {

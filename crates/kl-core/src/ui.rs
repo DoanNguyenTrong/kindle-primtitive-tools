@@ -238,6 +238,25 @@ pub fn valid_ssh_password(pw: &str) -> bool {
 /// A horizontal swipe longer than this (pixels) turns the page.
 const SWIPE_MIN: f32 = 150.0;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRequirementReview {
+    pub apps: Vec<crate::store::StoreEntry>,
+    pub page: usize,
+}
+
+impl StoreRequirementReview {
+    const APPS_PER_PAGE: usize = 3;
+
+    pub fn pages(&self) -> usize {
+        self.apps.len().div_ceil(Self::APPS_PER_PAGE).max(1)
+    }
+
+    pub fn visible_apps(&self) -> &[crate::store::StoreEntry] {
+        let start = self.page.min(self.pages() - 1) * Self::APPS_PER_PAGE;
+        &self.apps[start..(start + Self::APPS_PER_PAGE).min(self.apps.len())]
+    }
+}
+
 pub struct Ui {
     apps: Vec<App>,
     pub layout: Layout,
@@ -285,6 +304,7 @@ pub struct Ui {
     pub store_search_keyboard: bool,
     /// The catalog entry on the confirmation or progress sheet.
     pub store_sheet: Option<usize>,
+    pub store_requirements: Option<StoreRequirementReview>,
     pub store_progress: Option<String>,
     pub store_progress_percent: Option<u8>,
     pub store_settings_open: bool,
@@ -357,6 +377,7 @@ impl Ui {
             store_query: primitive_keyboard::Editor::new(48),
             store_search_keyboard: false,
             store_sheet: None,
+            store_requirements: None,
             store_progress: None,
             store_progress_percent: None,
             store_settings_open: false,
@@ -480,6 +501,7 @@ impl Ui {
         self.store_scroll = 0;
         self.store_shot_index = 0;
         self.store_sheet = None;
+        self.store_requirements = None;
         self.store_remove_armed = None;
     }
 
@@ -495,6 +517,7 @@ impl Ui {
                 self.before_sleep = Screen::Store;
             }
             self.store_sheet = None;
+            self.store_requirements = None;
             self.store_remove_armed = None;
         } else if self.store_sheet.is_some() {
             self.store_sheet = self.store_open;
@@ -687,6 +710,7 @@ impl Ui {
         }
         self.store_search_keyboard = false;
         self.store_open = Some(index);
+        self.store_requirements = None;
         self.store_scroll = 0;
         self.store_shot_index = 0;
         self.store_remove_armed = None;
@@ -930,6 +954,19 @@ impl Ui {
             }
             let box_rect = l.store_sheet();
             let [cancel, install] = l.store_sheet_buttons();
+            if let Some(review) = &mut self.store_requirements {
+                if let Input::Tap(x, y) = input {
+                    let [prev, next] = l.store_requirements_nav();
+                    if prev.contains(x, y) || next.contains(x, y) {
+                        if prev.contains(x, y) {
+                            review.page = review.page.saturating_sub(1);
+                        } else {
+                            review.page = (review.page + 1).min(review.pages() - 1);
+                        }
+                        return Action::Redraw { full: false };
+                    }
+                }
+            }
             match input {
                 Input::Tap(x, y) if install.contains(x, y) => {
                     if self.store_busy {
@@ -943,6 +980,7 @@ impl Ui {
                 Input::Tap(x, y) if cancel.contains(x, y) || !box_rect.contains(x, y) => self.store_sheet = None,
                 _ => return Action::None,
             }
+            self.store_requirements = None;
             return Action::Redraw { full: true };
         }
         if self.store_remove_armed.is_some() {
@@ -1937,6 +1975,30 @@ mod tests {
         u.handle(centre(u.layout.store_category_cell(1)));
         assert_eq!(u.store_category.as_deref(), Some("productivity"));
         assert_eq!(u.store_apps(), vec![0]);
+    }
+
+    #[test]
+    fn a_required_app_review_pages_the_list_and_can_be_cancelled() {
+        use crate::store::{test_entry, Status};
+
+        let mut u = ui(0);
+        u.set_store(vec![test_entry("target", "Target", Status::NotInstalled)]);
+        u.open_store();
+        u.handle(centre(u.layout.store_feature()));
+        u.handle(centre(u.layout.store_action(0)));
+        u.store_requirements = Some(StoreRequirementReview {
+            apps: (0..4).map(|index| test_entry(&format!("required-{index}"), "Required app", Status::NotInstalled)).collect(),
+            page: 0,
+        });
+        let [_, next] = u.layout.store_requirements_nav();
+        assert_eq!(u.handle(centre(next)), Action::Redraw { full: false });
+        let review = u.store_requirements.as_ref().unwrap();
+        assert_eq!(review.page, 1);
+        assert_eq!(review.visible_apps()[0].id, "required-3");
+        let [cancel, _] = u.layout.store_sheet_buttons();
+        assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: true });
+        assert!(u.store_requirements.is_none());
+        assert!(u.store_installing.is_none());
     }
 
     #[test]

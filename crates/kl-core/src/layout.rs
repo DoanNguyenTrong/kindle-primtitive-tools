@@ -1035,6 +1035,12 @@ impl Layout {
         let width = (b.w - 104) / 2;
         [Rect::new(b.x + 40, y, width, BUTTON_H), Rect::new(b.right() - 40 - width, y, width, BUTTON_H)]
     }
+
+    pub fn store_requirements_nav(&self) -> [Rect; 2] {
+        let b = self.store_sheet().inset(48);
+        let y = b.y + 484;
+        [Rect::new(b.x, y, 220, 85), Rect::new(b.right() - 220, y, 220, 85)]
+    }
 }
 
 #[cfg(test)]
