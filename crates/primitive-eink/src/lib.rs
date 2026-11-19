@@ -14,6 +14,9 @@
 //!
 //! The structure and ioctl are the Oasis 3 (Zelda platform) ones, from FBInk's `eink/mxcfb-kindle.h`.
 
+pub mod display;
+pub use display::Display;
+
 use std::{
     fs::{File, OpenOptions},
     io,

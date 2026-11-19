@@ -1,0 +1,12 @@
+[package]
+name = "primitive-eink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kindle framebuffer, waveform and region updates, and grayscale display presentation."
+
+[dependencies]
+kl-core = { path = "../kl-core" }
+kl-render = { path = "../kl-render" }
+primitive-device = { path = "../primitive-device" }
+libc.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "primitive-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kindle device profiles, power events, rotation, battery, and Wi-Fi services."
+
+[dependencies]
+kl-core = { path = "../kl-core" }
+primitive-quick = { path = "../primitive-quick" }
+libc.workspace = true

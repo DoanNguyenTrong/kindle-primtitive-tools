@@ -2,10 +2,10 @@
 //! input, the device's status, and the events an app's loop reads.
 
 pub mod device;
-pub mod display;
-pub mod eink;
 pub mod input;
-pub mod profile;
+
+pub use primitive_device::{log, profile};
+pub use primitive_eink::{self as eink, display};
 
 use kl_core::{Input, Rotation};
 
@@ -34,8 +34,4 @@ pub enum Ev {
     StoreProgress { message: String, percent: Option<u8> },
     /// The launcher finished installing the standalone store.
     StoreBootstrapped(Result<(), String>),
-}
-
-pub fn log(msg: &str) {
-    eprintln!("[kl] {msg}");
 }

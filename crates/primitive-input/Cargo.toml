@@ -1,0 +1,11 @@
+[package]
+name = "primitive-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Touch gestures and page-button input from the Kindle evdev devices."
+
+[dependencies]
+kl-core = { path = "../kl-core" }
+primitive-device = { path = "../primitive-device" }
+libc.workspace = true

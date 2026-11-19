@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use kl_core::Settings;
 
-use crate::{eink, log, profile};
+use primitive_device::{log, profile};
+
+use crate as eink;
 
 const W: u32 = profile::ACTIVE.screen_w;
 const H: u32 = profile::ACTIVE.screen_h;
@@ -49,10 +51,9 @@ impl Display {
         let result = if full || self.last.len() != frame.len() {
             panel.draw(W, (0, 0, W, H), &frame, eink::WAVE_GC16, true).map(|ok| (ok, "GC16 full", (0, 0, W, H)))
         } else if let Some((x, y, w, h)) = kl_render::changed_rect(&self.last, &frame, W as usize) {
-            let stride = W as usize;
-            let bw = (y..y + h).all(|r| kl_render::is_black_and_white(&frame[r * stride + x..r * stride + x + w]));
-            let (wave, name) = if bw { (eink::WAVE_DU, "DU") } else { (eink::WAVE_AUTO, "AUTO") };
             let region = (x as u32, y as u32, w as u32, h as u32);
+            let wave = region_wave(&frame, region);
+            let name = if wave == eink::WAVE_DU { "DU" } else { "AUTO" };
             panel.draw(W, region, &frame, wave, false).map(|ok| (ok, name, region))
         } else {
             Ok((true, "unchanged", (0, 0, 0, 0)))
@@ -91,12 +92,32 @@ impl Display {
             return;
         }
         let region = (x0, y0, x1.min(W) - x0, y1 - y0);
-        let stride = W as usize;
-        let bw = (y0..y1).all(|r| kl_render::is_black_and_white(&frame[r as usize * stride + x0 as usize..r as usize * stride + (x0 + region.2) as usize]));
-        let wave = if bw { eink::WAVE_DU } else { eink::WAVE_AUTO };
+        let wave = region_wave(&frame, region);
         if let Err(e) = panel.draw(W, region, &frame, wave, false) {
             log(&format!("draw: {e}"));
         }
+    }
+}
+
+fn region_wave(frame: &[u8], (x, y, w, h): (u32, u32, u32, u32)) -> u32 {
+    let stride = W as usize;
+    let (left, right) = (x as usize, (x + w) as usize);
+    let black_and_white = (y as usize..(y + h) as usize)
+        .all(|row| kl_render::is_black_and_white(&frame[row * stride + left..row * stride + right]));
+    if black_and_white { eink::WAVE_DU } else { eink::WAVE_AUTO }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_waveform_depends_only_on_the_region_pixels() {
+        let mut frame = vec![255; W as usize * 2];
+        frame[0] = 128;
+        assert_eq!(region_wave(&frame, (8, 0, 8, 2)), eink::WAVE_DU);
+        frame[W as usize + 8] = 128;
+        assert_eq!(region_wave(&frame, (8, 0, 8, 2)), eink::WAVE_AUTO);
     }
 }
 
