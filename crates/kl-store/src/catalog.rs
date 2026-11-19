@@ -54,6 +54,9 @@ pub struct Card {
     pub updated_at: String,
     #[serde(default)]
     pub listing: Option<String>,
+    /// SHA-256 of the published listing, icon and the first two screenshots, each prefixed with its byte length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

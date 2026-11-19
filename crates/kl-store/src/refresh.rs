@@ -1,15 +1,18 @@
 //! Refreshing the catalog cache on the Kindle: the index, each listing, and its icon and screenshots, from the
-//! catalog's published site. The source of the files is given by the caller (the device fetches over HTTPS; the tests use
-//! a fake). An app that fails keeps the copy it had; an app the catalog no longer lists is removed.
+//! catalog's published site. The caller supplies the source of the files. A failed listing keeps its cached copy and
+//! artwork failures are reported separately. An app the catalog no longer lists is removed.
 //!
 //! Cache layout (under `launcher/store/cache`): `index.json`, `apps/<id>.json`, `icons/<id>.png`, `shots/<id>-<n>.png`.
 
 use crate::catalog::{valid_app_id, Asset, Card, CollectionIndex, Index, Listing};
 use crate::signatures::{self, PackageIdentity, TrustedKey, VerifiedIndex};
+use ring::digest::{Context, SHA256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{atomic::{AtomicUsize, Ordering}, mpsc};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where the files come from. `text` reads a small document; `bytes` reads a picture, refused past `max` bytes.
@@ -32,6 +35,7 @@ pub const MAX_PICTURE: u64 = 1024 * 1024;
 /// Screenshots shown per app (the product page has room for two).
 pub const SHOTS_PER_APP: usize = 2;
 const SIGNED_CURRENT: &str = "signed-current";
+const REFRESH_WORKERS: usize = 4;
 
 fn read_limited(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -187,10 +191,14 @@ pub fn clear_cache(launcher: &Path) -> io::Result<()> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
-    /// Apps whose files were refreshed.
+    /// App listings fetched from the source.
     pub refreshed: usize,
-    /// Apps that failed, with the reason; their cached copy is kept.
+    /// Apps whose complete files already matched the published revision.
+    pub reused: usize,
+    /// Listings that failed, with the reason; their cached copy is kept.
     pub failed: Vec<(String, String)>,
+    /// Apps whose artwork could not be fully refreshed, with the reasons.
+    pub artwork_failed: Vec<(String, String)>,
     /// Cached files of apps the catalog no longer lists, removed.
     pub removed: usize,
 }
@@ -208,36 +216,105 @@ fn is_png(bytes: &[u8]) -> bool {
     bytes.len() > 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
 }
 
-/// Fetches all of an app's files before replacing any cached files.
-fn fetch_app(base: &str, cache: &Path, card: &Card, source: &dyn Source, proof: Option<&VerifiedIndex>) -> Result<(), String> {
-    let bytes = checked_fetch(source, || source.bytes(&format!("{base}/apps/{}.json", card.id), MAX_LISTING))?;
-    let listing = parse_listing(&card.id, &bytes, proof)?;
-    // The icon comes from this site's own folder, as the screenshots do, whatever URL the index gives.
-    let icon = checked_fetch(source, || source.bytes(&format!("{base}/icons/{}.png", card.id), MAX_PICTURE))?;
-    if !is_png(&icon) {
-        return Err("the icon is not a PNG".into());
+struct AppUpdate {
+    reused: bool,
+    artwork_errors: Vec<String>,
+}
+
+struct Picture {
+    path: String,
+    label: String,
+    bytes: Vec<u8>,
+}
+
+/// Art always comes from the catalog site, whatever URLs the listing or index gives.
+fn pictures_for(id: &str, shots_count: usize) -> impl Iterator<Item = (String, String)> + '_ {
+    std::iter::once((format!("icons/{id}.png"), "icon".to_owned())).chain(
+        (0..shots_count).map(move |n| (format!("shots/{id}-{n}.png"), format!("screenshot {}", n + 1))),
+    )
+}
+
+fn app_revision(listing: &[u8], artwork: &[Picture]) -> String {
+    let mut digest = Context::new(&SHA256);
+    for bytes in std::iter::once(listing).chain(artwork.iter().map(|picture| picture.bytes.as_slice())) {
+        digest.update(&(bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
     }
-    let shots_count = listing.screenshots.len().min(SHOTS_PER_APP);
-    let mut shots = Vec::new();
-    for n in 0..shots_count {
-        let bytes = checked_fetch(source, || source.bytes(&format!("{base}/shots/{}-{n}.png", card.id), MAX_PICTURE))?;
-        if !is_png(&bytes) {
-            return Err(format!("screenshot {} is not a PNG", n + 1));
+    signatures::encode_hex(digest.finish().as_ref())
+}
+
+struct CatalogFetch<'a> {
+    base: &'a str,
+    cache: &'a Path,
+    previous: Option<&'a Path>,
+    source: &'a (dyn Source + Sync),
+    proof: Option<&'a VerifiedIndex>,
+}
+
+impl CatalogFetch<'_> {
+    fn reusable_files(&self, card: &Card, path: &str) -> Option<(Vec<u8>, Vec<Picture>)> {
+        let revision = card.revision.as_deref()?;
+        if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return None;
         }
-        shots.push((n, bytes));
+        let previous = self.previous?;
+        let bytes = read_limited(&previous.join(path), MAX_LISTING).ok()?;
+        let listing = parse_listing(&card.id, &bytes, self.proof).ok()?;
+        let artwork = pictures_for(&card.id, listing.screenshots.len().min(SHOTS_PER_APP))
+            .map(|(path, label)| {
+                let bytes = read_limited(&previous.join(&path), MAX_PICTURE).ok()?;
+                is_png(&bytes).then_some(Picture { path, label, bytes })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (app_revision(&bytes, &artwork) == revision).then_some((bytes, artwork))
     }
-    // Once these writes start, finish this app before honoring cancellation.
-    source.check_refresh()?;
-    write_atomic(&cache.join("apps").join(format!("{}.json", card.id)), &bytes).map_err(|e| e.to_string())?;
-    write_atomic(&cache.join("icons").join(format!("{}.png", card.id)), &icon).map_err(|e| e.to_string())?;
-    for (n, bytes) in &shots {
-        write_atomic(&cache.join("shots").join(format!("{}-{n}.png", card.id)), bytes).map_err(|e| e.to_string())?;
+
+    fn fetch_app(&self, card: &Card) -> Result<AppUpdate, String> {
+        let path = format!("apps/{}.json", card.id);
+        if let Some((listing, artwork)) = self.reusable_files(card, &path) {
+            let mut update = AppUpdate { reused: true, artwork_errors: Vec::new() };
+            self.source.check_refresh()?;
+            if self.previous != Some(self.cache) {
+                self.write_app(&path, &listing, &artwork, &mut update)?;
+            }
+            return Ok(update);
+        }
+
+        let bytes = checked_fetch(self.source, || self.source.bytes(&format!("{}/{path}", self.base), MAX_LISTING))?;
+        let listing = parse_listing(&card.id, &bytes, self.proof)?;
+        let shots_count = listing.screenshots.len().min(SHOTS_PER_APP);
+        let mut artwork = Vec::new();
+        let mut update = AppUpdate { reused: false, artwork_errors: Vec::new() };
+        for (path, label) in pictures_for(&card.id, shots_count) {
+            match checked_fetch(self.source, || self.source.bytes(&format!("{}/{path}", self.base), MAX_PICTURE)) {
+                Ok(bytes) if is_png(&bytes) => artwork.push(Picture { path, label, bytes }),
+                Ok(_) => update.artwork_errors.push(format!("{label}: the file is not a PNG")),
+                Err(error) => {
+                    self.source.check_refresh()?;
+                    update.artwork_errors.push(format!("{label}: {error}"));
+                }
+            }
+        }
+
+        // Once these writes start, finish this app before honoring cancellation. The listing and
+        // each available picture replace their previous versions independently.
+        self.source.check_refresh()?;
+        self.write_app(&path, &bytes, &artwork, &mut update)?;
+        for n in shots_count..SHOTS_PER_APP {
+            let _ = fs::remove_file(self.cache.join(format!("shots/{}-{n}.png", card.id)));
+        }
+        Ok(update)
     }
-    // Screenshots the app no longer has.
-    for n in shots_count..SHOTS_PER_APP {
-        let _ = fs::remove_file(cache.join("shots").join(format!("{}-{n}.png", card.id)));
+
+    fn write_app(&self, path: &str, listing: &[u8], artwork: &[Picture], update: &mut AppUpdate) -> Result<(), String> {
+        write_atomic(&self.cache.join(path), listing).map_err(|error| error.to_string())?;
+        for picture in artwork {
+            if let Err(error) = write_atomic(&self.cache.join(&picture.path), &picture.bytes) {
+                update.artwork_errors.push(format!("{}: {error}", picture.label));
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The id of a cached file: `apps/<id>.json`, `icons/<id>.png`, or `shots/<id>-<n>.png`.
@@ -252,25 +329,26 @@ fn cached_id(path: &Path) -> Option<String> {
 
 /// Refreshes the cache from the catalog at `base` (its `v1` site). If cancelled, the previous index is kept, and apps
 /// that already finished refreshing remain in the unsigned cache.
-pub fn refresh(base: &str, cache: &Path, source: &dyn Source) -> Result<Report, String> {
+pub fn refresh(base: &str, cache: &Path, source: &(dyn Source + Sync)) -> Result<Report, String> {
     refresh_with_key(base, cache, source, None)
 }
 
-pub fn refresh_with_key(base: &str, cache: &Path, source: &dyn Source, key: Option<&TrustedKey>) -> Result<Report, String> {
+pub fn refresh_with_key(base: &str, cache: &Path, source: &(dyn Source + Sync), key: Option<&TrustedKey>) -> Result<Report, String> {
     let base = base.trim_end_matches('/');
     if let Some(key) = key {
         return refresh_signed(base, cache, source, key);
     }
     let index_text = checked_fetch(source, || source.text(&format!("{base}/index.json")))?;
     let index = index_from_bytes(index_text.as_bytes())?;
-    let files = refresh_files(base, cache, source, &index, None)?;
+    let fetch = CatalogFetch { base, cache, previous: Some(cache), source, proof: None };
+    let files = fetch.refresh_files(&index)?;
     // Publish and prune together. Once the index is replaced, finish the commit even if cancelled.
     source.check_refresh()?;
     write_atomic(&cache.join("index.json"), index_text.as_bytes()).map_err(|e| e.to_string())?;
     Ok(finish_files(cache, files))
 }
 
-fn refresh_signed(base: &str, cache: &Path, source: &dyn Source, key: &TrustedKey) -> Result<Report, String> {
+fn refresh_signed(base: &str, cache: &Path, source: &(dyn Source + Sync), key: &TrustedKey) -> Result<Report, String> {
     let (raw_index, signature) = fetch_index_proof(base, source)?;
     let (index, proof) = verified_index(key, &raw_index, &signature)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -281,9 +359,10 @@ fn refresh_signed(base: &str, cache: &Path, source: &dyn Source, key: &TrustedKe
     fs::create_dir(&pending).map_err(|error| error.to_string())?;
 
     let pointer = pending.join(SIGNED_CURRENT);
-    let mut previous = None;
+    let previous = read_current_snapshot(cache).ok().flatten();
+    let fetch = CatalogFetch { base, cache: &pending, previous: previous.as_deref(), source, proof: Some(&proof) };
     let publish = (|| {
-        let files = refresh_files(base, &pending, source, &index, Some(&proof))?;
+        let files = fetch.refresh_files(&index)?;
         if let Some((id, reason)) = files.report.failed.first() {
             return Err(format!("the signed catalog was not replaced. {id}: {reason}"));
         }
@@ -292,7 +371,6 @@ fn refresh_signed(base: &str, cache: &Path, source: &dyn Source, key: &TrustedKe
         write_atomic(&pending.join("index.json"), &raw_index).map_err(|error| error.to_string())?;
         write_atomic(&pending.join(signatures::INDEX_SIGNATURE_FILENAME), &signature).map_err(|error| error.to_string())?;
         fs::write(&pointer, name.as_bytes()).map_err(|error| error.to_string())?;
-        previous = read_current_snapshot(cache).ok().flatten();
         source.check_refresh()?;
         fs::rename(&pointer, cache.join(SIGNED_CURRENT)).map_err(|error| error.to_string())?;
         Ok(report)
@@ -311,35 +389,83 @@ struct RefreshedFiles {
     collections: Option<String>,
 }
 
-fn refresh_files(base: &str, cache: &Path, source: &dyn Source, index: &Index, proof: Option<&VerifiedIndex>) -> Result<RefreshedFiles, String> {
-    let mut report = Report::default();
-    let mut listed: BTreeSet<String> = BTreeSet::new();
-    let total = index.apps.len();
-    source.report_refresh(0, total);
-    for (i, card) in index.apps.iter().enumerate() {
-        source.check_refresh()?;
-        if !valid_app_id(&card.id) {
-            report.failed.push((card.id.clone(), "the app id is invalid".to_string()));
-        } else if listed.insert(card.id.clone()) {
-            match fetch_app(base, cache, card, source, proof) {
-                Ok(()) => report.refreshed += 1,
-                Err(reason) => {
-                    source.check_refresh()?;
-                    report.failed.push((card.id.clone(), reason));
-                }
+impl CatalogFetch<'_> {
+    fn refresh_files(&self, index: &Index) -> Result<RefreshedFiles, String> {
+        let mut report = Report::default();
+        let mut listed = BTreeSet::new();
+        let total = index.apps.len();
+        let mut results: Vec<Option<Result<AppUpdate, String>>> = (0..total).map(|_| None).collect();
+        let mut jobs = Vec::new();
+        self.source.report_refresh(0, total);
+        for (i, card) in index.apps.iter().enumerate() {
+            self.source.check_refresh()?;
+            if !valid_app_id(&card.id) {
+                results[i] = Some(Err("the app id is invalid".into()));
+            } else if listed.insert(card.id.clone()) {
+                jobs.push((i, card));
             }
         }
-        source.report_refresh(i + 1, total);
+        let mut completed = total - jobs.len();
+        if completed > 0 {
+            self.source.report_refresh(completed, total);
+        }
+        self.run_jobs(&jobs, |i, result| {
+            results[i] = Some(result);
+            completed += 1;
+            self.source.report_refresh(completed, total);
+        })?;
+        for (i, result) in results.into_iter().enumerate() {
+            let Some(result) = result else { continue };
+            let id = &index.apps[i].id;
+            match result {
+                Ok(update) => {
+                    if update.reused {
+                        report.reused += 1;
+                    } else {
+                        report.refreshed += 1;
+                    }
+                    if !update.artwork_errors.is_empty() {
+                        report.artwork_failed.push((id.clone(), update.artwork_errors.join("; ")));
+                    }
+                }
+                Err(reason) => report.failed.push((id.clone(), reason)),
+            }
+        }
+
+        // Older catalog deployments have no collections endpoint.
+        let collections = checked_fetch(self.source, || self.source.text(&format!("{}/collections.json", self.base)))
+            .ok()
+            .filter(|text| text.len() as u64 <= MAX_LISTING
+                && serde_json::from_str::<CollectionIndex>(text).is_ok_and(|index| index.schema == 1)
+            );
+        self.source.check_refresh()?;
+        Ok(RefreshedFiles { report, listed, collections })
     }
 
-    // Older catalog deployments have no collections endpoint.
-    let collections = checked_fetch(source, || source.text(&format!("{base}/collections.json")))
-        .ok()
-        .filter(|text| text.len() as u64 <= MAX_LISTING
-            && serde_json::from_str::<CollectionIndex>(text).is_ok_and(|index| index.schema == 1)
-        );
-    source.check_refresh()?;
-    Ok(RefreshedFiles { report, listed, collections })
+    fn run_jobs(&self, jobs: &[(usize, &Card)], mut report: impl FnMut(usize, Result<AppUpdate, String>)) -> Result<(), String> {
+        let next = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            for _ in 0..REFRESH_WORKERS.min(jobs.len()) {
+                let sender = sender.clone();
+                let next = &next;
+                scope.spawn(move || {
+                    while self.source.check_refresh().is_ok() {
+                        let Some(&(i, card)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                        let result = self.fetch_app(card);
+                        if self.source.check_refresh().is_err() || sender.send((i, result)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            for (i, result) in receiver {
+                report(i, result);
+            }
+        });
+        self.source.check_refresh()
+    }
 }
 
 fn finish_files(cache: &Path, files: RefreshedFiles) -> Report {
@@ -366,8 +492,9 @@ fn finish_files(cache: &Path, files: RefreshedFiles) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::sync::{atomic::AtomicBool, Condvar, Mutex};
+    use std::time::Duration;
 
     /// A catalog in memory: documents by URL; a URL missing from the map is a failed fetch.
     #[derive(Default)]
@@ -391,18 +518,18 @@ mod tests {
     struct CancelAfter {
         site: Fake,
         url_suffix: &'static str,
-        cancelled: Cell<bool>,
-        progress: RefCell<Vec<(usize, usize)>>,
+        cancelled: AtomicBool,
+        progress: Mutex<Vec<(usize, usize)>>,
     }
 
     impl CancelAfter {
         fn new(site: Fake, url_suffix: &'static str) -> Self {
-            Self { site, url_suffix, cancelled: Cell::new(false), progress: RefCell::new(Vec::new()) }
+            Self { site, url_suffix, cancelled: AtomicBool::new(false), progress: Mutex::new(Vec::new()) }
         }
 
         fn after_fetch<T>(&self, url: &str, result: Result<T, String>) -> Result<T, String> {
             if url.ends_with(self.url_suffix) {
-                self.cancelled.set(true);
+                self.cancelled.store(true, Ordering::Relaxed);
             }
             result
         }
@@ -418,11 +545,11 @@ mod tests {
         }
 
         fn check_refresh(&self) -> Result<(), String> {
-            if self.cancelled.get() { Err("cancelled".into()) } else { Ok(()) }
+            if self.cancelled.load(Ordering::Relaxed) { Err("cancelled".into()) } else { Ok(()) }
         }
 
         fn report_refresh(&self, completed: usize, total: usize) {
-            self.progress.borrow_mut().push((completed, total));
+            self.progress.lock().unwrap().push((completed, total));
         }
     }
 
@@ -460,6 +587,19 @@ mod tests {
             }
         }
         f
+    }
+
+    fn with_revisions(site: &mut Fake) {
+        let mut index = index_from_bytes(&site.docs[&format!("{BASE}/index.json")]).unwrap();
+        for card in &mut index.apps {
+            let bytes = &site.docs[&format!("{BASE}/apps/{}.json", card.id)];
+            let listing = parse_listing(&card.id, bytes, None).unwrap();
+            let artwork = pictures_for(&card.id, listing.screenshots.len().min(SHOTS_PER_APP))
+                .map(|(path, label)| Picture { bytes: site.docs[&format!("{BASE}/{path}")].clone(), path, label })
+                .collect::<Vec<_>>();
+            card.revision = Some(app_revision(bytes, &artwork));
+        }
+        site.docs.insert(format!("{BASE}/index.json"), serde_json::to_vec(&index).unwrap());
     }
 
     fn cache(name: &str) -> std::path::PathBuf {
@@ -516,7 +656,7 @@ mod tests {
         }
         let source = CancelAfter::new(next, "/shots/notes-1.png");
         assert_eq!(refresh(BASE, &dir, &source).unwrap_err(), "cancelled");
-        assert_eq!(*source.progress.borrow(), [(0, 1)]);
+        assert_eq!(*source.progress.lock().unwrap(), [(0, 1)]);
         assert_eq!(fs::read_to_string(dir.join("index.json")).unwrap(), index(&["notes", "words"]));
         assert_eq!(fs::read_to_string(dir.join("apps/notes.json")).unwrap(), listing("notes", 2));
         for path in ["icons/notes.png", "shots/notes-0.png", "shots/notes-1.png", "icons/words.png", "shots/words-0.png"] {
@@ -538,7 +678,7 @@ mod tests {
         sign_site(&mut next, &["notes", "words"]);
         let source = CancelAfter::new(next, "/collections.json");
         assert_eq!(refresh_with_key(BASE, &dir, &source, Some(&key)).unwrap_err(), "cancelled");
-        assert_eq!(*source.progress.borrow(), [(0, 2), (1, 2), (2, 2)]);
+        assert_eq!(*source.progress.lock().unwrap(), [(0, 2), (1, 2), (2, 2)]);
         let catalog = cached_catalog(&dir, Some(&key)).unwrap();
         assert_eq!(catalog.directory(), original);
         assert!(catalog.listing("notes").is_ok());
@@ -563,7 +703,7 @@ mod tests {
     fn a_fresh_refresh_writes_the_index_listings_icons_and_screenshots() {
         let c = cache("fresh");
         let r = refresh(BASE, &c, &site(&["notes", "words"], 2)).unwrap();
-        assert_eq!(r, Report { refreshed: 2, failed: vec![], removed: 0 });
+        assert_eq!(r, Report { refreshed: 2, ..Report::default() });
         assert!(c.join("index.json").exists());
         assert!(c.join("apps/notes.json").exists());
         assert!(c.join("icons/words.png").exists());
@@ -576,7 +716,7 @@ mod tests {
         let c = cache("partial");
         refresh(BASE, &c, &site(&["notes", "words"], 0)).unwrap();
         let mut broken = site(&["notes", "words"], 0);
-        broken.docs.remove(&format!("{BASE}/icons/notes.png"));
+        broken.docs.remove(&format!("{BASE}/apps/notes.json"));
         broken.docs.insert(format!("{BASE}/apps/words.json"), listing("words", 0).replace("1.0.0", "2.0.0").into_bytes());
         let r = refresh(BASE, &c, &broken).unwrap();
         assert_eq!(r.refreshed, 1);
@@ -644,7 +784,7 @@ mod tests {
         let source = Disk { root: std::path::PathBuf::from(site), base: base.clone() };
         let c = cache("catalog");
         let r = refresh(&base, &c, &source).expect("the index reads");
-        assert!(r.failed.is_empty(), "every app refreshes from the build output: {:?}", r.failed);
+        assert!(r.failed.is_empty() && r.artwork_failed.is_empty(), "the site must contain each listing and its art: {r:?}");
         assert!(r.refreshed >= 1);
         let _ = fs::remove_dir_all(c);
     }
@@ -655,8 +795,101 @@ mod tests {
         let mut f = site(&["notes"], 0);
         f.docs.insert(format!("{BASE}/icons/notes.png"), b"<html>".to_vec());
         let r = refresh(BASE, &c, &f).unwrap();
-        assert_eq!(r.refreshed, 0);
-        assert!(r.failed[0].1.contains("not a PNG"));
+        assert_eq!(r.refreshed, 1);
+        assert!(r.failed.is_empty());
+        assert!(r.artwork_failed[0].1.contains("icon: the file is not a PNG"));
+        assert!(c.join("apps/notes.json").exists());
+        assert!(!c.join("icons/notes.png").exists());
         let _ = fs::remove_dir_all(c);
+    }
+
+    #[test]
+    fn unchanged_groups_are_reused_and_a_damaged_picture_is_retried() {
+        let dir = cache("unchanged");
+        let mut full = site(&["notes", "words"], 1);
+        refresh(BASE, &dir, &full).unwrap();
+        with_revisions(&mut full);
+
+        let mut index_only = Fake::default();
+        index_only.docs.insert(format!("{BASE}/index.json"), full.docs[&format!("{BASE}/index.json")].clone());
+        assert_eq!(refresh(BASE, &dir, &index_only).unwrap(), Report { reused: 2, ..Report::default() });
+
+        let picture = dir.join("shots/notes-0.png");
+        fs::write(&picture, [PNG, b"changed"].concat()).unwrap();
+        assert_eq!(refresh(BASE, &dir, &full).unwrap(), Report { refreshed: 1, reused: 1, ..Report::default() });
+        assert_eq!(fs::read(picture).unwrap(), PNG);
+
+        // Artwork edits invalidate the revision even when the listing is unchanged.
+        let new_art = full.docs.get_mut(&format!("{BASE}/icons/words.png")).unwrap();
+        new_art.push(b'!');
+        let expected_art = new_art.clone();
+        with_revisions(&mut full);
+        assert_eq!(refresh(BASE, &dir, &full).unwrap(), Report { refreshed: 1, reused: 1, ..Report::default() });
+        assert_eq!(fs::read(dir.join("icons/words.png")).unwrap(), expected_art);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn signed_refresh_reuses_verified_groups_and_publishes_listings_with_missing_art() {
+        let dir = cache("signed-missing-art");
+        let mut first = site(&["notes"], 1);
+        with_revisions(&mut first);
+        let key = sign_site(&mut first, &["notes"]);
+        refresh_with_key(BASE, &dir, &first, Some(&key)).unwrap();
+
+        let mut next = site(&["notes", "words"], 1);
+        with_revisions(&mut next);
+        sign_site(&mut next, &["notes", "words"]);
+        for path in ["apps/notes.json", "icons/notes.png", "shots/notes-0.png", "shots/words-0.png"] {
+            next.docs.remove(&format!("{BASE}/{path}"));
+        }
+        let report = refresh_with_key(BASE, &dir, &next, Some(&key)).unwrap();
+        assert_eq!((report.refreshed, report.reused), (1, 1));
+        assert!(report.failed.is_empty());
+        assert_eq!(report.artwork_failed.len(), 1);
+        assert_eq!(report.artwork_failed[0].0, "words");
+        assert!(report.artwork_failed[0].1.starts_with("screenshot 1:"));
+        let catalog = cached_catalog(&dir, Some(&key)).unwrap();
+        for id in ["notes", "words"] {
+            assert!(catalog.listing(id).is_ok());
+            assert!(catalog.directory().join(format!("icons/{id}.png")).exists());
+        }
+        assert!(catalog.directory().join("shots/notes-0.png").exists());
+        assert!(!catalog.directory().join("shots/words-0.png").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn listing_fetches_use_a_bounded_worker_pool() {
+        #[derive(Default)]
+        struct Activity { in_flight: usize, peak: usize }
+        struct Concurrent { site: Fake, activity: Mutex<Activity>, ready: Condvar }
+        impl Source for Concurrent {
+            fn text(&self, url: &str) -> Result<String, String> {
+                self.site.text(url)
+            }
+
+            fn bytes(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+                if url.contains("/apps/") {
+                    let mut activity = self.activity.lock().unwrap();
+                    activity.in_flight += 1;
+                    activity.peak = activity.peak.max(activity.in_flight);
+                    self.ready.notify_all();
+                    let (mut activity, _) = self.ready.wait_timeout_while(activity, Duration::from_secs(2), |activity| {
+                        activity.peak < REFRESH_WORKERS
+                    }).unwrap();
+                    activity.in_flight -= 1;
+                }
+                self.site.bytes(url, max)
+            }
+        }
+
+        let dir = cache("parallel");
+        let ids = ["notes", "words", "blocks", "timer", "browser", "chess"];
+        let source = Concurrent { site: site(&ids, 0), activity: Mutex::default(), ready: Condvar::new() };
+        let report = refresh(BASE, &dir, &source).unwrap();
+        assert_eq!(report.refreshed, ids.len());
+        assert_eq!(source.activity.lock().unwrap().peak, REFRESH_WORKERS);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
