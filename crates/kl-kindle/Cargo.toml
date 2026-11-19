@@ -10,6 +10,5 @@ kl-store = { path = "../kl-store" }
 kl-core = { path = "../kl-core" }
 kl-render = { path = "../kl-render" }
 primitive-quick = { path = "../primitive-quick" }
-primitive-net = { path = "../primitive-net" }
 serde_json = "1"
 libc.workspace = true
