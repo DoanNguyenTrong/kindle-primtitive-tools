@@ -7,8 +7,11 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
+const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    InvalidArchiveSize(u64),
     Size { expected: u64, found: u64 },
     Hash { expected: String, found: String },
 }
@@ -16,9 +19,19 @@ pub enum VerifyError {
 impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            VerifyError::InvalidArchiveSize(0) => write!(f, "the catalog lists an empty package"),
+            VerifyError::InvalidArchiveSize(_) => write!(f, "the package exceeds the Store's 200 MiB download limit"),
             VerifyError::Size { expected, found } => write!(f, "the download is {found} bytes, the listing says {expected}"),
             VerifyError::Hash { .. } => write!(f, "the download does not match its SHA-256 in the listing"),
         }
+    }
+}
+
+pub fn check_archive_size(size: u64) -> Result<(), VerifyError> {
+    if (1..=MAX_ARCHIVE_BYTES).contains(&size) {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidArchiveSize(size))
     }
 }
 
@@ -42,6 +55,11 @@ pub fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
 
 /// Checks size first (cheap), then the hash. The expected hash is compared in lower case.
 pub fn verify_file(path: &Path, expected_sha256: &str, expected_size: u64) -> Result<(), VerifyError> {
+    check_archive_size(expected_size)?;
+    let measured = path.metadata().map_or(0, |metadata| metadata.len());
+    if measured != expected_size {
+        return Err(VerifyError::Size { expected: expected_size, found: measured });
+    }
     let (found, size) = sha256_file(path).map_err(|_| VerifyError::Size { expected: expected_size, found: 0 })?;
     if size != expected_size {
         return Err(VerifyError::Size { expected: expected_size, found: size });
@@ -70,6 +88,14 @@ mod tests {
         assert_eq!(hash, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(size, 3);
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn archive_sizes_match_the_catalog_and_packager_limit() {
+        assert_eq!(check_archive_size(0), Err(VerifyError::InvalidArchiveSize(0)));
+        assert!(check_archive_size(MAX_ARCHIVE_BYTES).is_ok());
+        let oversize = MAX_ARCHIVE_BYTES + 1;
+        assert_eq!(verify_file(Path::new("unused"), "", oversize), Err(VerifyError::InvalidArchiveSize(oversize)));
     }
 
     #[test]

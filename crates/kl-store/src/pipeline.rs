@@ -110,10 +110,16 @@ fn install_inner(
     }
     let source = Source { manifest: &manifest, source_url, sha256: &asset.sha256, installed_at };
     progress(Stage::Installing);
-    if manifest.id == install::LAUNCHER_ID {
-        install::prepare_launcher_update(paths, &source).map_err(|error| error.to_string())?;
+    let result = if manifest.id == install::LAUNCHER_ID {
+        install::prepare_launcher_update(paths, &source).map_err(|error| error.to_string())
     } else {
-        install::install(paths, &source, None).map_err(|error| error.to_string())?;
+        install::install(paths, &source, None).map_err(|error| error.to_string())
+    };
+    if let Err(error) = result {
+        if install::require_idle(paths).is_ok() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        return Err(error);
     }
     Ok(manifest.version.clone())
 }
@@ -181,6 +187,23 @@ mod tests {
         let rec = record::load(&p.record).unwrap();
         assert_eq!(rec.apps["primitive-browser"].version, "0.2.18");
         assert!(!zip.exists(), "the download is removed");
+    }
+
+    #[test]
+    fn a_destination_conflict_removes_uncommitted_staging() {
+        let p = paths("install-conflict");
+        let backup = p.root.join("primitive-browser/app.bin.prev");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"user backup").unwrap();
+        let (zip, sha, size) = package(&p.root, "primitive-browser", "0.2.18", "{}");
+        let listing = listing_for(&sha, size, "0.2.18");
+
+        let err = install_downloaded(&p, &listing, &device(), &zip, "u", "d").unwrap_err();
+        assert!(err.contains("backup path"), "{err}");
+        assert_eq!(fs::read(&backup).unwrap(), b"user backup");
+        assert!(!p.staging.join("primitive-browser").exists());
+        assert!(!p.journal.exists());
+        assert!(!zip.exists());
     }
 
     #[test]

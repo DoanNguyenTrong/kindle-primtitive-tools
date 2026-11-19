@@ -9,6 +9,7 @@
 use crate::catalog::Manifest;
 use crate::record::{self, Installed, Record};
 use crate::unpack::{is_allowed_place, is_safe_relative, valid_module_dir};
+use crate::verify::sha256_file;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -163,8 +164,8 @@ pub(crate) fn require_idle(paths: &Paths) -> io::Result<()> {
     Ok(())
 }
 
-/// Checks on-disk components as well as the package's relative path.
-fn validate_destination(paths: &Paths, relative: &str, dir: &str) -> io::Result<()> {
+/// Checks on-disk components and returns the size of an existing regular file.
+fn validate_destination(paths: &Paths, relative: &str, dir: &str) -> io::Result<Option<u64>> {
     if !is_safe_relative(relative) || !is_allowed_place(relative, dir) {
         return Err(invalid_data(format!("{relative} is outside this app's library and module folders")));
     }
@@ -174,11 +175,51 @@ fn validate_destination(paths: &Paths, relative: &str, dir: &str) -> io::Result<
         path.push(piece);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if pieces.peek().is_some() && metadata.is_dir() => {}
-            Ok(metadata) if pieces.peek().is_none() && metadata.is_file() => {}
+            Ok(metadata) if pieces.peek().is_none() && metadata.is_file() => return Ok(Some(metadata.len())),
             Ok(_) => return Err(invalid_data(format!("{relative} does not name a regular file in the app's folder"))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => break,
             Err(error) => return Err(error),
         }
+    }
+    Ok(None)
+}
+
+/// Unrecorded USB/SSH installs predate the Store. Use exact bytes from known installers,
+/// including their generated library icons, to distinguish them from local files with the same name.
+fn known_library_entry(target: &Path, id: &str, dir: &str, relative: &str, size: u64) -> io::Result<bool> {
+    let fingerprints: &[(u64, &str)] = match (id, dir, relative) {
+        (LAUNCHER_ID, "launcher", "documents/Launcher.sh") => &[
+            // Launcher v0.3.20 and 0.4.4, USB and SSH.
+            (52_396, "fbf79e8551026d0cfaa81aedf658d725e1f4af8900fb565f2d12e0242e838b4d"),
+            (52_556, "922758977e66a739ca5b1aed6d55375c18fe12adcb24342035a4b6efbc0f4ef8"),
+        ],
+        ("primitive-browser", "browser", "documents/Primitive Browser.sh") => &[
+            // Browser v0.2.17 with the packaged icon or the icon used by deploy/install*.sh.
+            (38_528, "297a908f8d4b5c3014cefc96e2ca21660106cc483dff6d9e4478fae1e1136502"),
+            (124_908, "8b13b59b7375e8db1aed89e6e77dace928134946031e687aac398bd44cc1e8eb"),
+        ],
+        ("primitive-store", "store", "documents/Store.sh") => &[
+            (486, "34ea9e6d89807113d457f5dde46e1df67e01e0f022418196f6b175d1e7d73d66"),
+        ],
+        ("primitive-terminal", "terminal", "documents/Terminal.sh") => &[
+            (34_099, "acd08514eca0138927b1cd69d8f263d6894b77beab6688ee5f059de763303151"),
+        ],
+        _ => &[],
+    };
+    let Some(&(_, expected)) = fingerprints.iter().find(|(length, _)| *length == size) else {
+        return Ok(false);
+    };
+    let (hash, actual_size) = sha256_file(target)?;
+    Ok(actual_size == size && hash == expected)
+}
+
+fn require_replaceable(paths: &Paths, id: &str, dir: &str, previous: Option<&Installed>, relative: &str, size: u64) -> io::Result<()> {
+    let shared = relative.starts_with("documents/") || relative.starts_with("extensions/");
+    // Use the recorded spelling so a case-sensitive host cannot mistake a second file for the first.
+    if shared && !previous.is_some_and(|app| app.files.iter().any(|file| file == relative))
+        && !known_library_entry(&paths.root.join(relative), id, dir, relative, size)?
+    {
+        return Err(invalid_data(format!("{relative} already exists and is not managed by this app. Move it somewhere safe and try again.")));
     }
     Ok(())
 }
@@ -197,11 +238,15 @@ fn validate_changes(paths: &Paths, record: &Record, id: &str, dir: &str, files: 
     if files.len() != requested.len() {
         return Err(invalid_data("the same file appears twice in this app's file list".into()));
     }
+    let previous = record.apps.get(id);
     for relative in files {
-        validate_destination(paths, relative, dir)?;
+        let existing_size = validate_destination(paths, relative, dir)?;
         let normalized = relative.to_ascii_lowercase();
         if owned.contains(&normalized) {
             return Err(invalid_data(format!("{relative} belongs to another installed app")));
+        }
+        if let Some(size) = existing_size {
+            require_replaceable(paths, id, dir, previous, relative, size)?;
         }
         let backup = format!("{normalized}.prev");
         if requested.contains(&backup) || owned.contains(&backup) || fs::symlink_metadata(prev_of(&paths.root.join(relative))).is_ok() {
@@ -269,17 +314,21 @@ fn journal_for_install(paths: &Paths, rec: &Record, source: &Source<'_>) -> io::
     })
 }
 
-fn move_files(paths: &Paths, journal: &mut Journal, files: &[String], fail_after: Option<usize>) -> io::Result<()> {
+fn move_files(paths: &Paths, journal: &mut Journal, dir: &str, files: &[String], fail_after: Option<usize>) -> io::Result<()> {
     for (n, relative) in files.iter().enumerate() {
         if fail_after == Some(n) {
             return Err(io::Error::other("a test asked for a failure"));
         }
         let src = paths.staging.join(&journal.id).join(relative);
         let dst = paths.root.join(relative);
+        let existing_size = validate_destination(paths, relative, dir)?;
+        if let Some(size) = existing_size {
+            require_replaceable(paths, &journal.id, dir, journal.previous.as_ref(), relative, size)?;
+        }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        let had_old = dst.is_file();
+        let had_old = existing_size.is_some();
         journal.done.push(Done { path: relative.clone(), prev: had_old });
         write_journal(&paths.journal, journal)?;
         if had_old {
@@ -300,7 +349,7 @@ pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) ->
     let mut journal = journal_for_install(paths, &rec, source)?;
     write_journal(&paths.journal, &journal)?;
 
-    if let Err(error) = move_files(paths, &mut journal, &source.manifest.files, fail_after) {
+    if let Err(error) = move_files(paths, &mut journal, &source.manifest.dir, &source.manifest.files, fail_after) {
         undo(paths, &journal.done)?;
         remove_if_exists(&paths.journal)?;
         return Err(InstallError::RolledBack(error.to_string()));
@@ -374,12 +423,17 @@ pub fn launcher_update_begin(paths: &Paths) -> io::Result<LauncherUpdate> {
             return Ok(LauncherUpdate::Idle);
         }
         State::Prepared => {
-            validate_changes(paths, &record, LAUNCHER_ID, "launcher", &trial.candidate.files)?;
+            if let Err(error) = validate_changes(paths, &record, LAUNCHER_ID, "launcher", &trial.candidate.files) {
+                eprintln!("Launcher update: {error}");
+                launcher_update_revert(paths)?;
+                return Ok(LauncherUpdate::Reverted);
+            }
             journal.state = State::Moving;
             write_journal(&paths.journal, &journal)?;
-            if let Err(error) = move_files(paths, &mut journal, &trial.candidate.files, None) {
+            if let Err(error) = move_files(paths, &mut journal, &trial.candidate.dir, &trial.candidate.files, None) {
+                eprintln!("Launcher update: {error}");
                 recover(paths)?;
-                return Err(error);
+                return Ok(LauncherUpdate::Reverted);
             }
             journal.state = State::Trial;
         }
@@ -798,6 +852,76 @@ mod tests {
         assert_eq!(fs::read_to_string(w.paths.root.join("documents/Notes.sh")).unwrap(), "1.0.0 notes");
     }
 
+    #[test]
+    fn an_install_cannot_overwrite_unrecorded_shared_files() {
+        for (name, relative) in [
+            ("unowned-document", "documents/books/Personal.txt"),
+            ("unowned-extension", "extensions/notes/config.xml"),
+        ] {
+            let w = world(name);
+            let target = w.paths.root.join(relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, "kept by the user").unwrap();
+            let app = manifest("notes", "1.0.0", &["notes/app", relative], &[]);
+            stage(&w.paths, &app, "new");
+
+            let err = install(&w.paths, &src(&app), None).unwrap_err().to_string();
+            assert!(err.contains(relative) && err.contains("already exists"), "{err}");
+            assert_eq!(fs::read(&target).unwrap(), b"kept by the user");
+            assert!(!w.paths.root.join("notes/app").exists());
+            assert!(!w.paths.journal.exists());
+            assert!(record::load(&w.paths.record).unwrap().apps.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_store_can_update_shared_files_it_installed() {
+        let w = world("managed-shared-files");
+        let files = ["documents/Notes.sh", "extensions/notes/config.xml"];
+        for version in ["1.0.0", "1.0.0", "2.0.0"] {
+            let app = manifest("notes", version, &files, &[]);
+            stage(&w.paths, &app, "managed");
+            install(&w.paths, &src(&app), None).unwrap();
+            for file in files {
+                assert_eq!(fs::read_to_string(w.paths.root.join(file)).unwrap(), format!("{version} managed"));
+            }
+        }
+    }
+
+    #[test]
+    fn an_app_update_cannot_claim_new_shared_files_already_on_disk() {
+        let w = world("update-unowned-document");
+        let v1 = manifest("notes", "1.0.0", &["notes/app"], &[]);
+        stage(&w.paths, &v1, "old");
+        install(&w.paths, &src(&v1), None).unwrap();
+        fs::create_dir_all(w.paths.root.join("documents")).unwrap();
+        fs::write(w.paths.root.join("documents/Notes.sh"), "my local note script").unwrap();
+        let v2 = manifest("notes", "2.0.0", &["notes/app", "documents/Notes.sh"], &[]);
+        stage(&w.paths, &v2, "new");
+
+        assert!(install(&w.paths, &src(&v2), None).unwrap_err().to_string().contains("documents/Notes.sh"));
+        assert_eq!(fs::read(w.paths.root.join("documents/Notes.sh")).unwrap(), b"my local note script");
+        assert_eq!(fs::read(w.paths.root.join("notes/app")).unwrap(), b"1.0.0 old");
+        assert_eq!(record::load(&w.paths.record).unwrap().apps["notes"].version, "1.0.0");
+    }
+
+    #[test]
+    fn a_legacy_entry_name_and_size_do_not_grant_ownership() {
+        let w = world("lookalike-legacy");
+        let relative = "documents/Store.sh";
+        let target = w.paths.root.join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut custom = b"#!/bin/sh\n# Name: Primitive Store\n# Author: Primitive AI\n".to_vec();
+        custom.resize(486, b' ');
+        fs::write(&target, &custom).unwrap();
+        let mut app = manifest("primitive-store", "1.0.0", &[relative], &[]);
+        app.dir = "store".into();
+        stage(&w.paths, &app, "candidate");
+
+        assert!(install(&w.paths, &src(&app), None).unwrap_err().to_string().contains(relative));
+        assert_eq!(fs::read(target).unwrap(), custom);
+    }
+
     fn launcher_fixture(paths: &Paths) -> Manifest {
         let mut candidate = manifest(
             LAUNCHER_ID,
@@ -859,11 +983,28 @@ mod tests {
         let candidate = launcher_fixture(&w.paths);
         prepare_launcher_update(&w.paths, &src(&candidate)).unwrap();
         fs::remove_file(w.paths.staging.join(LAUNCHER_ID).join("launcher/supervisor.sh")).unwrap();
-        assert!(launcher_update_begin(&w.paths).is_err());
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Reverted);
         for file in &candidate.files {
             assert_eq!(fs::read(w.paths.root.join(file)).unwrap(), b"old launcher");
         }
         assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Idle);
+    }
+
+    #[test]
+    fn a_prepared_launcher_update_cannot_overwrite_a_new_user_file() {
+        let w = world("launcher-document-conflict");
+        let mut candidate = launcher_fixture(&w.paths);
+        let relative = "documents/Launcher.sh";
+        candidate.files.push(relative.into());
+        stage(&w.paths, &candidate, "candidate");
+        prepare_launcher_update(&w.paths, &src(&candidate)).unwrap();
+        fs::create_dir_all(w.paths.root.join("documents")).unwrap();
+        fs::write(w.paths.root.join(relative), b"user file").unwrap();
+
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Reverted);
+        assert_eq!(fs::read(w.paths.root.join(relative)).unwrap(), b"user file");
+        assert_eq!(fs::read(w.paths.root.join("launcher/kl-launcher")).unwrap(), b"old launcher");
+        assert!(!w.paths.journal.exists());
     }
 
     #[test]
