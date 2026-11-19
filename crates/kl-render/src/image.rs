@@ -202,7 +202,7 @@ pub type Area = (i32, i32, i32, i32);
 
 /// Signed distance from pixel (`x`, `y`) of a rectangle `w` × `h` with corner radius `radius` to its edge
 /// (negative inside).
-fn rect_distance(x: i32, y: i32, w: i32, h: i32, radius: f32) -> f32 {
+pub(super) fn rect_distance(x: i32, y: i32, w: i32, h: i32, radius: f32) -> f32 {
     let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
     let r = radius.min(hw).min(hh);
     let qx = (x as f32 + 0.5 - hw).abs() - (hw - r);

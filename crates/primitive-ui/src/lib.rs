@@ -1,10 +1,16 @@
 //! Common geometry and components for native Primitive apps.
 
 pub mod editor;
+mod widgets;
 
-pub use kl_core::{Input, Layout, Rect};
-pub use kl_render::component::{Align, Canvas, TextStyle};
+pub use kl_core::{Input, Layout, Rect, Rotation, Status};
+pub use kl_render::component::{icons, Align, Canvas, GrayImage, Icon, TextStyle};
+pub use kl_render::{changed_rect, for_panel};
 pub use primitive_keyboard::{Editor, Key, Layer, Press};
+pub use widgets::{
+    chevron, full_screen_message, section_header, PageTurn, Pager, Row, RowAccessory, Rows, Sheet,
+    SheetAction, Tab, TabBar,
+};
 
 pub const BLACK: u8 = 0;
 pub const PAPER: u8 = 255;

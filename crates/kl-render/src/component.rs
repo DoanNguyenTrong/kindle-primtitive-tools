@@ -1,7 +1,15 @@
 //! Shared drawing primitives for apps with their own screens.
 
-use super::{gray, Align as RenderAlign, GrayImage, Renderer, Text, BLACK, WHITE};
-use kl_core::{Layout, Rect};
+pub use super::image::GrayImage;
+use super::{gray, Align as RenderAlign, Renderer, Text, BLACK, WHITE};
+use kl_core::{Layout, Rect, Status};
+pub use primitive_quick::{icons, Icon};
+
+struct Picture {
+    rect: Rect,
+    image: GrayImage,
+    after_popups: usize,
+}
 
 /// Text alignment inside its bounds.
 #[derive(Clone, Copy)]
@@ -15,7 +23,8 @@ pub enum Align {
 pub struct Canvas {
     renderer: Renderer,
     bounds: Rect,
-    pictures: Vec<(Rect, GrayImage)>,
+    pictures: Vec<Picture>,
+    popup_covers: Vec<(Rect, f32)>,
 }
 
 impl Canvas {
@@ -24,6 +33,7 @@ impl Canvas {
             renderer: Renderer::new(width, height, fonts)?,
             bounds: Rect::new(0, 0, width as i32, height as i32),
             pictures: Vec::new(),
+            popup_covers: Vec::new(),
         })
     }
 
@@ -40,6 +50,7 @@ impl Canvas {
         self.renderer.ctx.reset();
         self.renderer.fill(self.bounds, WHITE);
         self.pictures.clear();
+        self.popup_covers.clear();
     }
 
     pub fn finish(&mut self, dark: bool) -> Vec<u8> {
@@ -48,8 +59,13 @@ impl Canvas {
         if dark {
             super::image::invert_except(&mut image, width, &[], None);
         }
-        for (rect, picture) in &self.pictures {
-            super::blit(&mut image, width, *rect, picture);
+        for picture in &self.pictures {
+            blit_picture(
+                &mut image,
+                self.bounds,
+                picture,
+                &self.popup_covers[picture.after_popups..],
+            );
         }
         image
     }
@@ -69,9 +85,28 @@ impl Canvas {
 
     pub fn popup(&mut self, rect: Rect) {
         let halo = self.px(10);
-        self.renderer
-            .rounded(rect.inset(-halo), f64::from(self.px(38)), WHITE);
+        let cover = rect.inset(-halo);
+        let radius = self.px(38);
+        self.popup_covers.push((cover, radius as f32));
+        self.renderer.rounded(cover, f64::from(radius), WHITE);
         self.panel(rect, 28, 6, WHITE);
+    }
+
+    /// The same clock, connectivity and battery strip as the launcher.
+    pub fn status_bar(&mut self, status: &Status, running: usize) {
+        let layout = Layout::new(self.bounds.w as u32, self.bounds.h as u32, 4, 5);
+        self.renderer.status_strip(&layout, status, running);
+    }
+
+    /// An outline with semicircular ends.
+    pub fn pill(&mut self, rect: Rect, border: i32, inside: u8) {
+        self.renderer.rounded_frame(
+            rect,
+            f64::from(rect.h.min(rect.w)) / 2.0,
+            self.px(border).max(1),
+            BLACK,
+            inside,
+        );
     }
 
     pub fn panel(&mut self, rect: Rect, radius: i32, border: i32, inside: u8) {
@@ -135,7 +170,7 @@ impl Canvas {
         );
     }
 
-    pub fn icon(&mut self, rect: Rect, icon: primitive_quick::Icon, ink: u8) {
+    pub fn icon(&mut self, rect: Rect, icon: Icon, ink: u8) {
         self.renderer.ctx.set_paint(gray(ink));
         self.renderer.draw_icon(
             icon,
@@ -147,7 +182,11 @@ impl Canvas {
     }
 
     pub fn picture(&mut self, rect: Rect, picture: GrayImage) {
-        self.pictures.push((rect, picture));
+        self.pictures.push(Picture {
+            rect,
+            image: picture,
+            after_popups: self.popup_covers.len(),
+        });
     }
 
     pub fn keyboard(
@@ -162,6 +201,43 @@ impl Canvas {
         self.fill(Rect::new(band.x, band.y, band.w, 2), 226);
         for (key, rect) in layout.keyboard_keys_with(layer, done) {
             self.renderer.key(&key, rect, pressed == Some(rect));
+        }
+    }
+}
+
+fn blit_picture(frame: &mut [u8], bounds: Rect, picture: &Picture, covered_by: &[(Rect, f32)]) {
+    let Picture { rect, image, .. } = picture;
+    if u64::from(image.width) * u64::from(image.height) != image.pixels.len() as u64 {
+        return;
+    }
+    let (Ok(width), Ok(height)) = (i32::try_from(image.width), i32::try_from(image.height)) else {
+        return;
+    };
+    let x_start = rect.x.max(0);
+    let x_end = rect.x.saturating_add(rect.w.min(width)).min(bounds.w);
+    if x_start >= x_end {
+        return;
+    }
+    let y_end = rect.y.saturating_add(rect.h.min(height)).min(bounds.h);
+    let stride = bounds.w as usize;
+    for y in rect.y.max(0)..y_end {
+        let src_start = (y - rect.y) as usize * width as usize + (x_start - rect.x) as usize;
+        let dst_start = y as usize * stride + x_start as usize;
+        let len = (x_end - x_start) as usize;
+        let source = &image.pixels[src_start..src_start + len];
+        let target = &mut frame[dst_start..dst_start + len];
+        if covered_by.is_empty() {
+            target.copy_from_slice(source);
+            continue;
+        }
+        for (offset, (&pixel, target)) in source.iter().zip(target).enumerate() {
+            let x = x_start + offset as i32;
+            if !covered_by.iter().any(|(r, radius)| {
+                r.contains(x as f32, y as f32)
+                    && super::image::rect_distance(x - r.x, y - r.y, r.w, r.h, *radius) < 0.0
+            }) {
+                *target = pixel;
+            }
         }
     }
 }
@@ -209,5 +285,34 @@ impl TextStyle {
     pub const fn ink(mut self, ink: u8) -> Self {
         self.ink = ink;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pictures_clip_at_screen_edges_and_leave_overlapping_popup_visible() {
+        let bounds = Rect::new(0, 0, 6, 4);
+        let picture = Picture {
+            rect: Rect::new(-2, -1, 7, 5),
+            image: GrayImage {
+                width: 7,
+                height: 5,
+                pixels: (0..35).collect(),
+            },
+            after_popups: 0,
+        };
+        let mut pixels = vec![99; 24];
+        blit_picture(
+            &mut pixels,
+            bounds,
+            &picture,
+            &[(Rect::new(2, 1, 2, 3), 0.0)],
+        );
+        assert_eq!(&pixels[..6], &[9, 10, 11, 12, 13, 99]);
+        assert_eq!(&pixels[6..12], &[16, 17, 99, 99, 20, 99]);
+        assert_eq!(&pixels[18..], &[30, 31, 99, 99, 34, 99]);
     }
 }
