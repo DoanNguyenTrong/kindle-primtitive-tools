@@ -250,6 +250,8 @@ pub struct Ui {
     pub notice: Option<String>,
     /// Local network address and code for the active file transfer session.
     pub file_transfer: Option<(String, String)>,
+    /// Compatible updates shown on the Store tile.
+    pub store_update_count: usize,
     /// The app's version, shown on the About page (set by the app: the launcher's own version).
     pub version: String,
     /// The keyboard key under the finger, drawn in the on look until its action runs (see `press_feedback`).
@@ -334,6 +336,7 @@ impl Ui {
             pressed: None,
             notice: None,
             file_transfer: None,
+            store_update_count: 0,
             version: String::new(),
             pressed_key: None,
             usb: Usb::Unplugged,

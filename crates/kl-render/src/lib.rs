@@ -710,7 +710,16 @@ impl Renderer {
         self.status_strip(&l, s, ui.running);
         let page: Vec<(usize, App)> = ui.page_apps().map(|(i, a)| (i, a.clone())).collect();
         for (slot, app) in page {
-            self.app_icon(l.icon(slot), &app, icon_blits);
+            let icon = l.icon(slot);
+            self.app_icon(icon, &app, icon_blits);
+            if ui.store_update_count > 0 && (app.launch == Launch::Store || app.id == kl_core::apps::STORE_ENTRY_FILE) {
+                let text = if ui.store_update_count > 99 { "99+".into() } else { ui.store_update_count.to_string() };
+                // The badge sits above the icon so a custom picture can never cover it.
+                let badge = Rect::new(icon.right() - 54, icon.y - 38, 56, 36);
+                self.rounded_frame(badge, 18.0, 2, BLACK, BLACK);
+                self.text(Text { text: &text, x: badge.x as f32, y: (badge.y + 1) as f32, w: badge.w as f32,
+                    size: 26.0, bold: true, align: Align::Center, lines: 1, gray: WHITE });
+            }
             let label = l.label(slot);
             self.text(Text {
                 text: &app.name,

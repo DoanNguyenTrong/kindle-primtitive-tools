@@ -5,6 +5,8 @@ use std::{fs, path::Path};
 
 use crate::{config::Config, scriptlet};
 
+pub const STORE_ENTRY_FILE: &str = "Store.sh";
+
 /// How an app is started. The supervisor (`launcher.sh`) runs it; see `next_file`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
