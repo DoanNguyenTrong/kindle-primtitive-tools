@@ -9,6 +9,7 @@ use kl_store::catalog::valid_app_id;
 use kl_store::record::Installed;
 use kl_store::unpack::is_safe_relative;
 
+use crate::apps::is_store_alias;
 use crate::store::{LAUNCHER_ID, STORE_ID};
 
 pub const EXIT_OPEN_APP: i32 = 11;
@@ -34,8 +35,7 @@ pub fn entry_file(app: &Installed) -> Option<&str> {
         .then_some(name)
     });
     let script = scripts.next()?;
-    (scripts.next().is_none() && !script.eq_ignore_ascii_case(crate::apps::STORE_ENTRY_FILE))
-        .then_some(script)
+    (scripts.next().is_none() && !is_store_alias(script)).then_some(script)
 }
 
 pub fn installed_entry(launcher: &Path, documents: &Path, id: &str) -> io::Result<String> {
@@ -138,8 +138,10 @@ mod tests {
         assert_eq!(entry_file(&app), None);
         app.files = vec!["documents/../Another.sh".into()];
         assert_eq!(entry_file(&app), None);
-        app.files = vec!["documents/Store.sh".into()];
-        assert_eq!(entry_file(&app), None);
+        for alias in ["Store.sh", "Primitive Store.sh", "primitive-store.sh", "PrimitiveStore.sh"] {
+            app.files = vec![format!("documents/{alias}")];
+            assert_eq!(entry_file(&app), None);
+        }
         app.files = vec!["documents/Example App.sh".into()];
         app.id = LAUNCHER_ID.into();
         assert_eq!(entry_file(&app), None);

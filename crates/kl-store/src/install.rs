@@ -252,7 +252,9 @@ fn known_library_entry(target: &Path, id: &str, dir: &str, relative: &str, size:
             (124_908, "8b13b59b7375e8db1aed89e6e77dace928134946031e687aac398bd44cc1e8eb"),
         ],
         ("primitive-store", "store", "documents/Store.sh") => &[
+            // The packaged script is also copied verbatim by the SSH installer.
             (486, "34ea9e6d89807113d457f5dde46e1df67e01e0f022418196f6b175d1e7d73d66"),
+            (466, "10e5e72c0eb32551d3ca20ff7a4471d3cd8df67aa2316d9c67c29bb5c5bef682"),
         ],
         ("primitive-terminal", "terminal", "documents/Terminal.sh") => &[
             (34_099, "acd08514eca0138927b1cd69d8f263d6894b77beab6688ee5f059de763303151"),
@@ -1368,6 +1370,38 @@ mod tests {
         assert_eq!(fs::read(w.paths.root.join("documents/Notes.sh")).unwrap(), b"my local note script");
         assert_eq!(fs::read(w.paths.root.join("notes/app")).unwrap(), b"1.0.0 old");
         assert_eq!(record::load(&w.paths.record).unwrap().apps["notes"].version, "1.0.0");
+    }
+
+    #[test]
+    fn both_store_library_entries_can_be_adopted() {
+        const SCRIPT: &str = r#"#!/bin/sh
+# Name: {name}
+# Author: Primitive AI
+# DontUseFBInk
+# Opens {name} from the Kindle library. The program is copied to tmpfs and run from there, so /mnt/us stays free
+# for USB drive mode. When the store ends (Done), the launcher takes the screen again.
+
+BIN=/mnt/us/store/bin/kl-store-app
+RUN=/var/tmp/kl-store
+
+[ -x "$BIN" ] || exit 1
+mkdir -p "$RUN"
+cp "$BIN" "$RUN/kl-store-app" && chmod 755 "$RUN/kl-store-app" || exit 1
+cd / && exec "$RUN/kl-store-app"
+"#;
+        for (name, label) in [("Primitive Store", "old"), ("Store", "new")] {
+            let w = world(&format!("known-store-entry-{label}"));
+            let relative = "documents/Store.sh";
+            let target = w.paths.root.join(relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, SCRIPT.replace("{name}", name)).unwrap();
+            let mut candidate = manifest("primitive-store", "1.0.0", &[relative], &[]);
+            candidate.dir = "store".into();
+            stage(&w.paths, &candidate, "candidate");
+
+            install(&w.paths, &src(&candidate), None).unwrap();
+            assert_eq!(fs::read_to_string(target).unwrap(), "1.0.0 candidate");
+        }
     }
 
     #[test]

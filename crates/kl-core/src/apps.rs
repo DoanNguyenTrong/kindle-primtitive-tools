@@ -1,11 +1,65 @@
 //! The app list: built-ins, scriptlets found in `documents/`, and the entries and overrides of
 //! `apps.toml`, merged in that order.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use crate::{config::Config, scriptlet};
 
 pub const STORE_ENTRY_FILE: &str = "Store.sh";
+pub const STORE_BINARY: &str = "store/bin/kl-store-app";
+const STORE_NAME: &str = "Store";
+
+/// Reserved spellings used by the built-in Store tile and standalone library entries.
+pub fn is_store_alias(name: &str) -> bool {
+    let name = name.trim();
+    let name = match name.rsplit_once('.') {
+        Some((stem, extension)) if extension.eq_ignore_ascii_case("sh") => stem.trim(),
+        _ => name,
+    };
+    ["Store", "Primitive Store", "Primitive-Store", "PrimitiveStore"]
+        .iter()
+        .any(|alias| name.eq_ignore_ascii_case(alias))
+}
+
+/// A complete standalone copy has both the regular library entry and its executable.
+pub fn store_present(documents: &Path) -> bool {
+    if !fs::symlink_metadata(documents.join(STORE_ENTRY_FILE)).is_ok_and(|entry| entry.is_file()) {
+        return false;
+    }
+    let Some(binary) = documents
+        .parent()
+        .and_then(|root| fs::symlink_metadata(root.join(STORE_BINARY)).ok())
+    else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if binary.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    binary.is_file()
+}
+
+/// Resolve the Store tile against its canonical script even if storage changed after discovery.
+pub fn store_entry(mut app: App, documents: &Path) -> Option<App> {
+    if (app.launch != Launch::Store && app.id != STORE_ENTRY_FILE) || !store_present(documents) {
+        return None;
+    }
+    use_store_script(&mut app, documents);
+    Some(app)
+}
+
+fn use_store_script(app: &mut App, documents: &Path) {
+    app.name = STORE_NAME.into();
+    app.background = false;
+    app.dir = documents.to_string_lossy().into_owned();
+    app.launch = Launch::Script {
+        path: documents.join(STORE_ENTRY_FILE).to_string_lossy().into_owned(),
+        hooks: false,
+    };
+}
 
 /// How an app is started. The supervisor (`launcher.sh`) runs it; see `next_file`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +74,7 @@ pub enum Launch {
     Settings,
     /// Built-in: the Extensions list (KUAL menus).
     Extensions,
-    /// Built-in: Primitive Store (the catalog's apps, install and update).
+    /// Built-in: launch the standalone Store, or install it when missing.
     Store,
 }
 
@@ -100,7 +154,7 @@ fn builtins() -> Vec<App> {
         },
         App {
             id: "store".into(),
-            name: "Store".into(),
+            name: STORE_NAME.into(),
             icon: IconSource::None,
             launch: Launch::Store,
             dir: "/".into(),
@@ -220,7 +274,33 @@ pub fn merge(discovered: Vec<App>, config: &Config) -> (Vec<App>, Vec<String>) {
 /// Every app the launcher shows in the grid: scriptlets in the documents folder, then the `apps.toml`
 /// overrides. KUAL extensions are listed behind the Extensions tile (`kual::discover_root`).
 pub fn discover(documents: &Path, config: &Config) -> (Vec<App>, Vec<String>) {
-    merge(scriptlets(documents), config)
+    let scripts = scriptlets(documents);
+    // Remember the original names because apps.toml may rename an old Store script.
+    let former_store_ids: BTreeSet<_> = scripts
+        .iter()
+        .filter(|app| is_store_alias(&app.name))
+        .map(|app| app.id.clone())
+        .collect();
+    let standalone =
+        scripts.iter().any(|app| app.id == STORE_ENTRY_FILE) && store_present(documents);
+    let (mut apps, problems) = merge(scripts, config);
+    apps.retain_mut(|app| {
+        if standalone && app.id == STORE_ENTRY_FILE {
+            use_store_script(app, documents);
+            true
+        } else if !standalone && app.launch == Launch::Store {
+            app.name = STORE_NAME.into();
+            app.background = false;
+            true
+        } else {
+            app.launch != Launch::Store
+                && !is_store_alias(&app.id)
+                && !is_store_alias(&app.name)
+                && !former_store_ids.contains(&app.id)
+        }
+    });
+    apps.sort_by_cached_key(sort_key);
+    (apps, problems)
 }
 
 /// KOReader's own library entry (`KOReader.sh`) would start the stock UI again when KOReader exits. Unless
