@@ -1,0 +1,2133 @@
+//! The launcher's UI state machine. Input comes in as gestures in screen coordinates (already turned
+//! for the rotation); the result is an `Action` for the driver: redraw, launch an app, change a device
+//! setting, or leave for the Kindle UI.
+
+use std::collections::HashMap;
+
+use crate::{
+    apps::{extensions_app, sort_key, App, IconSource, Launch},
+    kual::MenuItem,
+    battery::{self, Warning},
+    layout::{Button, Layout, Page, QuickTile, Rect},
+    settings::Rotation,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Home,
+    Settings,
+    /// "Open the Kindle UI?" over the previous screen.
+    ConfirmKindle,
+    /// The power menu: Cancel, Restart, Power off (opened by the Power tile in quick settings).
+    PowerMenu,
+    Sleep,
+    /// Edit one app (long press): a box beside its icon to move it, change its icon or hide it. The app is
+    /// `Ui::menu`.
+    AppMenu,
+    /// The KUAL extensions list, with submenus.
+    Extensions,
+    /// Quick settings, dropped down from the status bar.
+    QuickSettings,
+    /// One page of Settings (Settings > page; Back returns to the Settings list).
+    Page(Page),
+    /// One network from the Wi-Fi scan: connect, or forget a saved one.
+    NetworkDetail,
+    /// The password of a new secured network, typed on the on-screen keyboard.
+    Password,
+    /// The name of a network that is not in the list (a hidden network), typed on the keyboard.
+    NetworkName,
+    /// The SSH server's root password, typed on the keyboard.
+    SshPassword,
+    /// Primitive Store: the list of the catalog's apps.
+    Store,
+    /// Primitive Store: one app's page (`Ui::store_open`).
+    StoreApp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    Tap(f32, f32),
+    LongTap(f32, f32),
+    /// A swipe: the distance moved, and the height where the finger went down (pixels).
+    Swipe { dx: f32, dy: f32, start_y: f32 },
+    PageForward,
+    PageBack,
+    /// `powerd` is going to the screensaver.
+    Sleep,
+    /// `powerd` left the screensaver.
+    Wake,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceCmd {
+    Light(i32),
+    Warmth(i32),
+    ToggleWifi,
+    ToggleRotation,
+    ToggleSsh,
+    /// Settings > DNS: public DNS on or off (the network's servers back).
+    ToggleDns,
+    /// Power menu: restart the Kindle (`reboot`), or turn it off (`poweroff`).
+    Restart,
+    PowerOff,
+    /// Settings > Device > Launcher: start the launcher again (the supervisor starts it, as after an install).
+    RestartLauncher,
+    /// Primitive Store: install the entry at this index of `Ui::store` (its position in the list).
+    StoreInstall(usize),
+    /// Primitive Store: download the catalog again (the Refresh button).
+    StoreRefresh,
+    /// Primitive Store: remove the installed entry at this index (after a second tap on Remove).
+    StoreRemove(usize),
+    ToggleAutostart,
+    ToggleSleepScreen,
+    /// Follow the device's turn again (Settings > Screen > Auto).
+    AutoRotation,
+    ToggleDarkMode,
+    ToggleAnimation,
+    /// Quick settings' sliders: a level from 0 to 24.
+    SetLight(u32),
+    SetWarmth(u32),
+    /// Quick settings > Auto-rotate: off keeps the screen as it is now; on follows the turn again.
+    ToggleAutoRotation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    None,
+    /// Draw the current screen. `full` asks for a flashing full refresh (screen changes that clear ghosting).
+    Redraw { full: bool },
+    /// Show the pressed tile, then hand the app to the supervisor.
+    Launch(App),
+    /// Leave: the supervisor starts the stock Kindle UI.
+    KindleMode,
+    /// Change a device setting, then redraw.
+    Device(DeviceCmd),
+    /// Hide (true) or show (false) apps by id: written to apps.toml, then redraw.
+    SetHidden(Vec<(String, bool)>),
+    /// Save the grid order: (id, position) for every app the user can move. Written to apps.toml.
+    SetOrder(Vec<(String, i64)>),
+    /// Set (`Some`) or clear (`None`) an app's icon file. Written to apps.toml; the driver reloads the tile.
+    SetIcon { id: String, icon: Option<String> },
+    /// Run an app while the launcher stays in front (background mode); the driver shows its last output line.
+    RunBackground(App),
+    /// Scan for Wi-Fi networks (the Wi-Fi page's Scan button, or opening the page). The driver sends the result back.
+    ScanWifi,
+    /// Join a network. `saved`: the Kindle has a profile for it, so only the connection is asked for; otherwise the
+    /// profile is saved first (with the password, for a secured network). The password is never logged.
+    JoinWifi { name: String, secured: bool, password: Option<String>, saved: bool },
+    /// Forget a saved network (delete its profile).
+    ForgetWifi(String),
+    /// Set the root password the SSH server checks, from the SSH password screen. The driver gives it to the
+    /// device on stdin only: it is not logged, kept, or put in a command line.
+    SetSshPassword(String),
+    /// Check the SSH server (its process, port and firewall): the driver shows the result in the notice.
+    CheckSsh,
+}
+
+/// The Kindle's USB state: nothing plugged in, the cable charging the Kindle, or the drive shown on a computer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Usb {
+    #[default]
+    Unplugged,
+    Charging,
+    Drive,
+}
+
+impl Usb {
+    /// From the charger's `online` (the cable is in) and whether the user storage (`/mnt/us`) is mounted on the Kindle:
+    /// while the drive is shown on a computer, the Kindle has it unmounted.
+    pub fn from_device(cable_in: bool, userstore_mounted: bool) -> Usb {
+        match (cable_in, userstore_mounted) {
+            (false, _) => Usb::Unplugged,
+            (true, true) => Usb::Charging,
+            (true, false) => Usb::Drive,
+        }
+    }
+}
+
+/// What the status strip and Settings show. Filled by the driver.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Status {
+    pub clock: String,
+    pub date: String,
+    pub battery: Option<u32>,
+    pub charging: bool,
+    /// The USB state (see `Usb`).
+    pub usb: Usb,
+    pub wifi_on: bool,
+    /// "connected", "not connected", "off", or empty when unknown.
+    pub wifi_state: String,
+    /// Signal strength while connected: (level, out of), from `signalStrength` ("4/5").
+    pub wifi_signal: Option<(u32, u32)>,
+    pub light: u32,
+    pub warmth: u32,
+    pub ssh: bool,
+    /// The address to connect to while SSH runs, e.g. "ssh -p 2222 root@192.168.1.28"; empty when off or unknown.
+    pub ssh_address: String,
+    /// Whether the root password for SSH has been set from the launcher (or by the browser before it).
+    pub ssh_password_set: bool,
+    /// Public DNS (1.1.1.1 and 8.8.8.8) is in use.
+    pub public_dns: bool,
+    /// False while the launcher is off at boot (the DISABLE file exists).
+    pub autostart: bool,
+    /// The launcher's own sleep screen is on (the stock screensaver is unloaded).
+    pub sleep_launcher: bool,
+    /// The screen follows the device's turn.
+    pub auto_rotation: bool,
+    /// White on black.
+    pub dark_mode: bool,
+    /// The opening zoom is on.
+    pub animation: bool,
+    pub rotation: Rotation,
+    /// Free memory for the About text, e.g. "MemAvailable 312 MB".
+    pub memory: String,
+    /// The Wi-Fi address (About), or "not connected".
+    pub ip: String,
+    /// CPU, memory and storage, shown in quick settings (read by the driver).
+    pub system: primitive_quick::Stats,
+    /// Free storage on the Kindle's user partition (About), e.g. "2.1 GB free".
+    pub storage: String,
+}
+
+impl Status {
+    /// Whether what the Settings screens show from the status differs: Wi-Fi, SSH and its password and address,
+    /// public DNS, and the start-up switch.
+    pub fn settings_differs(&self, other: &Status) -> bool {
+        self.wifi_on != other.wifi_on
+            || self.wifi_state != other.wifi_state
+            || self.wifi_signal != other.wifi_signal
+            || self.ssh != other.ssh
+            || self.ssh_address != other.ssh_address
+            || self.ssh_password_set != other.ssh_password_set
+            || self.public_dns != other.public_dns
+            || self.autostart != other.autostart
+    }
+
+    /// Whether what the status bar shows differs between two readings (the clock minute, battery, charging,
+    /// Wi-Fi and its signal, SSH). The bar is redrawn only then.
+    pub fn bar_differs(&self, other: &Status) -> bool {
+        self.clock != other.clock
+            || self.battery != other.battery
+            || self.charging != other.charging
+            || self.wifi_on != other.wifi_on
+            || self.wifi_state != other.wifi_state
+            || self.wifi_signal != other.wifi_signal
+            || self.ssh != other.ssh
+    }
+}
+
+/// The shortest and longest Wi-Fi password (WPA2-PSK).
+pub const MIN_PASSWORD: usize = 8;
+pub const MAX_PASSWORD: usize = 63;
+/// The longest network name (SSID).
+pub const MAX_NAME: usize = 32;
+/// The SSH root password: 6 to 64 characters of letters, digits and - _ . @ # % + = ! (no spaces).
+pub const MIN_SSH_PASSWORD: usize = 6;
+pub const MAX_SSH_PASSWORD: usize = 64;
+
+/// Whether `pw` is an acceptable SSH password. Only these characters can reach the device's shell or chpasswd, so
+/// nothing in it can change what the launcher runs.
+pub fn valid_ssh_password(pw: &str) -> bool {
+    (MIN_SSH_PASSWORD..=MAX_SSH_PASSWORD).contains(&pw.chars().count())
+        && pw.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@#%+=!".contains(c))
+}
+
+/// A horizontal swipe longer than this (pixels) turns the page.
+const SWIPE_MIN: f32 = 150.0;
+
+pub struct Ui {
+    apps: Vec<App>,
+    pub layout: Layout,
+    pub page: usize,
+    pub screen: Screen,
+    before_sleep: Screen,
+    /// The pressed icon, drawn darkened until the app starts.
+    pub pressed: Option<Rect>,
+    /// A message in the footer (problems in apps.toml, a failed action). Cleared by the next tap.
+    pub notice: Option<String>,
+    /// The app's version, shown on the About page (set by the app: the launcher's own version).
+    pub version: String,
+    /// The keyboard key under the finger, drawn in the on look until its action runs (see `press_feedback`).
+    pub pressed_key: Option<Rect>,
+    /// The USB state the screen follows: while the drive is shown, the drive-mode screen is drawn instead.
+    pub usb: Usb,
+    /// Apps hidden by the user (long press, or Settings > Hidden apps). Kept so they can be shown again.
+    hidden_apps: Vec<App>,
+    /// Low or critical battery, shown in the footer until the level recovers or the charger is connected.
+    pub battery: Warning,
+    battery_level: Option<u32>,
+    /// The app the app menu edits (index into the visible apps).
+    pub menu: usize,
+    /// Icon files the app menu offers (PNGs in the launcher's icons folder), set by the driver.
+    icon_choices: Vec<String>,
+    /// Each app's own icon, for "Change icon" to come back to.
+    original_icons: HashMap<String, IconSource>,
+    /// KUAL extension menus (the Extensions tile), the open submenu path, and the list page.
+    extensions: Vec<MenuItem>,
+    ext_path: Vec<usize>,
+    pub ext_page: usize,
+    /// Primitive Store: the catalog's entries, the list page, and the entry open on its page.
+    pub store: Vec<crate::store::StoreEntry>,
+    pub store_page: usize,
+    pub store_open: Option<usize>,
+    /// The tab shown, and how far the product page is scrolled.
+    pub store_tab: crate::store::StoreTab,
+    pub store_scroll: i32,
+    /// A catalog refresh is running (the button shows Updating).
+    pub store_busy: bool,
+    /// The app being installed from the store, if any (its page shows Installing, and its action waits).
+    pub store_installing: Option<String>,
+    /// The app whose Remove was tapped once: a second tap removes it.
+    pub store_remove_armed: Option<String>,
+    /// Background jobs still running (shown in the status bar).
+    pub running: usize,
+    /// The Wi-Fi page: the networks from the last scan, whether a scan is running, and the list's scroll.
+    pub wifi: crate::wifi::WifiInfo,
+    pub wifi_scanning: bool,
+    pub wifi_scroll: usize,
+    /// The network the network screen or password screen is for.
+    pub wifi_target: Option<crate::wifi::Network>,
+    /// The password being typed (the shared editor: text, caret, keyboard layer), and whether it is shown.
+    pub password: primitive_keyboard::Editor,
+    pub show_password: bool,
+    /// The name of a hidden network being typed, and whether the password screen is for a hidden network (an empty
+    /// password then joins it as an open network).
+    pub network_name: primitive_keyboard::Editor,
+    pub wifi_hidden: bool,
+    /// The SSH password being typed (kept here only until Set; never logged).
+    pub ssh_password: primitive_keyboard::Editor,
+}
+
+impl Ui {
+    /// `apps` is the merged list; hidden apps are dropped here.
+    pub fn new(apps: Vec<App>, layout: Layout) -> Ui {
+        let original_icons = apps.iter().map(|a| (a.id.clone(), a.icon.clone())).collect();
+        let (hidden_apps, apps): (Vec<App>, Vec<App>) = apps.into_iter().partition(|a| a.hidden);
+        Ui {
+            apps,
+            hidden_apps,
+            layout,
+            page: 0,
+            screen: Screen::Home,
+            before_sleep: Screen::Home,
+            pressed: None,
+            notice: None,
+            version: String::new(),
+            pressed_key: None,
+            usb: Usb::Unplugged,
+            battery: Warning::None,
+            battery_level: None,
+            menu: 0,
+            icon_choices: Vec::new(),
+            original_icons,
+            extensions: Vec::new(),
+            ext_path: Vec::new(),
+            ext_page: 0,
+            store: Vec::new(),
+            store_page: 0,
+            store_open: None,
+            store_tab: crate::store::StoreTab::Today,
+            store_scroll: 0,
+            store_busy: false,
+            store_installing: None,
+            store_remove_armed: None,
+            running: 0,
+            wifi: crate::wifi::WifiInfo::default(),
+            wifi_scanning: false,
+            wifi_scroll: 0,
+            wifi_target: None,
+            password: primitive_keyboard::Editor::new(MAX_PASSWORD),
+            show_password: false,
+            network_name: primitive_keyboard::Editor::new(MAX_NAME),
+            wifi_hidden: false,
+            ssh_password: primitive_keyboard::Editor::new(MAX_SSH_PASSWORD),
+        }
+    }
+
+    /// A background job ended (the driver got its last line).
+    pub fn background_done(&mut self) {
+        self.running = self.running.saturating_sub(1);
+    }
+
+    /// KUAL extension menus. When there are any, the Extensions tile joins the grid (with the built-ins).
+    /// Replace the app list (the user storage came back: the apps are read again from /mnt/us).
+    pub fn set_apps(&mut self, apps: Vec<App>) {
+        self.apps = apps;
+        self.page = 0;
+        self.pressed = None;
+    }
+
+    pub fn set_extensions(&mut self, menu: Vec<MenuItem>) {
+        self.extensions = menu;
+        self.ext_path.clear();
+        self.ext_page = 0;
+        let present = self.apps.iter().any(|a| a.launch == Launch::Extensions);
+        if !self.extensions.is_empty() && !present {
+            self.apps.push(extensions_app());
+            self.apps.sort_by_cached_key(sort_key);
+        } else if self.extensions.is_empty() && present {
+            self.apps.retain(|a| a.launch != Launch::Extensions);
+        }
+    }
+
+    /// The items at the open level of the Extensions list.
+    pub fn ext_items(&self) -> &[MenuItem] {
+        let mut items = self.extensions.as_slice();
+        for &i in &self.ext_path {
+            match items.get(i) {
+                Some(item) => items = &item.children,
+                None => return &[],
+            }
+        }
+        items
+    }
+
+    /// The Extensions list's title: "Extensions", or the open submenu's name.
+    pub fn ext_title(&self) -> String {
+        let mut items = self.extensions.as_slice();
+        let mut title = "Extensions".to_string();
+        for &i in &self.ext_path {
+            if let Some(item) = items.get(i) {
+                title = item.name.clone();
+                items = &item.children;
+            }
+        }
+        title
+    }
+
+    /// How deep the open submenu is (0: the top of the list).
+    pub fn ext_depth(&self) -> usize {
+        self.ext_path.len()
+    }
+
+    pub fn ext_pages(&self) -> usize {
+        self.layout.list_pages(self.ext_items().len())
+    }
+
+    /// The Wi-Fi page's networks, from the last scan. Set by the driver.
+    pub fn set_wifi(&mut self, info: crate::wifi::WifiInfo) {
+        let current = info.current.as_ref().map(|c| c.name.clone());
+        let networks = info.networks.into_iter().filter(|n| Some(&n.name) != current.as_ref()).collect();
+        self.wifi = crate::wifi::WifiInfo { current: info.current, networks };
+        // The network screen shows the network as it is now (saved or not, connected or not).
+        if let Some(name) = self.wifi_target.as_ref().map(|t| t.name.clone()) {
+            let fresh = self.wifi.current.iter().chain(self.wifi.networks.iter()).find(|n| n.name == name).cloned();
+            if let Some(fresh) = fresh {
+                self.wifi_target = Some(fresh);
+            }
+        }
+        self.wifi_scanning = false;
+        self.wifi_scroll = self.wifi_scroll.min(self.wifi_max_scroll());
+    }
+
+    /// How far the scan list can scroll: its networks, less the rows that fit.
+    fn wifi_max_scroll(&self) -> usize {
+        self.wifi.networks.len().saturating_sub(self.layout.wifi_area().visible)
+    }
+
+    /// Background mode: say it started; the driver runs it and shows its last line when it ends.
+    fn run_background(&mut self, app: App) -> Action {
+        self.notice = Some(format!("Running {}…", app.name));
+        self.running += 1;
+        Action::RunBackground(app)
+    }
+
+    /// The Extensions tile: open the list at the top.
+    /// Replaces the store's entries (from the catalog cache and the installed record). Today is the first tab.
+    pub fn set_store(&mut self, entries: Vec<crate::store::StoreEntry>) {
+        self.store = entries;
+        self.store_page = 0;
+        self.store_open = None;
+        self.store_scroll = 0;
+    }
+
+    /// Today's featured app: the first entry.
+    pub fn store_featured(&self) -> Option<usize> {
+        (!self.store.is_empty()).then_some(0)
+    }
+
+    /// Today's rows under the featured app: the next two entries.
+    pub fn store_today_rows(&self) -> Vec<usize> {
+        (1..self.store.len().min(3)).collect()
+    }
+
+    /// The Apps tab: every entry.
+    pub fn store_apps(&self) -> Vec<usize> {
+        (0..self.store.len()).collect()
+    }
+
+    /// The Updates tab: the entries installed from the store, with or without an update ready.
+    pub fn store_updates(&self) -> Vec<usize> {
+        self.store
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !matches!(e.status, crate::store::Status::NotInstalled))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The paged list of the current tab (Apps or Updates).
+    fn store_list_indices(&self) -> Vec<usize> {
+        match self.store_tab {
+            crate::store::StoreTab::Updates => self.store_updates(),
+            _ => self.store_apps(),
+        }
+    }
+
+    /// The pages of the current tab's list.
+    pub fn store_pages(&self) -> usize {
+        self.layout.store_pages(self.store_list_indices().len())
+    }
+
+    /// The rows of a product page (information, and Remove when it applies), and its screenshots, for its scroll limit.
+    fn store_info_count(&self, index: usize) -> (usize, usize) {
+        self.store.get(index).map_or((0, 0), |e| (e.page_rows().len(), e.screenshots))
+    }
+
+    pub fn open_store(&mut self) -> Action {
+        self.store_tab = crate::store::StoreTab::Today;
+        self.store_page = 0;
+        self.go(Screen::Store)
+    }
+
+    /// Turns the page of the Apps or Updates list by one, if there is one.
+    fn store_turn(&mut self, step: i32) -> Action {
+        let next = self.store_page as i32 + step;
+        if next < 0 || next >= self.store_pages() as i32 {
+            return Action::None;
+        }
+        self.store_page = next as usize;
+        Action::Redraw { full: false }
+    }
+
+    /// The page buttons on the store's tabs: page through a list that has more than one page; otherwise (and on Today)
+    /// move to the next or previous tab.
+    fn store_page_key(&mut self, step: i32) -> Action {
+        use crate::store::StoreTab;
+        if self.store_tab != StoreTab::Today && self.store_pages() > 1 {
+            return self.store_turn(step);
+        }
+        let tabs = [StoreTab::Today, StoreTab::Apps, StoreTab::Updates];
+        let current = tabs.iter().position(|t| *t == self.store_tab).unwrap_or(0) as i32;
+        let next = current + step;
+        if next < 0 || next >= tabs.len() as i32 {
+            return Action::None;
+        }
+        self.set_store_tab(tabs[next as usize])
+    }
+
+    fn store_open_entry(&mut self, index: usize) -> Action {
+        self.store_open = Some(index);
+        self.store_scroll = 0;
+        self.go(Screen::StoreApp)
+    }
+
+    fn set_store_tab(&mut self, tab: crate::store::StoreTab) -> Action {
+        self.store_tab = tab;
+        self.store_page = 0;
+        Action::Redraw { full: false }
+    }
+
+    /// The store's tabs: a tap on the tab bar changes the tab; Today opens its featured app and rows; Apps and Updates
+    /// page through their lists and open an app.
+    fn store_list(&mut self, input: Input) -> Action {
+        use crate::store::StoreTab;
+        let l = self.layout;
+        match input {
+            Input::PageForward => self.store_page_key(1),
+            Input::PageBack => self.store_page_key(-1),
+            Input::Swipe { dx, dy, .. } if dx.abs() > SWIPE_MIN && dx.abs() > dy.abs() * 1.5 => self.store_turn(if dx < 0.0 { 1 } else { -1 }),
+            Input::Tap(x, y) => {
+                if l.store_done().inset(-16).contains(x, y) {
+                    return self.go(Screen::Home);
+                }
+                if l.store_refresh().inset(-16).contains(x, y) {
+                    if self.store_busy {
+                        return Action::None;
+                    }
+                    self.store_busy = true;
+                    return Action::Device(DeviceCmd::StoreRefresh);
+                }
+                if let Some(i) = l.store_tab_at(x, y) {
+                    let tab = [StoreTab::Today, StoreTab::Apps, StoreTab::Updates][i];
+                    if tab == self.store_tab {
+                        return Action::None;
+                    }
+                    return self.set_store_tab(tab);
+                }
+                if self.store_tab == StoreTab::Today {
+                    if let Some(featured) = self.store_featured() {
+                        if l.store_feature().contains(x, y) {
+                            return self.store_open_entry(featured);
+                        }
+                    }
+                    if l.store_see_all().inset(-20).contains(x, y) {
+                        return self.set_store_tab(StoreTab::Apps);
+                    }
+                    let rows = self.store_today_rows();
+                    let Some(row) = (0..rows.len()).find(|&i| l.store_today_row(i).contains(x, y)) else { return Action::None };
+                    return self.store_open_entry(rows[row]);
+                }
+                if l.store_page_label().contains(x, y) {
+                    return self.store_turn(if x < (l.width / 2) as f32 { -1 } else { 1 });
+                }
+                let list = self.store_list_indices();
+                let per = l.store_rows_per_page();
+                let on_page = list.len().saturating_sub(self.store_page * per).min(per);
+                let Some(row) = (0..on_page).find(|&i| l.store_list_row(i).contains(x, y)) else { return Action::None };
+                match list.get(self.store_page * per + row) {
+                    Some(&index) => self.store_open_entry(index),
+                    None => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// A product page: scrolls with a vertical swipe; Back returns to the tab; the action button installs (from the
+    /// store), or shows where a link listing lives.
+    fn store_app(&mut self, input: Input) -> Action {
+        let l = self.layout;
+        let Some(index) = self.store_open else { return self.go(Screen::Store) };
+        let Some(entry) = self.store.get(index).cloned() else { return self.go(Screen::Store) };
+        let (rows, shots) = self.store_info_count(index);
+        let max = (l.store_page_height(rows, shots) - l.height).max(0);
+        match input {
+            Input::Swipe { dx, dy, .. } if dy.abs() > SWIPE_MIN && dy.abs() > dx.abs() * 1.5 => {
+                let next = (self.store_scroll - dy as i32).clamp(0, max);
+                if next == self.store_scroll {
+                    return Action::None;
+                }
+                self.store_scroll = next;
+                Action::Redraw { full: false }
+            }
+            Input::PageForward | Input::PageBack => {
+                // A page button scrolls the product page by a screen; Back at the top returns to the store.
+                let step = if input == Input::PageForward { 1 } else { -1 };
+                let next = (self.store_scroll + step * (l.height - 200)).clamp(0, max);
+                if next == self.store_scroll {
+                    return if step < 0 { self.go(Screen::Store) } else { Action::None };
+                }
+                self.store_scroll = next;
+                Action::Redraw { full: false }
+            }
+            Input::Tap(x, y) => {
+                if l.store_back().inset(-20).contains(x, y) {
+                    return self.go(Screen::Store);
+                }
+                if l.store_action(self.store_scroll).inset(-12).contains(x, y) {
+                    return match (entry.kind, &entry.status) {
+                        (crate::store::Kind::Link, _) => {
+                            self.notice = Some(format!("{} is on its own website: {}", entry.name, entry.repo));
+                            Action::Redraw { full: false }
+                        }
+                        _ if self.store_installing.is_some() => Action::None,
+                        (crate::store::Kind::Install, crate::store::Status::Installed(_)) => Action::None,
+                        (crate::store::Kind::Install, _) => {
+                            self.store_installing = Some(entry.id.clone());
+                            Action::Device(DeviceCmd::StoreInstall(index))
+                        }
+                    };
+                }
+                // The last row of an installed app: Remove, on a second tap.
+                let rows = entry.page_rows();
+                if entry.can_remove() {
+                    let last = rows.len() - 1;
+                    let row = l.store_info_row(last, self.store_scroll, entry.screenshots);
+                    if row.contains(x, y) {
+                        if self.store_remove_armed.as_deref() == Some(entry.id.as_str()) {
+                            self.store_remove_armed = None;
+                            return Action::Device(DeviceCmd::StoreRemove(index));
+                        }
+                        self.store_remove_armed = Some(entry.id.clone());
+                        self.notice = Some(format!("Tap Remove again to remove {} from this Kindle.", entry.name));
+                        return Action::Redraw { full: false };
+                    }
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The largest scroll of the open product page (zero when it fits the screen).
+    pub fn store_scroll_max(&self) -> i32 {
+        self.store_open.map_or(0, |i| {
+            let (rows, shots) = self.store_info_count(i);
+            (self.layout.store_page_height(rows, shots) - self.layout.height).max(0)
+        })
+    }
+
+    pub fn open_extensions(&mut self) -> Action {
+        self.ext_path.clear();
+        self.ext_page = 0;
+        self.go(Screen::Extensions)
+    }
+
+    /// The Extensions list: open a submenu, run an item, page, or go back up.
+    fn extensions_list(&mut self, input: Input) -> Action {
+        let l = self.layout;
+        let turn = |u: &mut Ui, step: i32| -> Action {
+            let next = u.ext_page as i32 + step;
+            if next < 0 || next >= u.ext_pages() as i32 {
+                return Action::None;
+            }
+            u.ext_page = next as usize;
+            Action::Redraw { full: false }
+        };
+        match input {
+            Input::PageForward => turn(self, 1),
+            Input::PageBack => turn(self, -1),
+            Input::Swipe { dx, dy, .. } if dx.abs() > SWIPE_MIN && dx.abs() > dy.abs() * 1.5 => turn(self, if dx < 0.0 { 1 } else { -1 }),
+            Input::Tap(x, y) => {
+                if l.done_button().inset(-20).contains(x, y) {
+                    if self.ext_path.pop().is_some() {
+                        self.ext_page = 0;
+                        return Action::Redraw { full: false };
+                    }
+                    return self.go(Screen::Home);
+                }
+                if l.footer().contains(x, y) {
+                    return turn(self, if x < (l.width / 2) as f32 { -1 } else { 1 });
+                }
+                let Some(row) = l.list_row_at(x, y) else { return Action::None };
+                let index = self.ext_page * l.list_rows_per_page() + row;
+                let Some(item) = self.ext_items().get(index).cloned() else { return Action::None };
+                if item.is_submenu() {
+                    self.ext_path.push(index);
+                    self.ext_page = 0;
+                    return Action::Redraw { full: false };
+                }
+                match item.app() {
+                    Some(app) if app.background => self.run_background(app),
+                    Some(app) => Action::Launch(app),
+                    None => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The icon files "Change icon" cycles through.
+    pub fn set_icon_choices(&mut self, choices: Vec<String>) {
+        self.icon_choices = choices;
+    }
+
+    /// The Wi-Fi scan list on the Wi-Fi page (networks other than the current one).
+    pub fn wifi_networks(&self) -> &[crate::wifi::Network] {
+        &self.wifi.networks
+    }
+
+    /// The app the app menu edits.
+    pub fn menu_app(&self) -> Option<&App> {
+        self.apps.get(self.menu)
+    }
+
+    /// The icon of the app at `index`, when it is on the current page.
+    pub fn icon_rect(&self, index: usize) -> Option<Rect> {
+        let l = self.layout;
+        (index < self.apps.len() && index / l.per_page() == self.page).then(|| l.icon(index % l.per_page()))
+    }
+
+    /// The app menu's actions for the app it edits.
+    pub fn menu_actions(&self) -> Vec<Button> {
+        match self.menu_app() {
+            Some(app) if !is_builtin(app) => vec![Button::MenuEarlier, Button::MenuLater, Button::MenuIcon, Button::MenuHide],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Where the app menu opens: beside the edited app's icon.
+    pub fn menu_anchor(&self) -> Rect {
+        self.icon_rect(self.menu).unwrap_or_else(|| {
+            let s = self.layout.icon_size();
+            Rect::new((self.layout.width - s) / 2, self.layout.grid().y, s, s)
+        })
+    }
+
+    /// Record a battery reading. Returns true when the warning changed (the screen needs a redraw). A critical
+    /// battery on the home screen goes to the sleep screen, which shows the warning; the power button wakes it.
+    pub fn set_battery(&mut self, level: Option<u32>, charging: bool) -> bool {
+        let next = battery::assess(level, charging, self.battery);
+        self.battery_level = level;
+        let changed = next != self.battery;
+        self.battery = next;
+        if changed && next == Warning::Critical && self.screen == Screen::Home {
+            self.before_sleep = Screen::Home;
+            self.screen = Screen::Sleep;
+            self.pressed = None;
+        }
+        changed
+    }
+
+    /// The battery text for the footer, if a warning is active.
+    pub fn battery_message(&self) -> Option<String> {
+        battery::message(self.battery, self.battery_level)
+    }
+
+    pub fn apps(&self) -> &[App] {
+        &self.apps
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.hidden_apps.len()
+    }
+
+    /// The app (index into the visible apps) whose icon is under a point on the home screen.
+    fn app_at(&self, x: f32, y: f32) -> Option<usize> {
+        let l = self.layout;
+        let index = self.page * l.per_page() + l.slot_at(x, y)?;
+        (index < self.apps.len()).then_some(index)
+    }
+
+    /// Long press on an icon: open its app menu beside it. Settings and the Kindle UI stay as they are.
+    fn home_long_tap(&mut self, x: f32, y: f32) -> Action {
+        let Some(index) = self.app_at(x, y) else { return Action::None };
+        if is_builtin(&self.apps[index]) {
+            self.notice = Some(format!("{} stays in place", self.apps[index].name));
+            return Action::Redraw { full: false };
+        }
+        self.menu = index;
+        self.go(Screen::AppMenu)
+    }
+
+    /// The app menu: one of its actions, or a tap outside the box to close it.
+    fn app_menu(&mut self, input: Input) -> Action {
+        match input {
+            Input::PageBack => self.leave_menu(),
+            Input::Tap(x, y) => {
+                let (anchor, actions) = (self.menu_anchor(), self.menu_actions());
+                let hit = (0..actions.len()).find(|&i| self.layout.menu_row(anchor, actions.len(), i).contains(x, y));
+                match hit.map(|i| actions[i]) {
+                    Some(Button::MenuEarlier) => self.move_app(-1),
+                    Some(Button::MenuLater) => self.move_app(1),
+                    Some(Button::MenuIcon) => self.next_icon(),
+                    Some(Button::MenuHide) => {
+                        let action = self.hide_at(self.menu);
+                        self.screen = Screen::Home;
+                        action
+                    }
+                    _ if !self.layout.menu_box(anchor, actions.len()).contains(x, y) => self.leave_menu(),
+                    _ => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Back to the home screen.
+    fn leave_menu(&mut self) -> Action {
+        self.page = self.page.min(self.pages().saturating_sub(1));
+        self.go(Screen::Home)
+    }
+
+    /// Move the edited app one place. The new order of every movable app is saved, so it holds after apps are
+    /// added or removed. Built-ins stay at the end. The page follows the app, so the menu stays beside it.
+    fn move_app(&mut self, step: i64) -> Action {
+        let to = self.menu as i64 + step;
+        if to < 0 || to >= self.apps.len() as i64 || is_builtin(&self.apps[to as usize]) {
+            self.notice = Some(if step < 0 { "Already first".into() } else { "Already last".into() });
+            return Action::Redraw { full: false };
+        }
+        let to = to as usize;
+        self.apps.swap(self.menu, to);
+        self.menu = to;
+        self.page = to / self.layout.per_page();
+        let mut order = Vec::new();
+        for (i, app) in self.apps.iter_mut().filter(|a| !is_builtin(a)).enumerate() {
+            app.order = Some(i as i64 + 1);
+            order.push((app.id.clone(), i as i64 + 1));
+        }
+        Action::SetOrder(order)
+    }
+
+    /// Change icon: the next file in the icons folder, then back to the app's own icon.
+    fn next_icon(&mut self) -> Action {
+        if self.icon_choices.is_empty() {
+            self.notice = Some("No icons: add PNG files to /mnt/us/launcher/icons".into());
+            return Action::Redraw { full: false };
+        }
+        let Some(app) = self.apps.get(self.menu) else { return Action::None };
+        let current = match &app.icon {
+            IconSource::File(path) => self.icon_choices.iter().position(|c| c == path),
+            _ => None,
+        };
+        let next = match current {
+            Some(i) if i + 1 < self.icon_choices.len() => Some(self.icon_choices[i + 1].clone()),
+            Some(_) => None,
+            None => Some(self.icon_choices[0].clone()),
+        };
+        let id = app.id.clone();
+        let icon = match &next {
+            Some(path) => IconSource::File(path.clone()),
+            None => self.original_icons.get(&id).cloned().unwrap_or(IconSource::None),
+        };
+        self.apps[self.menu].icon = icon;
+        Action::SetIcon { id, icon: next }
+    }
+
+    /// Hide the app at `index` (app menu > Hide).
+    fn hide_at(&mut self, index: usize) -> Action {
+        if index >= self.apps.len() || is_builtin(&self.apps[index]) {
+            return Action::None;
+        }
+        let app = self.apps.remove(index);
+        let id = app.id.clone();
+        self.notice = Some(format!("Hidden: {}. Show it again in Settings > Hidden apps.", app.name));
+        self.hidden_apps.push(App { hidden: true, ..app });
+        self.page = self.page.min(self.pages().saturating_sub(1));
+        Action::SetHidden(vec![(id, true)])
+    }
+
+    /// Settings > Hidden apps > Show all.
+    pub fn show_all(&mut self) -> Action {
+        if self.hidden_apps.is_empty() {
+            return Action::None;
+        }
+        let back: Vec<App> = self.hidden_apps.drain(..).map(|a| App { hidden: false, ..a }).collect();
+        let changes = back.iter().map(|a| (a.id.clone(), false)).collect();
+        self.notice = Some(format!("Showing {} app(s) again", back.len()));
+        self.apps.extend(back);
+        self.apps.sort_by_cached_key(sort_key);
+        Action::SetHidden(changes)
+    }
+
+    pub fn pages(&self) -> usize {
+        self.layout.pages(self.apps.len())
+    }
+
+    /// The apps on the current page, with their slots.
+    pub fn page_apps(&self) -> impl Iterator<Item = (usize, &App)> {
+        let per = self.layout.per_page();
+        self.apps.iter().skip(self.page * per).take(per).enumerate()
+    }
+
+    fn turn_page(&mut self, step: i32) -> Action {
+        let next = self.page as i32 + step;
+        if next < 0 || next >= self.pages() as i32 {
+            return Action::None;
+        }
+        self.page = next as usize;
+        Action::Redraw { full: false }
+    }
+
+    fn go(&mut self, screen: Screen) -> Action {
+        self.screen = screen;
+        self.pressed = None;
+        Action::Redraw { full: false }
+    }
+
+    /// A tap on a key of the keyboard marks the key as pressed, so the driver can show it before the key's action
+    /// runs. Returns whether a key was marked; `handle` clears the mark.
+    pub fn press_feedback(&mut self, input: Input) -> bool {
+        let Input::Tap(x, y) = input else { return false };
+        let keys = match self.screen {
+            Screen::Password => self.layout.keyboard_keys(self.password.layer),
+            Screen::NetworkName => self.layout.keyboard_keys_with(self.network_name.layer, "Next"),
+            Screen::SshPassword => self.layout.keyboard_keys_with(self.ssh_password.layer, "Set"),
+            _ => return false,
+        };
+        match keys.into_iter().find(|(_, r)| r.contains(x, y)) {
+            Some((_, r)) => {
+                self.pressed_key = Some(r);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn handle(&mut self, input: Input) -> Action {
+        self.pressed_key = None;
+        // While the drive is shown on a computer, the screen takes no taps: the Kindle's files are changing.
+        if self.usb == Usb::Drive && !matches!(input, Input::Sleep | Input::Wake) {
+            return Action::None;
+        }
+        match input {
+            Input::Sleep => {
+                if self.screen != Screen::Sleep {
+                    self.before_sleep = self.screen;
+                }
+                self.screen = Screen::Sleep;
+                self.pressed = None;
+                return Action::Redraw { full: true };
+            }
+            Input::Wake => {
+                // `outOfScreenSaver` and `exitingScreenSaver` both arrive: redraw once.
+                if self.screen != Screen::Sleep {
+                    return Action::None;
+                }
+                self.screen = self.before_sleep;
+                return Action::Redraw { full: true };
+            }
+            _ if self.screen == Screen::Sleep => return Action::None,
+            _ => {}
+        }
+        let had_notice = self.notice.take().is_some();
+        let action = match self.screen {
+            Screen::Home => self.home(input),
+            Screen::Settings => self.settings_home(input),
+            Screen::Page(page) => self.settings_page(input, page),
+            Screen::NetworkDetail => self.network_detail(input),
+            Screen::Password => self.password_screen(input),
+            Screen::NetworkName => self.network_name_screen(input),
+            Screen::SshPassword => self.ssh_password_screen(input),
+            Screen::ConfirmKindle => self.confirm(input),
+            Screen::PowerMenu => self.power_menu(input),
+            Screen::AppMenu => self.app_menu(input),
+            Screen::Extensions => self.extensions_list(input),
+            Screen::Store => self.store_list(input),
+            Screen::StoreApp => self.store_app(input),
+            Screen::QuickSettings => self.quick(input),
+            Screen::Sleep => Action::None,
+        };
+        if had_notice && action == Action::None {
+            Action::Redraw { full: false }
+        } else {
+            action
+        }
+    }
+
+    fn home(&mut self, input: Input) -> Action {
+        let l = self.layout;
+        match input {
+            Input::PageForward => self.turn_page(1),
+            Input::PageBack => self.turn_page(-1),
+            Input::Swipe { dx, dy, start_y } if dy > SWIPE_MIN && dy.abs() > dx.abs() * 1.5 && start_y <= l.status().bottom() as f32 + 40.0 => {
+                // Swipe down from the top edge: quick settings, as Primitive Browser.
+                self.go(Screen::QuickSettings)
+            }
+            Input::Swipe { dx, dy, .. } if dx.abs() > SWIPE_MIN && dx.abs() > dy.abs() * 1.5 => {
+                self.turn_page(if dx < 0.0 { 1 } else { -1 })
+            }
+            Input::LongTap(x, y) => self.home_long_tap(x, y),
+            Input::Tap(x, y) => {
+                if l.home_footer().contains(x, y) {
+                    return self.turn_page(if x < (l.width / 2) as f32 { -1 } else { 1 });
+                }
+                let Some(index) = self.app_at(x, y) else { return Action::None };
+                let app = self.apps[index].clone();
+                match app.launch {
+                    Launch::Settings => self.go(Screen::Settings),
+                    Launch::KindleMode => self.go(Screen::ConfirmKindle),
+                    Launch::Extensions => self.open_extensions(),
+                    Launch::Store => self.open_store(),
+                    _ if app.background => self.run_background(app),
+                    _ => {
+                        self.pressed = self.icon_rect(index);
+                        Action::Launch(app)
+                    }
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Quick settings: a button, a level button or step, or the Wi-Fi icon. A swipe up closes it (a tap does not).
+    fn quick(&mut self, input: Input) -> Action {
+        let l = self.layout;
+        match input {
+            Input::PageBack => self.go(Screen::Home),
+            Input::Swipe { dx, dy, .. } if dy < -SWIPE_MIN && dy.abs() > dx.abs() => self.go(Screen::Home),
+            Input::Tap(x, y) => {
+                // Quick settings is closed by a swipe up (or the back key), not by a tap.
+                if !l.quick_panel().contains(x, y) || l.quick_handle().contains(x, y) {
+                    return Action::None;
+                }
+                if l.header_wifi().inset(-12).contains(x, y) {
+                    return Action::Device(DeviceCmd::ToggleWifi);
+                }
+                if let Some((tile, _)) = l.quick_buttons().into_iter().find(|(_, slot)| slot.contains(x, y)) {
+                    return match tile {
+                        QuickTile::Airplane => Action::Device(DeviceCmd::ToggleWifi),
+                        QuickTile::AutoRotate => Action::Device(DeviceCmd::ToggleAutoRotation),
+                        QuickTile::DarkMode => Action::Device(DeviceCmd::ToggleDarkMode),
+                        QuickTile::Animation => Action::Device(DeviceCmd::ToggleAnimation),
+                        QuickTile::Ssh => Action::Device(DeviceCmd::ToggleSsh),
+                        QuickTile::AllSettings => self.go(Screen::Settings),
+                        QuickTile::Power => self.go(Screen::PowerMenu),
+                    };
+                }
+                for row in 0..2 {
+                    let level = |step: i32| if row == 0 { DeviceCmd::Light(step) } else { DeviceCmd::Warmth(step) };
+                    if l.quick_minus(row).inset(-10).contains(x, y) {
+                        return Action::Device(level(-1));
+                    }
+                    if l.quick_plus(row).inset(-10).contains(x, y) {
+                        return Action::Device(level(1));
+                    }
+                    if let Some(to) = l.quick_step(row, x, y) {
+                        return Action::Device(if row == 0 { DeviceCmd::SetLight(to) } else { DeviceCmd::SetWarmth(to) });
+                    }
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The network screen: Connect (or Enter the password for a new secured network), Forget for a saved one, and
+    /// Back to the Wi-Fi page.
+    fn network_detail(&mut self, input: Input) -> Action {
+        let Some(net) = self.wifi_target.clone() else { return self.go(Screen::Settings) };
+        match input {
+            Input::PageBack => self.go(Screen::Page(Page::Wifi)),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(Screen::Page(Page::Wifi));
+                }
+                if self.layout.net_connect().inset(-12).contains(x, y) {
+                    if net.secured && !net.known {
+                        self.password = primitive_keyboard::Editor::new(MAX_PASSWORD);
+                        self.show_password = false;
+                        self.wifi_hidden = false;
+                        return self.go(Screen::Password);
+                    }
+                    return self.join(net.name, net.secured, None, net.known);
+                }
+                if net.known && self.layout.net_forget().inset(-12).contains(x, y) {
+                    return Action::ForgetWifi(net.name);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The password screen: type the password on the keyboard (its Go key joins), show or hide it. Back returns to
+    /// the network screen.
+    /// The SSH password: type it on the keyboard, then Set gives it to the driver. Back returns to the SSH & DNS page.
+    /// The password is not shown after this screen and is never logged.
+    fn ssh_password_screen(&mut self, input: Input) -> Action {
+        match input {
+            Input::PageBack => self.go(Screen::Page(Page::Connection)),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(Screen::Page(Page::Connection));
+                }
+                let Some(key) = self.layout.keyboard_key_at(self.ssh_password.layer, x, y) else { return Action::None };
+                if self.ssh_password.press(key) != primitive_keyboard::Press::Go {
+                    return Action::Redraw { full: false };
+                }
+                let password = self.ssh_password.string();
+                if !valid_ssh_password(&password) {
+                    self.notice = Some(format!("Use {MIN_SSH_PASSWORD} to {MAX_SSH_PASSWORD} letters, digits or - _ . @ # % + = !, no spaces."));
+                    return Action::Redraw { full: false };
+                }
+                self.ssh_password = primitive_keyboard::Editor::new(MAX_SSH_PASSWORD);
+                self.notice = Some("Setting the SSH password…".into());
+                self.screen = Screen::Page(Page::Connection);
+                Action::SetSshPassword(password)
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn password_screen(&mut self, input: Input) -> Action {
+        let Some(net) = self.wifi_target.clone() else { return self.go(Screen::Settings) };
+        let back = if self.wifi_hidden { Screen::NetworkName } else { Screen::NetworkDetail };
+        match input {
+            Input::PageBack => self.go(back),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(back);
+                }
+                if self.layout.password_show().inset(-12).contains(x, y) {
+                    self.show_password = !self.show_password;
+                    return Action::Redraw { full: false };
+                }
+                let Some(key) = self.layout.keyboard_key_at(self.password.layer, x, y) else { return Action::None };
+                match self.password.press(key) {
+                    primitive_keyboard::Press::Go => {
+                        if self.wifi_hidden && self.password.text.is_empty() {
+                            return self.join(net.name, false, None, false);
+                        }
+                        if self.password.text.len() < MIN_PASSWORD {
+                            self.notice = Some(format!("A Wi-Fi password has at least {MIN_PASSWORD} characters."));
+                            return Action::Redraw { full: false };
+                        }
+                        let password = self.password.string();
+                        self.join(net.name, true, Some(password), false)
+                    }
+                    _ => Action::Redraw { full: false },
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The name of a network that is not in the list: type it, then Next goes to its password (an empty password
+    /// joins it as an open network). Back returns to the Wi-Fi page.
+    fn network_name_screen(&mut self, input: Input) -> Action {
+        match input {
+            Input::PageBack => self.go(Screen::Page(Page::Wifi)),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(Screen::Page(Page::Wifi));
+                }
+                let Some(key) = self.layout.keyboard_key_at(self.network_name.layer, x, y) else { return Action::None };
+                if self.network_name.press(key) == primitive_keyboard::Press::Go {
+                    let name = self.network_name.string().trim().to_string();
+                    if name.is_empty() {
+                        self.notice = Some("Type the network's name.".into());
+                        return Action::Redraw { full: false };
+                    }
+                    self.wifi_target = Some(crate::wifi::Network { name, level: 0, max: 5, secured: true, known: false });
+                    self.wifi_hidden = true;
+                    self.password = primitive_keyboard::Editor::new(MAX_PASSWORD);
+                    self.show_password = false;
+                    return self.go(Screen::Password);
+                }
+                Action::Redraw { full: false }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Start joining: back on the Wi-Fi page while it connects (the driver reports the result).
+    fn join(&mut self, name: String, secured: bool, password: Option<String>, saved: bool) -> Action {
+        self.password = primitive_keyboard::Editor::new(MAX_PASSWORD);
+        self.notice = Some(format!("Connecting to {name}…"));
+        self.wifi_scanning = true;
+        self.screen = Screen::Page(Page::Wifi);
+        self.pressed = None;
+        Action::JoinWifi { name, secured, password, saved }
+    }
+
+    /// The result of a join, shown in the footer.
+    pub fn set_join_result(&mut self, ok: bool, message: String) {
+        self.notice = Some(if ok { message } else { format!("Could not connect: {message}") });
+    }
+
+    /// Settings: the list of pages. A tap on a page opens it; Done (or the back key) goes to the home screen.
+    fn settings_home(&mut self, input: Input) -> Action {
+        match input {
+            Input::PageBack => self.go(Screen::Home),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(Screen::Home);
+                }
+                match self.layout.settings_home_at(x, y) {
+                    Some(page) => self.go(Screen::Page(page)),
+                    None => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// One page of Settings: its rows' buttons. Back (or the back key) returns to the Settings list.
+    fn settings_page(&mut self, input: Input, page: Page) -> Action {
+        match input {
+            Input::PageBack => self.go(Screen::Settings),
+            Input::Swipe { dy, dx, .. } if page == Page::Wifi && dy.abs() > SWIPE_MIN && dy.abs() > dx.abs() => {
+                // The list moves by about as many rows as the swipe covers (at least one).
+                let rows = ((dy.abs() / crate::layout::NETWORK_H as f32) as usize).max(1);
+                let next = if dy < 0.0 { self.wifi_scroll + rows } else { self.wifi_scroll.saturating_sub(rows) };
+                self.wifi_scroll = next.min(self.wifi_max_scroll());
+                Action::Redraw { full: false }
+            }
+            Input::Tap(x, y) if page == Page::Wifi && self.layout.wifi_area().current.contains(x, y) => {
+                // The connected network: its screen, where it can be forgotten.
+                match self.wifi.current.clone() {
+                    Some(net) => {
+                        self.wifi_target = Some(net);
+                        self.go(Screen::NetworkDetail)
+                    }
+                    None => Action::None,
+                }
+            }
+            Input::Tap(x, y) if page == Page::Wifi && self.layout.scan_at(x, y) => {
+                self.wifi_scanning = true;
+                Action::ScanWifi
+            }
+            Input::Tap(x, y) if page == Page::Wifi && self.layout.wifi_other().inset(-12).contains(x, y) => {
+                self.network_name = primitive_keyboard::Editor::new(MAX_NAME);
+                self.go(Screen::NetworkName)
+            }
+            Input::Tap(x, y) if page == Page::Wifi && self.layout.network_at(x, y).is_some() => {
+                let index = self.wifi_scroll + self.layout.network_at(x, y).unwrap_or(0);
+                match self.wifi.networks.get(index).cloned() {
+                    Some(net) => {
+                        self.wifi_target = Some(net);
+                        self.go(Screen::NetworkDetail)
+                    }
+                    None => Action::None,
+                }
+            }
+            Input::Tap(x, y) => match self.layout.settings_button_at(page, x, y) {
+                Some(Button::Done) => self.go(Screen::Settings),
+                Some(Button::LightDown) => Action::Device(DeviceCmd::Light(-2)),
+                Some(Button::LightUp) => Action::Device(DeviceCmd::Light(2)),
+                Some(Button::WarmDown) => Action::Device(DeviceCmd::Warmth(-2)),
+                Some(Button::WarmUp) => Action::Device(DeviceCmd::Warmth(2)),
+                Some(Button::Wifi) => Action::Device(DeviceCmd::ToggleWifi),
+                Some(Button::Rotation) => Action::Device(DeviceCmd::ToggleRotation),
+                Some(Button::Ssh) => Action::Device(DeviceCmd::ToggleSsh),
+                Some(Button::PublicDns) => Action::Device(DeviceCmd::ToggleDns),
+                Some(Button::SshCheck) => Action::CheckSsh,
+                Some(Button::SshPassword) => {
+                    self.ssh_password = primitive_keyboard::Editor::new(MAX_SSH_PASSWORD);
+                    self.go(Screen::SshPassword)
+                }
+                Some(Button::Autostart) => Action::Device(DeviceCmd::ToggleAutostart),
+                Some(Button::ShowHidden) => self.show_all(),
+                Some(Button::SleepScreen) => Action::Device(DeviceCmd::ToggleSleepScreen),
+                Some(Button::RotationAuto) => Action::Device(DeviceCmd::AutoRotation),
+                Some(Button::DarkMode) => Action::Device(DeviceCmd::ToggleDarkMode),
+                Some(Button::Animation) => Action::Device(DeviceCmd::ToggleAnimation),
+                Some(Button::KindleUi) => self.go(Screen::ConfirmKindle),
+                Some(Button::Restart) => Action::Device(DeviceCmd::RestartLauncher),
+                _ => Action::None,
+            },
+            _ => Action::None,
+        }
+    }
+
+    /// The power menu: Restart and Power off run the device's command; Cancel, or a tap outside the box, goes home.
+    fn power_menu(&mut self, input: Input) -> Action {
+        let Input::Tap(x, y) = input else { return Action::None };
+        let [(_, cancel), (_, restart), (_, off)] = self.layout.power_buttons();
+        if off.inset(-12).contains(x, y) {
+            Action::Device(DeviceCmd::PowerOff)
+        } else if restart.inset(-12).contains(x, y) {
+            Action::Device(DeviceCmd::Restart)
+        } else if cancel.inset(-12).contains(x, y) || !self.layout.power_box().contains(x, y) {
+            self.go(Screen::Home)
+        } else {
+            Action::None
+        }
+    }
+
+    fn confirm(&mut self, input: Input) -> Action {
+        let Input::Tap(x, y) = input else { return Action::None };
+        let [(_, cancel), (_, open)] = self.layout.confirm_buttons();
+        if open.inset(-12).contains(x, y) {
+            Action::KindleMode
+        } else if cancel.inset(-12).contains(x, y) || !self.layout.confirm_box().contains(x, y) {
+            self.go(Screen::Home)
+        } else {
+            Action::None
+        }
+    }
+}
+
+/// Settings, the Kindle UI and Extensions: they cannot be moved, hidden or given another icon.
+fn is_builtin(app: &App) -> bool {
+    matches!(app.launch, Launch::Settings | Launch::KindleMode | Launch::Extensions | Launch::Store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apps::IconSource;
+
+    fn app(id: &str, launch: Launch) -> App {
+        App { id: id.into(), name: id.into(), icon: IconSource::None, launch, dir: "/".into(), order: None, hidden: false, background: false }
+    }
+
+    fn script(id: &str) -> App {
+        app(id, Launch::Script { path: format!("/d/{id}"), hooks: false })
+    }
+
+    fn ui(n: usize) -> Ui {
+        let mut apps: Vec<App> = (0..n).map(|i| script(&format!("app{i}.sh"))).collect();
+        apps.push(app("settings", Launch::Settings));
+        apps.push(app("kindle", Launch::KindleMode));
+        Ui::new(apps, Layout::new(1264, 1680, 3, 3))
+    }
+
+    fn centre(r: crate::Rect) -> Input {
+        Input::Tap((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)
+    }
+
+    #[test]
+    fn tapping_a_tile_launches_it_and_marks_it_pressed() {
+        let mut u = ui(3);
+        let c = u.layout.cell(1);
+        match u.handle(centre(c)) {
+            Action::Launch(a) => assert_eq!(a.id, "app1.sh"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(u.pressed, Some(u.layout.icon(1)), "only the touched icon is marked");
+        assert_eq!(u.handle(centre(u.layout.cell(8))), Action::None, "empty slot");
+    }
+
+    #[test]
+    fn paging_with_buttons_swipes_and_bounds() {
+        let u = ui(7); // 9 icons with the built-ins: 1 page of 3 × 3; 10 would make 2
+        assert_eq!(u.pages(), 1);
+        let mut u2 = ui(8);
+        assert_eq!(u2.pages(), 2);
+        assert_eq!(u2.handle(Input::PageForward), Action::Redraw { full: false });
+        let mut u = ui(10); // 12 icons: 2 pages
+        assert_eq!(u.pages(), 2);
+        assert_eq!(u.handle(Input::PageBack), Action::None);
+        assert_eq!(u.handle(Input::PageForward), Action::Redraw { full: false });
+        assert_eq!(u.page, 1);
+        assert_eq!(u.handle(Input::PageForward), Action::None);
+        assert_eq!(u.handle(Input::Swipe { dx: 300.0, dy: 20.0, start_y: 500.0 }), Action::Redraw { full: false });
+        assert_eq!(u.page, 0);
+        assert_eq!(u.handle(Input::Swipe { dx: -100.0, dy: 0.0, start_y: 500.0 }), Action::None, "too short");
+        assert_eq!(u.page_apps().count(), 9);
+    }
+
+    #[test]
+    fn hidden_apps_are_not_shown() {
+        let mut a = script("x.sh");
+        a.hidden = true;
+        let u = Ui::new(vec![a, script("y.sh")], Layout::new(1264, 1680, 3, 3));
+        assert_eq!(u.apps().len(), 1);
+    }
+
+    #[test]
+    fn remove_takes_two_taps_on_an_installed_app_and_is_not_offered_otherwise() {
+        use crate::store::{test_entry, Status};
+        let mut u = ui(0);
+        u.set_store(vec![test_entry("a", "Alpha", Status::Installed("1.0.0".into())), test_entry("b", "Beta", Status::NotInstalled)]);
+        u.open_store();
+        u.store_open = Some(0);
+        u.screen = Screen::StoreApp;
+        let last = u.store[0].page_rows().len() - 1;
+        let row = u.layout.store_info_row(last, 0, 0);
+        assert_eq!(u.handle(centre(row)), Action::Redraw { full: false }, "the first tap asks");
+        assert!(u.notice.as_deref().unwrap_or("").contains("Tap Remove again"));
+        assert_eq!(u.handle(centre(row)), Action::Device(DeviceCmd::StoreRemove(0)), "the second tap removes");
+        // Not installed: no Remove row, so the last row is information.
+        assert!(!u.store[1].can_remove());
+        assert_ne!(u.store[1].page_rows().last().map(|r| r.0.as_str()), Some(crate::store::StoreEntry::REMOVE_LABEL));
+    }
+
+    #[test]
+    fn the_page_buttons_move_through_the_store() {
+        use crate::store::{test_entry, Status, StoreTab};
+        let mut u = ui(0);
+        let entries: Vec<_> = (0..30).map(|i| test_entry(&format!("a{i}"), &format!("App {i}"), Status::NotInstalled)).collect();
+        u.set_store(entries);
+        u.open_store();
+        // Today has no pages: a page button moves to the next tab.
+        u.handle(Input::PageForward);
+        assert_eq!(u.store_tab, StoreTab::Apps);
+        // The Apps list has pages: a page button turns the page.
+        u.handle(Input::PageForward);
+        assert_eq!(u.store_page, 1);
+        // Back on the first tab, Today: the previous tab is not there.
+        u.store_tab = StoreTab::Today;
+        assert_eq!(u.handle(Input::PageBack), Action::None);
+        // The product page scrolls a screen, and Back at the top returns to the store.
+        u.store_open = Some(0);
+        u.screen = Screen::StoreApp;
+        u.handle(Input::PageForward);
+        assert!(u.store_scroll > 0 || u.store_scroll_max() == 0);
+        u.store_scroll = 0;
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Store);
+    }
+
+    #[test]
+    fn done_leaves_the_store_from_every_tab() {
+        use crate::store::{test_entry, Status, StoreTab};
+        let mut u = ui(0);
+        u.set_store(vec![test_entry("a", "Alpha", Status::NotInstalled)]);
+        for tab in [StoreTab::Today, StoreTab::Apps, StoreTab::Updates] {
+            u.open_store();
+            u.store_tab = tab;
+            u.handle(centre(u.layout.store_done()));
+            assert_eq!(u.screen, Screen::Home, "Done leaves the store from {tab:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_asks_the_device_once_while_it_runs() {
+        use crate::store::{test_entry, Status};
+        let mut u = ui(0);
+        u.set_store(vec![test_entry("a", "Alpha", Status::NotInstalled)]);
+        u.open_store();
+        let button = centre(u.layout.store_refresh());
+        assert_eq!(u.handle(button), Action::Device(DeviceCmd::StoreRefresh));
+        assert!(u.store_busy);
+        assert_eq!(u.handle(button), Action::None, "a second tap waits for the first refresh");
+    }
+
+    #[test]
+    fn the_store_opens_on_today_and_its_tabs_switch() {
+        use crate::store::{test_entry, Status, StoreTab};
+        let mut u = ui(0);
+        u.set_store(vec![
+            test_entry("a", "Alpha", Status::NotInstalled),
+            test_entry("b", "Beta", Status::NotInstalled),
+            test_entry("c", "Gamma", Status::Installed("1.0.0".into())),
+        ]);
+        u.open_store();
+        assert_eq!(u.screen, Screen::Store);
+        assert_eq!(u.store_tab, StoreTab::Today);
+        let apps = u.layout.store_tab(1);
+        u.handle(centre(apps));
+        assert_eq!(u.store_tab, StoreTab::Apps);
+        let updates = u.layout.store_tab(2);
+        u.handle(centre(updates));
+        assert_eq!(u.store_tab, StoreTab::Updates);
+        // Only the installed app is in Updates.
+        assert_eq!(u.store_updates(), vec![2]);
+    }
+
+    #[test]
+    fn today_opens_the_featured_app_and_its_rows_and_see_all_goes_to_apps() {
+        use crate::store::{test_entry, Status, StoreTab};
+        let mut u = ui(0);
+        u.set_store(vec![
+            test_entry("a", "Alpha", Status::NotInstalled),
+            test_entry("b", "Beta", Status::NotInstalled),
+            test_entry("c", "Gamma", Status::NotInstalled),
+        ]);
+        u.open_store();
+        assert_eq!(u.handle(centre(u.layout.store_feature())), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::StoreApp);
+        assert_eq!(u.store_open, Some(0));
+        u.handle(Input::Tap(0.0, 0.0)); // back to the store: the header is above the content
+        u.screen = Screen::Store;
+        let row = u.layout.store_today_row(1);
+        u.handle(centre(row));
+        assert_eq!(u.store_open, Some(2), "the second row under the featured card is the third entry");
+        u.screen = Screen::Store;
+        u.store_tab = StoreTab::Today;
+        u.handle(centre(u.layout.store_see_all()));
+        assert_eq!(u.store_tab, StoreTab::Apps);
+    }
+
+    #[test]
+    fn the_apps_list_pages_and_opens_the_entry_on_the_row() {
+        use crate::store::{test_entry, Status, StoreTab};
+        let mut u = ui(0);
+        let entries: Vec<_> = (0..30).map(|i| test_entry(&format!("app{i}"), &format!("App {i:02}"), Status::NotInstalled)).collect();
+        u.set_store(entries);
+        u.open_store();
+        u.store_tab = StoreTab::Apps;
+        let per = u.layout.store_rows_per_page();
+        assert!(u.store_pages() > 1, "thirty apps need more than one page");
+        u.handle(Input::PageForward);
+        assert_eq!(u.store_page, 1);
+        u.handle(centre(u.layout.store_list_row(0)));
+        assert_eq!(u.store_open, Some(per), "the first row of page two is entry {per}");
+    }
+
+    #[test]
+    fn the_product_page_scrolls_and_its_action_installs_or_shows_the_link() {
+        use crate::store::{test_entry, Kind, Status};
+        let mut u = ui(0);
+        let mut link = test_entry("k", "Kay", Status::NotInstalled);
+        link.kind = Kind::Link;
+        u.set_store(vec![test_entry("a", "Alpha", Status::NotInstalled), test_entry("i", "Ivy", Status::Installed("1.0.0".into())), link]);
+        u.open_store();
+        u.handle(centre(u.layout.store_feature()));
+        assert!(u.store_scroll_max() > 0, "the page is longer than the screen");
+        u.handle(Input::Swipe { dx: 0.0, dy: -400.0, start_y: 1200.0 });
+        assert_eq!(u.store_scroll, 400.min(u.store_scroll_max()));
+        u.handle(Input::Swipe { dx: 0.0, dy: 5000.0, start_y: 600.0 });
+        assert_eq!(u.store_scroll, 0, "scrolling back up stops at the top");
+        // Get installs (the device runs it).
+        let action = u.layout.store_action(0);
+        assert_eq!(u.handle(centre(action)), Action::Device(DeviceCmd::StoreInstall(0)));
+        // Back returns to the store.
+        u.handle(centre(u.layout.store_back()));
+        assert_eq!(u.screen, Screen::Store);
+        // Installed does nothing.
+        u.store_open = Some(1);
+        u.screen = Screen::StoreApp;
+        assert_eq!(u.handle(centre(action)), Action::None);
+        // A link says where the app is.
+        u.store_open = Some(2);
+        u.handle(centre(action));
+        assert!(u.notice.as_deref().unwrap_or("").contains("own website"));
+    }
+
+    #[test]
+    fn builtins_open_screens_and_confirm_leads_to_kindle_mode() {
+        let mut u = ui(2); // settings at slot 2, kindle at slot 3
+        assert_eq!(u.handle(centre(u.layout.cell(2))), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Settings);
+        let done = u.layout.done_button();
+        u.handle(centre(done));
+        assert_eq!(u.screen, Screen::Home);
+        u.handle(centre(u.layout.cell(3)));
+        assert_eq!(u.screen, Screen::ConfirmKindle);
+        let [(_, cancel), (_, open)] = u.layout.confirm_buttons();
+        u.handle(centre(cancel));
+        assert_eq!(u.screen, Screen::Home);
+        u.handle(centre(u.layout.cell(3)));
+        assert_eq!(u.handle(centre(open)), Action::KindleMode);
+    }
+
+    #[test]
+    fn connection_page_gives_ssh_and_dns_commands_and_a_password_screen() {
+        use primitive_keyboard::Key;
+        use crate::layout::Row;
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Connection);
+        let rows: Vec<_> = u.layout.page_sections(Page::Connection).into_iter().flat_map(|s| s.rows).collect();
+        let button = |rw: Row| rows.iter().find(|x| x.row == rw).unwrap().buttons.first().map(|b| b.1);
+        assert_eq!(u.handle(centre(button(Row::Ssh).unwrap())), Action::Device(DeviceCmd::ToggleSsh));
+        assert_eq!(u.handle(centre(button(Row::PublicDns).unwrap())), Action::Device(DeviceCmd::ToggleDns));
+        assert!(button(Row::SshAddress).is_none(), "the address is only shown");
+        // Set with three letters asks for at least six; six letters go to the driver.
+        u.handle(centre(button(Row::SshPassword).unwrap()));
+        assert_eq!(u.screen, Screen::SshPassword);
+        let key = |u: &Ui, k: Key| u.layout.keyboard_keys(u.ssh_password.layer).into_iter().find(|(d, _)| d.key == k).unwrap().1;
+        for c in ['a', 'b', 'c'] {
+            u.handle(centre(key(&u, Key::Char(c))));
+        }
+        u.handle(centre(key(&u, Key::Go)));
+        assert!(u.notice.as_deref().unwrap().contains("6 to 64"));
+        assert_eq!(u.screen, Screen::SshPassword);
+        for c in ['d', 'e', 'f'] {
+            u.handle(centre(key(&u, Key::Char(c))));
+        }
+        assert_eq!(u.handle(centre(key(&u, Key::Go))), Action::SetSshPassword("abcdef".into()));
+        assert_eq!(u.screen, Screen::Page(Page::Connection), "the password is set from the SSH & DNS page");
+    }
+
+    #[test]
+    fn the_device_page_restarts_the_launcher_from_its_own_row() {
+        use crate::layout::Row;
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Device);
+        let rows: Vec<_> = u.layout.page_sections(Page::Device).into_iter().flat_map(|s| s.rows).collect();
+        let restart = rows.iter().find(|r| r.row == Row::Restart).expect("the restart row is on the Device page");
+        assert_eq!(u.handle(centre(restart.buttons[0].1)), Action::Device(DeviceCmd::RestartLauncher));
+    }
+
+    #[test]
+    fn the_usb_state_comes_from_the_cable_and_the_drive() {
+        assert_eq!(Usb::from_device(false, true), Usb::Unplugged);
+        assert_eq!(Usb::from_device(false, false), Usb::Unplugged, "no cable, no drive");
+        assert_eq!(Usb::from_device(true, true), Usb::Charging);
+        assert_eq!(Usb::from_device(true, false), Usb::Drive, "the drive is on the computer: /mnt/us is away");
+    }
+
+    #[test]
+    fn the_drive_screen_takes_no_taps_until_it_ends() {
+        let mut u = ui(1);
+        u.screen = Screen::Settings;
+        let done = centre(u.layout.done_button());
+        u.usb = Usb::Drive;
+        assert_eq!(u.handle(done), Action::None, "no taps while the drive is shown");
+        u.usb = Usb::Charging;
+        assert_eq!(u.handle(done), Action::Redraw { full: false }, "taps work again");
+        assert_eq!(u.screen, Screen::Home);
+    }
+
+    #[test]
+    fn a_key_tap_is_marked_pressed_until_its_action_runs() {
+        use primitive_keyboard::Key;
+        let mut u = ui(1);
+        u.screen = Screen::NetworkName;
+        let (_, r) = u.layout.keyboard_keys_with(u.network_name.layer, "Next").into_iter().find(|(d, _)| d.key == Key::Char('a')).unwrap();
+        let tap = Input::Tap(r.x as f32 + 5.0, r.y as f32 + 5.0);
+        assert!(u.press_feedback(tap), "a key under the finger is marked");
+        assert_eq!(u.pressed_key, Some(r));
+        u.handle(tap);
+        assert_eq!(u.pressed_key, None, "the action clears the mark");
+        assert_eq!(u.network_name.string(), "a");
+        // A tap outside the keyboard marks nothing.
+        u.screen = Screen::Settings;
+        assert!(!u.press_feedback(tap));
+    }
+
+    #[test]
+    fn the_power_tile_opens_a_menu_with_restart_and_power_off() {
+        let mut u = ui(1);
+        u.screen = Screen::QuickSettings;
+        let (_, tile) = u.layout.quick_buttons()[6];
+        assert_eq!(u.handle(centre(u.layout.quick_button_circle(tile))), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::PowerMenu, "the quick panel closes and the menu opens");
+        let [(_, cancel), (_, restart), (_, off)] = u.layout.power_buttons();
+        assert_eq!(u.handle(centre(restart)), Action::Device(DeviceCmd::Restart));
+        assert_eq!(u.handle(centre(off)), Action::Device(DeviceCmd::PowerOff));
+        assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Home, "Cancel goes home");
+    }
+
+    #[test]
+    fn ssh_passwords_have_safe_characters_and_length() {
+        assert!(valid_ssh_password("abc123"));
+        assert!(valid_ssh_password("Kindle-2026_x.@#%+=!"));
+        assert!(!valid_ssh_password("short"));
+        assert!(!valid_ssh_password("has space1"));
+        assert!(!valid_ssh_password("semi;colon1"));
+        assert!(!valid_ssh_password(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn status_strip_opens_settings_and_buttons_give_device_commands() {
+        let mut u = ui(1);
+        u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 40.0 });
+        assert_eq!(u.screen, Screen::QuickSettings, "the status bar opens quick settings");
+        let all = u.layout.quick_button_circle(u.layout.quick_buttons()[5].1);
+        u.handle(centre(all));
+        assert_eq!(u.screen, Screen::Settings);
+        // The Settings list opens the Display page, whose rows give the device commands.
+        let (display, r) = *u.layout.settings_home_rows().iter().find(|(p, _)| *p == Page::Display).unwrap();
+        assert_eq!(display, Page::Display);
+        u.handle(centre(r));
+        assert_eq!(u.screen, Screen::Page(Page::Display));
+        let rows: Vec<_> = u.layout.page_sections(Page::Display).into_iter().flat_map(|s| s.rows).collect();
+        let row = |rw: crate::layout::Row| rows.iter().find(|x| x.row == rw).unwrap().buttons[0].1;
+        assert_eq!(u.handle(centre(rows[0].buttons[1].1)), Action::Device(DeviceCmd::Light(2)));
+        assert_eq!(u.handle(centre(row(crate::layout::Row::Rotation))), Action::Device(DeviceCmd::ToggleRotation));
+        assert_eq!(u.handle(centre(row(crate::layout::Row::DarkMode))), Action::Device(DeviceCmd::ToggleDarkMode));
+        // Wi-Fi and Animation are on their own pages.
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Settings);
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Home);
+        u.screen = Screen::Page(Page::Wifi);
+        let wifi = u.layout.page_sections(Page::Wifi)[0].rows[0].buttons[0].1;
+        assert_eq!(u.handle(centre(wifi)), Action::Device(DeviceCmd::ToggleWifi));
+        u.screen = Screen::Page(Page::Display);
+        let anim = u.layout.page_sections(Page::Display).into_iter().flat_map(|s| s.rows).find(|r| r.row == crate::layout::Row::Animation).unwrap().buttons[0].1;
+        assert_eq!(u.handle(centre(anim)), Action::Device(DeviceCmd::ToggleAnimation));
+    }
+
+    #[test]
+    fn sleep_ignores_input_and_wake_restores_the_screen() {
+        let mut u = ui(1);
+        u.screen = Screen::Settings;
+        assert_eq!(u.handle(Input::Sleep), Action::Redraw { full: true });
+        assert_eq!(u.handle(Input::PageForward), Action::None);
+        assert_eq!(u.handle(Input::Sleep), Action::Redraw { full: true });
+        assert_eq!(u.handle(Input::Wake), Action::Redraw { full: true });
+        assert_eq!(u.screen, Screen::Settings);
+        assert_eq!(u.handle(Input::Wake), Action::None, "a second wake event does nothing");
+    }
+
+    #[test]
+    fn a_low_battery_warning_is_reported_once_and_persists_across_input() {
+        let mut u = ui(1);
+        assert!(!u.set_battery(Some(90), false));
+        assert_eq!(u.battery_message(), None);
+        assert!(u.set_battery(Some(9), false));
+        assert_eq!(u.battery_message().as_deref(), Some("Battery low 9%. Connect the charger soon."));
+        assert!(!u.set_battery(Some(8), false)); // still low: no change to redraw for
+        u.handle(Input::Tap(5.0, 1400.0));
+        assert!(u.battery_message().is_some()); // not a notice: the next input does not clear it
+        assert!(u.set_battery(Some(9), true)); // charger connected
+        assert_eq!(u.battery_message(), None);
+    }
+
+    #[test]
+    fn a_long_press_hides_an_app_and_show_all_brings_it_back() {
+        let mut u = ui(3);
+        let cell = u.layout.cell(0);
+        let (x, y) = (cell.x as f32 + 5.0, cell.y as f32 + 5.0);
+        let before = u.apps().len();
+        let name = u.apps()[0].name.clone();
+        let id = u.apps()[0].id.clone();
+        assert_eq!(u.handle(Input::LongTap(x, y)), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::AppMenu);
+        let hide = menu_row(&u, Button::MenuHide);
+        let action = u.handle(Input::Tap(hide.x as f32 + 10.0, hide.y as f32 + 10.0));
+        assert_eq!(action, Action::SetHidden(vec![(id, true)]));
+        assert_eq!(u.screen, Screen::Home);
+        assert_eq!(u.apps().len(), before - 1);
+        assert_eq!(u.hidden_count(), 1);
+        assert!(u.notice.as_deref().unwrap().contains(&name));
+        u.screen = Screen::Settings;
+        let Action::SetHidden(changes) = u.show_all() else { panic!() };
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].1);
+        assert_eq!(u.apps().len(), before);
+        assert_eq!(u.hidden_count(), 0);
+        assert_eq!(u.show_all(), Action::None);
+    }
+
+    fn tap(u: &mut Ui, r: crate::layout::Rect) -> Action {
+        u.handle(Input::Tap(r.x as f32 + 10.0, r.y as f32 + 10.0))
+    }
+
+    fn open_menu(u: &mut Ui, slot: usize) {
+        let c = u.layout.cell(slot);
+        u.handle(Input::LongTap(c.x as f32 + 5.0, c.y as f32 + 5.0));
+        assert_eq!(u.screen, Screen::AppMenu);
+    }
+
+    /// Tap the app menu's `button`.
+    fn press(u: &mut Ui, button: Button) -> Action {
+        let row = menu_row(u, button);
+        tap(u, row)
+    }
+
+    /// The app menu's row for `button`, beside the edited app's icon.
+    fn menu_row(u: &Ui, button: Button) -> Rect {
+        let actions = u.menu_actions();
+        let i = actions.iter().position(|&b| b == button).expect("action in the menu");
+        u.layout.menu_row(u.menu_anchor(), actions.len(), i)
+    }
+
+    #[test]
+    fn moving_an_app_saves_the_order_of_all_movable_apps() {
+        let mut u = ui(3);
+        let first = u.apps()[0].id.clone();
+        let second = u.apps()[1].id.clone();
+        open_menu(&mut u, 0);
+        let later = menu_row(&u, Button::MenuLater);
+        let Action::SetOrder(order) = tap(&mut u, later) else { panic!("no order saved") };
+        assert_eq!(order[0], (second.clone(), 1));
+        assert_eq!(order[1], (first.clone(), 2));
+        assert_eq!(u.menu, 1);
+        assert!(order.iter().all(|(id, _)| id != "settings" && id != "kindle"));
+        // The menu follows the icon to its new place.
+        assert_eq!(u.menu_anchor(), u.layout.icon(1));
+        // A tap outside the box closes it.
+        assert_eq!(u.handle(Input::Tap(5.0, 5.0)), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Home);
+        assert_eq!(u.apps()[1].id, first);
+    }
+
+    #[test]
+    fn an_app_cannot_move_before_the_first_place_or_past_the_built_ins() {
+        let mut u = ui(1);
+        open_menu(&mut u, 0);
+        let (earlier, later) = (menu_row(&u, Button::MenuEarlier), menu_row(&u, Button::MenuLater));
+        assert_eq!(tap(&mut u, earlier), Action::Redraw { full: false });
+        assert_eq!(u.notice.as_deref(), Some("Already first"));
+        assert_eq!(tap(&mut u, later), Action::Redraw { full: false });
+        assert_eq!(u.notice.as_deref(), Some("Already last"));
+    }
+
+    #[test]
+    fn change_icon_cycles_through_the_files_then_back_to_the_own_icon() {
+        let mut u = ui(1);
+        u.set_icon_choices(vec!["/i/a.png".into(), "/i/b.png".into()]);
+        let id = u.apps()[0].id.clone();
+        open_menu(&mut u, 0);
+        let icon = menu_row(&u, Button::MenuIcon);
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/a.png".into()) });
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/b.png".into()) });
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: None });
+        assert_eq!(u.apps()[0].icon, IconSource::None);
+    }
+
+    #[test]
+    fn change_icon_without_icon_files_explains_where_to_put_them() {
+        let mut u = ui(1);
+        open_menu(&mut u, 0);
+        let icon = menu_row(&u, Button::MenuIcon);
+        assert_eq!(tap(&mut u, icon), Action::Redraw { full: false });
+        assert!(u.notice.as_deref().unwrap().contains("/mnt/us/launcher/icons"));
+    }
+
+    fn menu_items() -> Vec<MenuItem> {
+        let leaf = |name: &str| MenuItem { name: name.into(), command: Some(format!("sh '/e/{name}.sh'")), dir: "/e".into(), priority: 0, background: name == "Sync", children: vec![] };
+        vec![
+            leaf("Alpha"),
+            MenuItem { name: "Tools".into(), command: None, dir: "/e".into(), priority: 0, background: false, children: vec![leaf("Reset"), leaf("Sync")] },
+        ]
+    }
+
+    #[test]
+    fn extensions_add_one_tile_with_the_built_ins() {
+        let mut u = ui(2);
+        u.set_extensions(menu_items());
+        u.set_extensions(menu_items());
+        let ids: Vec<_> = u.apps().iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids.iter().filter(|i| **i == "extensions").count(), 1);
+        let at = ids.iter().position(|i| *i == "extensions").unwrap();
+        assert!(at >= ids.len() - 3, "the Extensions tile sits with the built-ins at the end: {ids:?}");
+        u.set_extensions(vec![]);
+        assert!(!u.apps().iter().any(|a| a.id == "extensions"));
+    }
+
+    #[test]
+    fn the_extensions_list_opens_submenus_runs_items_and_goes_back() {
+        let mut u = ui(1);
+        u.set_extensions(menu_items());
+        assert_eq!(u.open_extensions(), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Extensions);
+        assert_eq!(u.ext_title(), "Extensions");
+        // Open "Tools" (second row).
+        let tools = u.layout.list_row(1);
+        assert_eq!(tap(&mut u, tools), Action::Redraw { full: false });
+        assert_eq!(u.ext_title(), "Tools");
+        assert_eq!(u.ext_depth(), 1);
+        // "Reset" leaves the launcher; "Sync" (exitmenu: false) runs in the background.
+        let reset = u.layout.list_row(0);
+        let Action::Launch(app) = tap(&mut u, reset) else { panic!("no launch") };
+        assert_eq!(app.launch, Launch::Shell { command: "sh '/e/Reset.sh'".into() });
+        let sync = u.layout.list_row(1);
+        let Action::RunBackground(app) = tap(&mut u, sync) else { panic!("not in the background") };
+        assert_eq!(app.name, "Sync");
+        assert_eq!(u.notice.as_deref(), Some("Running Sync…"));
+        assert_eq!(u.screen, Screen::Extensions);
+        // Back goes up a level, then to the grid.
+        let back = u.layout.done_button();
+        assert_eq!(tap(&mut u, back), Action::Redraw { full: false });
+        assert_eq!(u.ext_depth(), 0);
+        tap(&mut u, back);
+        assert_eq!(u.screen, Screen::Home);
+    }
+
+    #[test]
+    fn the_kindle_ui_and_settings_cannot_be_hidden() {
+        let mut u = Ui::new(
+            vec![app("kindle", Launch::KindleMode), app("a.sh", Launch::Script { path: "/d/a.sh".into(), hooks: false })],
+            Layout::new(1264, 1680, 3, 3),
+        );
+        let kindle = u.layout.cell(0);
+        assert_eq!(u.handle(Input::LongTap(kindle.x as f32 + 5.0, kindle.y as f32 + 5.0)), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Home);
+        assert_eq!(u.notice.as_deref(), Some("kindle stays in place"));
+        assert_eq!(u.apps().len(), 2);
+        assert_eq!(u.hidden_count(), 0);
+    }
+
+    #[test]
+    fn moving_across_a_page_turns_the_page_with_the_app() {
+        let mut u = ui(12); // 3 × 3: app8 is the last on page 1
+        open_menu(&mut u, 8);
+        assert!(matches!(press(&mut u, Button::MenuLater), Action::SetOrder(_)));
+        assert_eq!(u.page, 1);
+        assert_eq!(u.menu_anchor(), u.layout.icon(0));
+    }
+
+    #[test]
+    fn the_wifi_page_scans_lists_the_networks_and_scrolls() {
+        use crate::wifi::{Network, WifiInfo};
+        let net = |name: &str, level: u32| Network { name: name.into(), level, max: 5, secured: true, known: false };
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Wifi);
+        let scan = u.layout.wifi_area().scan;
+        assert_eq!(u.handle(centre(scan)), Action::ScanWifi);
+        assert!(u.wifi_scanning);
+        let current = Network { known: true, ..net("Current", 4) };
+        let mut networks: Vec<Network> = (0..30).map(|i| net(&format!("Net {i:02}"), 3)).collect();
+        networks.push(current.clone());
+        u.set_wifi(WifiInfo { current: Some(current), networks });
+        assert!(!u.wifi_scanning);
+        assert_eq!(u.wifi_networks().len(), 30, "the current network is not repeated in the list");
+        let visible = u.layout.wifi_area().visible;
+        assert!((6..30).contains(&visible), "a long list needs scrolling: {visible} rows fit");
+        // A swipe moves about as many rows as it covers; the list stops at its end.
+        u.handle(Input::Swipe { dx: 0.0, dy: -400.0, start_y: 900.0 });
+        assert_eq!(u.wifi_scroll, 3, "400 px covers three rows");
+        for _ in 0..40 {
+            u.handle(Input::Swipe { dx: 0.0, dy: -400.0, start_y: 900.0 });
+        }
+        assert_eq!(u.wifi_scroll, 30 - visible, "scrolls to the last network and stops");
+        u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 900.0 });
+        assert_eq!(u.wifi_scroll, 30 - visible - 3);
+        // Scrolled back to the top, the first network is row 0 of the list.
+        for _ in 0..40 {
+            u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 900.0 });
+        }
+        assert_eq!(u.wifi_scroll, 0);
+        let row = u.layout.network_row(0);
+        u.handle(centre(row));
+        assert_eq!(u.screen, Screen::NetworkDetail, "a network opens its screen");
+        assert_eq!(u.wifi_target.as_ref().map(|n| n.name.as_str()), Some("Net 00"));
+    }
+
+    #[test]
+    fn the_network_screen_follows_a_forget() {
+        use crate::wifi::{Network, WifiInfo};
+        let saved = Network { name: "Home".into(), level: 4, max: 5, secured: true, known: true };
+        let mut u = ui(1);
+        u.set_wifi(WifiInfo { current: None, networks: vec![saved.clone()] });
+        u.screen = Screen::Page(Page::Wifi);
+        u.handle(centre(u.layout.network_row(0)));
+        // The forget finishes: the scan now says the network is not saved.
+        let forgotten = Network { known: false, ..saved };
+        u.set_wifi(WifiInfo { current: None, networks: vec![forgotten] });
+        assert_eq!(u.screen, Screen::NetworkDetail);
+        // Connect now asks for the password, as it does for any new secured network.
+        u.handle(centre(u.layout.net_connect()));
+        assert_eq!(u.screen, Screen::Password, "a forgotten secured network asks for its password again");
+    }
+
+    #[test]
+    fn a_hidden_network_is_joined_by_name_with_or_without_a_password() {
+        use primitive_keyboard::Key;
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Wifi);
+        u.handle(centre(u.layout.wifi_other()));
+        assert_eq!(u.screen, Screen::NetworkName);
+        let key_at = |u: &Ui, k: Key, layer: primitive_keyboard::Layer| -> crate::layout::Rect {
+            u.layout.keyboard_keys(layer).into_iter().find(|(d, _)| d.key == k).unwrap().1
+        };
+        // Next with no name asks for one.
+        let go = key_at(&u, Key::Go, u.network_name.layer);
+        u.handle(centre(go));
+        assert!(u.notice.as_deref().unwrap().contains("name"));
+        for c in ['l', 'a', 'b'] {
+            let r = key_at(&u, Key::Char(c), u.network_name.layer);
+            u.handle(centre(r));
+        }
+        u.handle(centre(go));
+        assert_eq!(u.screen, Screen::Password);
+        assert_eq!(u.wifi_target.as_ref().unwrap().name, "lab");
+        // An empty password joins it as an open network.
+        match u.handle(centre(go)) {
+            Action::JoinWifi { name, secured, password, saved } => {
+                assert_eq!((name.as_str(), secured, saved), ("lab", false, false));
+                assert_eq!(password, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_connected_network_opens_its_screen_to_be_forgotten() {
+        use crate::wifi::{Network, WifiInfo};
+        let current = Network { name: "Home".into(), level: 4, max: 5, secured: true, known: true };
+        let mut u = ui(1);
+        u.set_wifi(WifiInfo { current: Some(current), networks: vec![] });
+        u.screen = Screen::Page(Page::Wifi);
+        u.handle(centre(u.layout.wifi_area().current));
+        assert_eq!(u.screen, Screen::NetworkDetail);
+        assert_eq!(u.handle(centre(u.layout.net_forget())), Action::ForgetWifi("Home".into()));
+    }
+
+    #[test]
+    fn a_new_secured_network_asks_for_a_password_then_joins() {
+        use crate::wifi::{Network, WifiInfo};
+        use primitive_keyboard::{Key, Layer};
+        let net = Network { name: "Cafe".into(), level: 4, max: 5, secured: true, known: false };
+        let mut u = ui(1);
+        u.set_wifi(WifiInfo { current: None, networks: vec![net.clone()] });
+        u.screen = Screen::Page(Page::Wifi);
+        u.handle(centre(u.layout.network_row(0)));
+        assert_eq!(u.screen, Screen::NetworkDetail);
+        u.handle(centre(u.layout.net_connect()));
+        assert_eq!(u.screen, Screen::Password, "a new secured network asks for its password");
+        let key_at = |u: &Ui, k: Key| -> crate::layout::Rect {
+            u.layout.keyboard_keys(u.password.layer).into_iter().find(|(d, _)| d.key == k).unwrap().1
+        };
+        let go = key_at(&u, Key::Go);
+        for c in ['a', 'b', 'c'] {
+            let r = key_at(&u, Key::Char(c));
+            u.handle(centre(r));
+        }
+        assert_eq!(u.password.string(), "abc");
+        // A short password is refused with a notice.
+        assert_eq!(u.handle(centre(go)), Action::Redraw { full: false });
+        assert!(u.notice.as_deref().unwrap().contains("at least"));
+        // Shift makes the next letter a capital, then turns off.
+        let shift = key_at(&u, Key::Shift);
+        u.handle(centre(shift));
+        assert_eq!(u.password.layer, Layer::Upper);
+        let d = key_at(&u, Key::Char('D'));
+        u.handle(centre(d));
+        assert_eq!(u.password.string(), "abcD");
+        assert_eq!(u.password.layer, Layer::Lower, "one capital, then back to lower");
+        for c in ['e', 'f', 'g', 'h'] {
+            let r = key_at(&u, Key::Char(c));
+            u.handle(centre(r));
+        }
+        match u.handle(centre(go)) {
+            Action::JoinWifi { name, secured, password, saved } => {
+                assert_eq!((name.as_str(), secured, saved), ("Cafe", true, false));
+                assert_eq!(password.as_deref(), Some("abcDefgh"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(u.password.text.is_empty(), "the password is not kept after joining");
+        assert_eq!(u.screen, Screen::Page(Page::Wifi));
+    }
+
+    #[test]
+    fn a_saved_network_connects_without_a_password_and_can_be_forgotten() {
+        use crate::wifi::{Network, WifiInfo};
+        let saved = Network { name: "Home".into(), level: 3, max: 5, secured: true, known: true };
+        let mut u = ui(1);
+        u.set_wifi(WifiInfo { current: None, networks: vec![saved] });
+        u.screen = Screen::Page(Page::Wifi);
+        u.handle(centre(u.layout.network_row(0)));
+        assert_eq!(u.handle(centre(u.layout.net_connect())), Action::JoinWifi { name: "Home".into(), secured: true, password: None, saved: true });
+        u.screen = Screen::NetworkDetail;
+        assert_eq!(u.handle(centre(u.layout.net_forget())), Action::ForgetWifi("Home".into()));
+    }
+
+    #[test]
+    fn quick_settings_cards_levels_and_closing() {
+        let mut u = ui(1);
+        u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 40.0 });
+        assert_eq!(u.screen, Screen::QuickSettings);
+        let layout = u.layout;
+        let buttons = layout.quick_buttons();
+        let card = |t: QuickTile| layout.quick_button_circle(buttons.iter().find(|(x, _)| *x == t).unwrap().1);
+        assert_eq!(u.handle(centre(card(QuickTile::Airplane))), Action::Device(DeviceCmd::ToggleWifi));
+        assert_eq!(u.handle(centre(card(QuickTile::AutoRotate))), Action::Device(DeviceCmd::ToggleAutoRotation));
+        assert_eq!(u.handle(centre(card(QuickTile::DarkMode))), Action::Device(DeviceCmd::ToggleDarkMode));
+        assert_eq!(u.handle(centre(card(QuickTile::Animation))), Action::Device(DeviceCmd::ToggleAnimation));
+        assert_eq!(u.handle(centre(card(QuickTile::Ssh))), Action::Device(DeviceCmd::ToggleSsh));
+        assert_eq!(u.handle(centre(card(QuickTile::AllSettings))), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Settings);
+        u.screen = Screen::QuickSettings;
+        assert_eq!(u.handle(centre(u.layout.quick_minus(0))), Action::Device(DeviceCmd::Light(-1)));
+        assert_eq!(u.handle(centre(u.layout.quick_plus(1))), Action::Device(DeviceCmd::Warmth(1)));
+        let bar = u.layout.quick_bar(0);
+        let y = (bar.y + bar.h / 2) as f32;
+        assert_eq!(u.handle(Input::Tap(bar.x as f32 + 1.0, y)), Action::Device(DeviceCmd::SetLight(0)));
+        assert_eq!(u.handle(Input::Tap(bar.right() as f32 - 1.0, y)), Action::Device(DeviceCmd::SetLight(24)));
+        let wifi = u.layout.header_wifi();
+        assert_eq!(u.handle(centre(wifi)), Action::Device(DeviceCmd::ToggleWifi));
+        // Taps do not close it (the handle and outside the sheet are ignored); a swipe up does.
+        assert_eq!(u.handle(centre(u.layout.quick_handle())), Action::None);
+        assert_eq!(u.handle(Input::Tap(600.0, 1600.0)), Action::None);
+        assert_eq!(u.screen, Screen::QuickSettings);
+        u.handle(Input::Swipe { dx: 10.0, dy: -400.0, start_y: 600.0 });
+        assert_eq!(u.screen, Screen::Home);
+        // Swipe down from the middle of the screen does not open it; from the top edge does.
+        u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 600.0 });
+        assert_eq!(u.screen, Screen::Home);
+        u.handle(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 40.0 });
+        assert_eq!(u.screen, Screen::QuickSettings);
+    }
+
+    #[test]
+    fn background_jobs_are_counted_for_the_status_bar() {
+        let mut u = ui(0);
+        let mut job = script("job.sh");
+        job.background = true;
+        u.apps.insert(0, job);
+        assert!(matches!(u.handle(centre(u.layout.cell(0))), Action::RunBackground(_)));
+        assert_eq!(u.running, 1);
+        u.background_done();
+        u.background_done();
+        assert_eq!(u.running, 0);
+    }
+
+    #[test]
+    fn a_critical_battery_goes_to_the_sleep_screen_and_wakes_to_home() {
+        let mut u = ui(1);
+        assert!(u.set_battery(Some(4), false));
+        assert_eq!(u.screen, Screen::Sleep);
+        assert_eq!(u.battery_message().as_deref(), Some("Battery critical 4%. Connect the charger now."));
+        assert_eq!(u.handle(Input::Wake), Action::Redraw { full: true });
+        assert_eq!(u.screen, Screen::Home);
+    }
+
+    #[test]
+    fn a_critical_battery_does_not_interrupt_settings() {
+        let mut u = ui(1);
+        u.screen = Screen::Settings;
+        u.set_battery(Some(4), false);
+        assert_eq!(u.screen, Screen::Settings);
+    }
+
+    #[test]
+    fn the_autostart_row_toggles_the_boot_switch() {
+        let mut u = ui(1);
+        u.screen = Screen::Settings;
+        u.screen = Screen::Page(Page::Device);
+        let row = u.layout.page_sections(Page::Device).into_iter().flat_map(|s| s.rows).find(|r| r.row == crate::layout::Row::Autostart).unwrap();
+        let (_, rect) = row.buttons[0];
+        assert_eq!(u.handle(Input::Tap(rect.x as f32 + 10.0, rect.y as f32 + 10.0)), Action::Device(DeviceCmd::ToggleAutostart));
+    }
+
+    #[test]
+    fn a_notice_is_cleared_by_the_next_input() {
+        let mut u = ui(1);
+        u.notice = Some("apps.toml is not valid".into());
+        assert_eq!(u.handle(Input::Tap(5.0, 1400.0)), Action::Redraw { full: false });
+        assert_eq!(u.notice, None);
+    }
+}

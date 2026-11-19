@@ -1,0 +1,12 @@
+[package]
+name = "kl-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Primitive Store engine: catalog, resolver, verified and safe unpacking, install journal, installed record."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+zip = { version = "2", default-features = false, features = ["deflate"] }

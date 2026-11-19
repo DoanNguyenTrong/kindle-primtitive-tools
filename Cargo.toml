@@ -1,3 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["crates/primitive-keyboard", "crates/primitive-quick", "crates/primitive-net"]
+members = [
+    "crates/primitive-keyboard",
+    "crates/primitive-quick",
+    "crates/primitive-net",
+    "crates/kl-store",
+    "crates/kl-core",
+    "crates/kl-render",
+    "crates/kl-kindle",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only OR PolyForm-Noncommercial-1.0.0"
+
+# The versions of the shared libraries the apps use. Keep them equal to the launcher's and the store's.
+[workspace.dependencies]
+vello_cpu = { version = "0.3", default-features = false, features = ["std", "text", "u8_pipeline"] }
+parley = { version = "=0.12.0", default-features = false, features = ["std"] }
+png = "0.17"
+libc = "0.2"

@@ -1,0 +1,12 @@
+[package]
+name = "kl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+primitive-keyboard = { path = "../primitive-keyboard" }
+primitive-quick = { path = "../primitive-quick" }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+serde_json = "1"
+kl-store = { path = "../kl-store" }

@@ -1,0 +1,24 @@
+//! Platform-free logic of Primitive Launcher: the app list (scriptlets, `apps.toml`, built-ins), the
+//! settings file, the screen layout and the UI state machine. Nothing here touches the Kindle, so all of it
+//! is tested on the Mac.
+
+pub mod apps;
+pub mod base64;
+pub mod battery;
+pub mod config;
+pub mod kual;
+pub mod layout;
+pub mod rotation;
+pub mod scriptlet;
+pub mod settings;
+pub mod store;
+pub mod tz;
+pub mod ui;
+pub mod wifi;
+
+pub use apps::{discover, App, IconSource, Launch};
+pub use config::Config;
+pub use layout::{Layout, Rect};
+pub use settings::{Rotation, Settings};
+pub use ui::{Action, DeviceCmd, Input, Screen, Status, Ui, Usb};
+
