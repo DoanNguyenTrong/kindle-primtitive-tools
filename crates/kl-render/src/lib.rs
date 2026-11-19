@@ -24,6 +24,7 @@ pub use image::GrayImage;
 
 const BLACK: u8 = 0;
 const WHITE: u8 = 255;
+const SYSTEM_NAME: &str = "PrimitiveOS";
 /// The horizontal margin of the Settings cards.
 const MARGIN_X: i32 = 40;
 
@@ -1837,22 +1838,24 @@ impl Renderer {
         }
     }
 
-    /// The About page's card: the launcher's version, apps, memory, storage and Wi-Fi address, as key and value rows.
+    /// System, Launcher version and device details, as key and value rows.
     fn about_card(&mut self, ui: &Ui, s: &Status) {
         let l = ui.layout;
         let top = l.title().bottom() + 24;
-        self.section_header(MARGIN_X, top, "Launcher");
-        let card = Rect::new(MARGIN_X, top + 56, self.width as i32 - 2 * MARGIN_X, 5 * 96);
-        self.card(card);
         let rows = [
-            ("Version", ui.version.clone()),
+            ("System", SYSTEM_NAME.into()),
+            ("Launcher version", ui.version.clone()),
             ("Apps", ui.apps().len().to_string()),
             ("Memory", if s.memory.is_empty() { "unknown".into() } else { s.memory.clone() }),
             ("Storage", s.storage.clone()),
             ("Wi-Fi address", s.ip.clone()),
         ];
+        self.section_header(MARGIN_X, top, "Device information");
+        let row_height = 96;
+        let card = Rect::new(MARGIN_X, top + 56, self.width as i32 - 2 * MARGIN_X, rows.len() as i32 * row_height);
+        self.card(card);
         for (i, (key, value)) in rows.iter().enumerate() {
-            let r = Rect::new(card.x, card.y + i as i32 * 96, card.w, 96);
+            let r = Rect::new(card.x, card.y + i as i32 * row_height, card.w, row_height);
             self.text(Text { text: key, x: (r.x + 32) as f32, y: (r.y + 32) as f32, w: 400.0, size: 32.0, bold: false, align: Align::Start, lines: 1, gray: BLACK });
             self.text(Text { text: value, x: (r.x + 32) as f32, y: (r.y + 32) as f32, w: (r.w - 64) as f32, size: 32.0, bold: true, align: Align::End, lines: 1, gray: BLACK });
             if i + 1 < rows.len() {
@@ -2001,7 +2004,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
         Page::Connection => format!("SSH {} · Public DNS {}", onoff(s.ssh), onoff(s.public_dns)),
         Page::FileTransfer => "Send documents from another device".into(),
         Page::Device => format!("Start with the Kindle {}", onoff(s.autostart)),
-        Page::About => format!("Version {}", ui.version),
+        Page::About => format!("{SYSTEM_NAME} · Launcher {}", ui.version),
     }
 }
 
