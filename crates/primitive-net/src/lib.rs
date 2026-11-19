@@ -27,6 +27,8 @@ impl Policy {
             allowed_hosts: vec![
                 "github.com".into(),
                 "objects.githubusercontent.com".into(),
+                // GitHub sends a release download here, on a signed link, after the github.com redirect.
+                "release-assets.githubusercontent.com".into(),
                 "raw.githubusercontent.com".into(),
                 "doannguyentrong.github.io".into(),
             ],
@@ -266,6 +268,7 @@ mod tests {
         let p = Policy::store(1000);
         assert!(allowed("https://github.com/x/releases/download/v1/a.zip", &p));
         assert!(allowed("https://objects.githubusercontent.com/a", &p));
+        assert!(allowed("https://release-assets.githubusercontent.com/github-production-release-asset/1/x?sig=y", &p));
         assert!(!allowed("https://github.com.evil.example/a", &p), "a look-alike host is refused");
         assert!(!allowed("https://evil.example/github.com", &p));
         assert!(!allowed("https://sub.github.com/a", &p), "a subdomain is not on the list");
