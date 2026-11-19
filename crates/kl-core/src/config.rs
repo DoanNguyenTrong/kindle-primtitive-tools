@@ -23,6 +23,8 @@
 //! id = "kindle"                         # built-in
 //! hidden = true
 //! ```
+//!
+//! A commandless scriptlet override takes effect when its file is present. It can stay in the file after uninstall.
 
 use toml::{Table, Value};
 

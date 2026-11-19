@@ -1,7 +1,7 @@
 //! The app list: built-ins, scriptlets found in `documents/`, and the entries and overrides of
 //! `apps.toml`, merged in that order.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, ffi::OsStr, fs, path::Path};
 
 use crate::{config::Config, scriptlet};
 
@@ -200,6 +200,12 @@ fn builtins() -> Vec<App> {
     ]
 }
 
+fn scriptlet_filename(path: &Path) -> Option<&OsStr> {
+    path.file_name().filter(|name| {
+        path.extension().is_some_and(|extension| extension == "sh") && !name.to_string_lossy().starts_with("._")
+    })
+}
+
 /// The scriptlets in `documents` (the Kindle's `/mnt/us/documents`), sorted by file name. macOS
 /// metadata files (`._*`) and this launcher's own entry are skipped.
 pub fn scriptlets(documents: &Path) -> Vec<App> {
@@ -207,8 +213,7 @@ pub fn scriptlets(documents: &Path) -> Vec<App> {
     let mut files: Vec<_> = dir
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "sh"))
-        .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("._")))
+        .filter(|path| scriptlet_filename(path).is_some())
         .collect();
     files.sort();
     let mut apps = Vec::new();
@@ -250,7 +255,7 @@ pub fn sort_key(a: &App) -> (u8, i64, String) {
 }
 
 /// Merge built-ins, discovered apps and `apps.toml`, and sort. Returns every app (hidden ones too) and
-/// the problems found.
+/// the problems found. A saved scriptlet override stays dormant until that file is present again.
 pub fn merge(discovered: Vec<App>, config: &Config) -> (Vec<App>, Vec<String>) {
     let mut apps = builtins();
     apps.extend(discovered);
@@ -291,7 +296,7 @@ pub fn merge(discovered: Vec<App>, config: &Config) -> (Vec<App>, Vec<String>) {
                 hidden: entry.hidden.unwrap_or(false),
                 background: entry.background.unwrap_or(false),
             });
-        } else {
+        } else if scriptlet_filename(Path::new(&entry.id)).is_none_or(|name| name != entry.id.as_str()) {
             problems.push(format!("apps.toml: no app \"{}\" found and no command given", entry.id));
         }
     }
@@ -514,6 +519,63 @@ mod tests {
         assert!(apps[3].hidden);
         assert_eq!(apps[0].launch, Launch::Shell { command: "/mnt/us/koreader/koreader.sh".into() });
         assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn store_uninstall_keeps_scriptlet_preferences_for_reinstall_without_a_warning() {
+        use kl_store::{catalog::{Firmware, Manifest}, install::{self, Paths, Source}};
+
+        let root = temp_dir("store-scriptlet-preferences");
+        let paths = Paths::under(&root);
+        let manifest = Manifest {
+            schema: 1,
+            id: "primitive-notes".into(),
+            dir: "notes".into(),
+            version: "1.0.0".into(),
+            arch: "armhf".into(),
+            firmware: Firmware { min: "5.16.3".into(), max: None },
+            requires: Default::default(),
+            files: vec!["documents/Notes.sh".into(), "notes/app".into()],
+            hooks: Vec::new(),
+        };
+        let source = Source {
+            manifest: &manifest,
+            source_url: "https://example.com/notes.zip",
+            sha256: "00",
+            installed_at: "2026-11-19",
+        };
+        let install_notes = || {
+            for file in &manifest.files {
+                let staged = paths.staging.join(&manifest.id).join(file);
+                fs::create_dir_all(staged.parent().unwrap()).unwrap();
+                fs::write(staged, "#!/bin/sh\n# Name: Notes\n").unwrap();
+            }
+            install::install(&paths, &source, None).unwrap();
+        };
+        let preferences = root.join("launcher/apps.toml");
+        let saved = "# Keep this preference\n[[app]]\nid = \"Notes.sh\"\nname = \"My Notes\"\norder = 7\nhidden = true\n\
+                     [[app]]\nid = \"Manual.sh\"\ncommand = \"/mnt/us/scripts/manual.sh\"\n";
+        install_notes();
+        fs::write(&preferences, saved).unwrap();
+        let discover_library = || {
+            let config = Config::load(&fs::read_to_string(&preferences).unwrap()).unwrap();
+            discover(&root.join("documents"), &config)
+        };
+        assert!(discover_library().0.iter().any(|app| app.id == "Notes.sh"));
+
+        install::remove(&paths, "primitive-notes").unwrap();
+        let (apps, problems) = discover_library();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(apps.iter().all(|app| app.id != "Notes.sh"));
+        assert!(apps.iter().any(|app| app.id == "Manual.sh" && matches!(app.launch, Launch::Shell { .. })));
+        assert_eq!(fs::read_to_string(&preferences).unwrap(), saved);
+
+        install_notes();
+        let (apps, problems) = discover_library();
+        assert!(problems.is_empty(), "{problems:?}");
+        let notes = apps.iter().find(|app| app.id == "Notes.sh").unwrap();
+        assert_eq!((&*notes.name, notes.order, notes.hidden), ("My Notes", Some(7), true));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
