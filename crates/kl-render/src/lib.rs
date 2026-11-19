@@ -906,7 +906,7 @@ impl Renderer {
             kl_core::store::StoreTab::Search => ("Search", 3),
         };
         self.text(Text { text: title, x: 40.0, y: 50.0, w: (l.width - 80) as f32, size: 84.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        let refresh = if ui.store_busy { "Updating" } else { "Refresh" };
+        let refresh = if ui.store_busy { "Refreshing" } else { "Refresh" };
         self.store_capsule(l.store_refresh(), refresh, false, BLACK);
         self.store_capsule(l.store_done(), "Done", true, BLACK);
         let settings = l.store_settings_button();
@@ -971,8 +971,9 @@ impl Renderer {
 
     /// The notice (what happened: a refresh, an install, a removal), on the store's screens.
     fn store_notice(&mut self, ui: &Ui, y: i32) {
-        if let Some(notice) = ui.notice.clone() {
-            self.text(Text { text: &notice, x: 40.0, y: y as f32, w: (ui.layout.width - 80) as f32, size: 30.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+        let notice = ui.notice.as_deref().or(if ui.store_busy { ui.store_progress.as_deref() } else { None });
+        if let Some(notice) = notice {
+            self.text(Text { text: notice, x: 40.0, y: y as f32, w: (ui.layout.width - 80) as f32, size: 30.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
         }
     }
 

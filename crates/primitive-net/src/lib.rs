@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ureq::http::Uri;
 
 mod resume;
@@ -164,7 +164,12 @@ fn agent(policy: &Policy) -> ureq::Agent {
 /// Opens `url`, following redirects by hand so each target is checked. Returns the final response's status, its URL and
 /// its body reader source.
 fn open(url: &str, policy: &Policy) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
-    let (final_url, resp) = request(url, policy, None)?;
+    successful(request(url, policy, None)?)
+}
+
+fn successful(
+    (final_url, resp): (String, ureq::http::Response<ureq::Body>),
+) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
     if resp.status().as_u16() != 200 {
         return Err(NetError::Status(resp.status().as_u16()));
     }
@@ -172,7 +177,16 @@ fn open(url: &str, policy: &Policy) -> Result<(String, ureq::http::Response<ureq
 }
 
 fn request(url: &str, policy: &Policy, verified_offset: Option<u64>) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
-    let agent = agent(policy);
+    request_with_agent(url, policy, verified_offset, &agent(policy), None)
+}
+
+fn request_with_agent(
+    url: &str,
+    policy: &Policy,
+    verified_offset: Option<u64>,
+    agent: &ureq::Agent,
+    started: Option<Instant>,
+) -> Result<(String, ureq::http::Response<ureq::Body>), NetError> {
     let mut current = url.to_string();
     for _ in 0..=policy.max_redirects {
         let uri = approved_uri(&current, policy).ok_or_else(|| refused_url(&current))?;
@@ -182,6 +196,13 @@ fn request(url: &str, policy: &Policy, verified_offset: Option<u64>) -> Result<(
             if offset > 0 {
                 request = request.header("range", format!("bytes={offset}-"));
             }
+        }
+        if let Some(started) = started {
+            let remaining = policy.timeout.checked_sub(started.elapsed()).ok_or(NetError::Timeout)?;
+            if remaining.is_zero() {
+                return Err(NetError::Timeout);
+            }
+            request = request.config().timeout_global(Some(remaining)).build();
         }
         let resp = request.call().map_err(transport_error)?;
         let status = resp.status().as_u16();
@@ -272,20 +293,56 @@ fn transport_error(error: ureq::Error) -> NetError {
 /// Reads a small text document (a catalog index, a listing) under the same policy, with the same size limit.
 pub fn fetch_text(url: &str, policy: &Policy) -> Result<String, NetError> {
     let (_, resp) = open(url, policy)?;
-    let mut text = String::new();
-    let mut body = resp.into_body();
-    let mut reader = body.with_config().limit(policy.max_bytes).reader();
-    reader.read_to_string(&mut text).map_err(|error| body_error(error, policy.max_bytes))?;
-    Ok(text)
+    read_text(resp, policy.max_bytes)
 }
 
 /// Reads a file (an icon, a screenshot) into memory under the same policy and size limit.
 pub fn fetch_bytes(url: &str, policy: &Policy) -> Result<Vec<u8>, NetError> {
     let (_, resp) = open(url, policy)?;
+    read_bytes(resp, policy.max_bytes)
+}
+
+/// Reuses HTTPS connections for small responses with one timeout for each fetch, including redirects and the body.
+pub struct FetchClient {
+    policy: Policy,
+    agent: ureq::Agent,
+}
+
+impl FetchClient {
+    pub fn new(policy: Policy) -> Self {
+        let agent = agent(&policy);
+        Self { policy, agent }
+    }
+
+    /// Reads UTF-8 text within both the requested limit and the policy ceiling.
+    pub fn fetch_text(&self, url: &str, max_bytes: u64) -> Result<String, NetError> {
+        read_text(self.open(url)?, self.policy.max_bytes.min(max_bytes))
+    }
+
+    /// Reads bytes within both the requested limit and the policy ceiling.
+    pub fn fetch_bytes(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, NetError> {
+        read_bytes(self.open(url)?, self.policy.max_bytes.min(max_bytes))
+    }
+
+    fn open(&self, url: &str) -> Result<ureq::http::Response<ureq::Body>, NetError> {
+        let (_, resp) = successful(request_with_agent(url, &self.policy, None, &self.agent, Some(Instant::now()))?)?;
+        Ok(resp)
+    }
+}
+
+fn read_text(resp: ureq::http::Response<ureq::Body>, limit: u64) -> Result<String, NetError> {
+    let mut text = String::new();
     let mut body = resp.into_body();
-    let mut reader = body.with_config().limit(policy.max_bytes).reader();
+    let mut reader = body.with_config().limit(limit).reader();
+    reader.read_to_string(&mut text).map_err(|error| body_error(error, limit))?;
+    Ok(text)
+}
+
+fn read_bytes(resp: ureq::http::Response<ureq::Body>, limit: u64) -> Result<Vec<u8>, NetError> {
+    let mut body = resp.into_body();
+    let mut reader = body.with_config().limit(limit).reader();
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).map_err(|error| body_error(error, policy.max_bytes))?;
+    reader.read_to_end(&mut bytes).map_err(|error| body_error(error, limit))?;
     Ok(bytes)
 }
 
@@ -423,6 +480,42 @@ mod tests {
         assert_eq!(got, b"hello from the test server, twelve bytes or more".to_vec());
         let too_big = Policy { max_bytes: 10, ..local_policy() };
         assert!(matches!(fetch_bytes(&format!("{base}/file"), &too_big), Err(NetError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn small_responses_reuse_a_connection_and_apply_the_per_fetch_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(stream);
+            for _ in 0..2 {
+                let mut header = String::new();
+                assert!(reader.read_line(&mut header).unwrap() > 2);
+                while header != "\r\n" {
+                    header.clear();
+                    assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                }
+                reader.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntiny").unwrap();
+            }
+        });
+        let url = format!("http://{addr}/file");
+        let client = FetchClient::new(Policy { timeout: Duration::from_secs(3), ..local_policy() });
+        assert_eq!(client.fetch_text(&url, 4).unwrap(), "tiny");
+        assert!(matches!(client.fetch_bytes(&url, 3), Err(NetError::TooLarge { limit: 3 })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn small_responses_keep_the_policy_ceiling_and_redirect_rules() {
+        let (base, _h) = server();
+        let client = FetchClient::new(Policy { max_bytes: 10, ..local_policy() });
+        assert!(matches!(client.fetch_bytes(&format!("{base}/file"), 100), Err(NetError::TooLarge { limit: 10 })));
+        assert!(matches!(client.fetch_bytes(&format!("{base}/redirect-out"), 100), Err(NetError::NotAllowed(host)) if host == "localhost"));
+
+        let client = FetchClient::new(Policy { max_redirects: 0, ..local_policy() });
+        assert!(matches!(client.fetch_bytes(&format!("{base}/redirect-out"), 100), Err(NetError::TooManyRedirects)));
     }
 
     #[test]
