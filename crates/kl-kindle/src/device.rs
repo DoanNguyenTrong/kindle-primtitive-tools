@@ -51,6 +51,23 @@ fn set_int(service: &str, prop: &str, value: u32) -> bool {
     ok
 }
 
+/// Refresh the active idle timer. Leave the persistent screensaver setting alone.
+pub fn refresh_screen_timeout() -> bool {
+    if may_refresh_screen_timeout(
+        &get_text(POWERD, "state"),
+        get_int(POWERD, "preventScreenSaver"),
+        get_int(POWERD, "isCharging"),
+    ) {
+        set_int(POWERD, "touchScreenSaverTimeout", 1)
+    } else {
+        false
+    }
+}
+
+fn may_refresh_screen_timeout(state: &str, inhibited: Option<u32>, charging: Option<u32>) -> bool {
+    state.eq_ignore_ascii_case("active") && inhibited == Some(0) && charging == Some(0)
+}
+
 fn sysfs_text(path: &str) -> String {
     std::fs::read_to_string(path).map(|t| t.trim().to_string()).unwrap_or_default()
 }
@@ -602,6 +619,16 @@ pub fn power_loop(tx: Sender<Ev>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_timeout_refresh_requires_an_active_known_power_state() {
+        assert!(may_refresh_screen_timeout("active", Some(0), Some(0)));
+        assert!(!may_refresh_screen_timeout("screensaver", Some(0), Some(0)));
+        assert!(!may_refresh_screen_timeout("active", Some(1), Some(0)));
+        assert!(!may_refresh_screen_timeout("active", Some(0), Some(1)));
+        assert!(!may_refresh_screen_timeout("active", None, Some(0)));
+        assert!(!may_refresh_screen_timeout("", Some(0), Some(0)));
+    }
 
     #[test]
     fn power_lines_map_to_inputs() {
