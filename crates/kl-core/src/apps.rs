@@ -8,6 +8,7 @@ use crate::{config::Config, scriptlet};
 pub const STORE_ENTRY_FILE: &str = "Store.sh";
 pub const STORE_BINARY: &str = "store/bin/kl-store-app";
 const STORE_NAME: &str = "Store";
+const STORE_ICON: &[u8] = include_bytes!("../../../assets/icons/apps/store.png");
 
 /// Reserved spellings used by the built-in Store tile and standalone library entries.
 pub fn is_store_alias(name: &str) -> bool {
@@ -53,6 +54,9 @@ pub fn store_entry(mut app: App, documents: &Path) -> Option<App> {
 
 fn use_store_script(app: &mut App, documents: &Path) {
     app.name = STORE_NAME.into();
+    if matches!(app.icon, IconSource::None) {
+        app.icon = IconSource::Bundled(STORE_ICON);
+    }
     app.background = false;
     app.dir = documents.to_string_lossy().into_owned();
     app.launch = Launch::Script {
@@ -140,6 +144,27 @@ fn icon_from(value: Option<&str>) -> IconSource {
     }
 }
 
+fn native_icon(file: &str) -> IconSource {
+    let bytes: &[u8] = match file {
+        "Blocks.sh" => include_bytes!("../../../assets/icons/apps/blocks.png"),
+        "Calculator.sh" => include_bytes!("../../../assets/icons/apps/calculator.png"),
+        "Cards.sh" => include_bytes!("../../../assets/icons/apps/cards.png"),
+        "Cascade.sh" => include_bytes!("../../../assets/icons/apps/cascade.png"),
+        "Chess.sh" => include_bytes!("../../../assets/icons/apps/chess.png"),
+        "Crossword.sh" => include_bytes!("../../../assets/icons/apps/crossword.png"),
+        "Focus.sh" => include_bytes!("../../../assets/icons/apps/focus.png"),
+        "Hello.sh" => include_bytes!("../../../assets/icons/apps/hello.png"),
+        "Minesweeper.sh" => include_bytes!("../../../assets/icons/apps/minesweeper.png"),
+        "Notes.sh" => include_bytes!("../../../assets/icons/apps/notes.png"),
+        "Ships.sh" => include_bytes!("../../../assets/icons/apps/ships.png"),
+        "Solitaire.sh" => include_bytes!("../../../assets/icons/apps/solitaire.png"),
+        "Sudoku.sh" => include_bytes!("../../../assets/icons/apps/sudoku.png"),
+        "Words.sh" => include_bytes!("../../../assets/icons/apps/words.png"),
+        _ => return IconSource::None,
+    };
+    IconSource::Bundled(bytes)
+}
+
 fn builtins() -> Vec<App> {
     vec![
         App {
@@ -155,7 +180,7 @@ fn builtins() -> Vec<App> {
         App {
             id: "store".into(),
             name: STORE_NAME.into(),
-            icon: IconSource::None,
+            icon: IconSource::Bundled(STORE_ICON),
             launch: Launch::Store,
             dir: "/".into(),
             order: Some(9_000),
@@ -195,10 +220,15 @@ pub fn scriptlets(documents: &Path) -> Vec<App> {
         }
         let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let icon = if header.icon.is_none() && header.author.as_deref() == Some("Primitive AI") {
+            native_icon(&file)
+        } else {
+            icon_from(header.icon.as_deref())
+        };
         apps.push(App {
             id: file,
             name: header.name.unwrap_or(stem),
-            icon: icon_from(header.icon.as_deref()),
+            icon,
             launch: Launch::Script { path: path.to_string_lossy().into_owned(), hooks: header.use_hooks },
             dir: documents.to_string_lossy().into_owned(),
             order: None,
@@ -360,6 +390,85 @@ mod tests {
         assert_eq!(apps[0].id, "Browser.sh");
         assert!(matches!(&apps[1].launch, Launch::Script { hooks: true, .. }));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_party_scriptlets_and_store_have_distinct_icons() {
+        let dir = temp_dir("bundled-app-icons");
+        let files = [
+            "Blocks.sh", "Calculator.sh", "Cards.sh", "Cascade.sh", "Chess.sh",
+            "Crossword.sh", "Focus.sh", "Hello.sh", "Minesweeper.sh", "Notes.sh",
+            "Ships.sh", "Solitaire.sh", "Sudoku.sh", "Words.sh",
+        ];
+        for file in files {
+            fs::write(dir.join(file), "#!/bin/sh\n# Author: Primitive AI\n").unwrap();
+        }
+        let (apps, problems) = discover(&dir, &Config::default());
+        assert!(problems.is_empty());
+        let mut images = BTreeSet::new();
+        for id in files.into_iter().chain(["store"]) {
+            let app = apps.iter().find(|app| app.id == id).unwrap();
+            let IconSource::Bundled(bytes) = app.icon else { panic!("{id} has no icon") };
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "{id}");
+            assert!(images.insert(bytes), "{id} shares another app's icon");
+        }
+        assert_eq!(images.len(), 15);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_icon_defaults_respect_both_identity_fields_and_overrides() {
+        let dir = temp_dir("app-icon-overrides");
+        for (file, script) in [
+            ("Notes.sh", "# Author: Other Author\n"),
+            ("focus.sh", "# Author: Primitive AI\n"),
+            ("Chess.sh", "# Author: Primitive AI\n# Icon: /mnt/us/chess/custom.png\n"),
+            ("Blocks.sh", "# Author: Primitive AI\n"),
+        ] {
+            fs::write(dir.join(file), script).unwrap();
+        }
+        let (config, _) = Config::parse(
+            "[[app]]\nid = \"Blocks.sh\"\nicon = \"/mnt/us/launcher/icons/blocks-custom.png\"\n",
+        );
+        let (apps, problems) = discover(&dir, &config);
+        assert!(problems.is_empty());
+        let icon = |id| &apps.iter().find(|app| app.id == id).unwrap().icon;
+        assert_eq!(icon("Notes.sh"), &IconSource::None);
+        assert_eq!(icon("focus.sh"), &IconSource::None);
+        assert_eq!(icon("Chess.sh"), &IconSource::File("/mnt/us/chess/custom.png".into()));
+        assert_eq!(icon("Blocks.sh"), &IconSource::File("/mnt/us/launcher/icons/blocks-custom.png".into()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_uses_the_same_icon_before_and_after_installation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("store-icon");
+        let documents = root.join("documents");
+        fs::create_dir(&documents).unwrap();
+        fs::write(documents.join("Primitive Store.sh"), "# Name: Primitive Store\n").unwrap();
+        let icon = |config: &Config| {
+            let (apps, problems) = discover(&documents, config);
+            assert!(problems.is_empty());
+            let store: Vec<_> = apps.iter().filter(|app| is_store_alias(&app.name)).collect();
+            assert_eq!(store.len(), 1);
+            store[0].icon.clone()
+        };
+        assert_eq!(icon(&Config::default()), IconSource::Bundled(STORE_ICON));
+
+        let binary = root.join(STORE_BINARY);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "placeholder").unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["Store", "Primitive Store"] {
+            fs::write(documents.join(STORE_ENTRY_FILE), format!("# Name: {name}\n")).unwrap();
+            assert_eq!(icon(&Config::default()), IconSource::Bundled(STORE_ICON));
+        }
+        let (config, _) = Config::parse("[[app]]\nid = \"Store.sh\"\nicon = \"/mnt/us/store/custom.png\"\n");
+        assert_eq!(icon(&config), IconSource::File("/mnt/us/store/custom.png".into()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn script(id: &str, name: &str) -> App {
