@@ -22,6 +22,14 @@ pub const MAX_PICTURE: u64 = 1024 * 1024;
 /// Screenshots shown per app (the product page has room for two).
 pub const SHOTS_PER_APP: usize = 2;
 
+/// Remove the offline catalog while preserving the installed app record and package staging.
+pub fn clear_cache(launcher: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(launcher.join("store/cache")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Apps whose files were refreshed.

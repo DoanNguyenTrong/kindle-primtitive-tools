@@ -55,6 +55,7 @@ pub enum Page {
     Display,
     Sleep,
     Apps,
+    Store,
     Device,
     About,
 }
@@ -67,7 +68,7 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 8] = [Page::Wifi, Page::Connection, Page::FileTransfer, Page::Display, Page::Sleep, Page::Apps, Page::Device, Page::About];
+    pub const ALL: [Page; 9] = [Page::Wifi, Page::Connection, Page::FileTransfer, Page::Display, Page::Sleep, Page::Apps, Page::Store, Page::Device, Page::About];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -77,6 +78,7 @@ impl Page {
             Page::Display => "Display",
             Page::Sleep => "Sleep",
             Page::Apps => "Apps",
+            Page::Store => "Store",
             Page::Device => "Device",
             Page::About => "About",
         }
@@ -110,6 +112,11 @@ impl Page {
                 footer: "On shows a picture from the launcher's screensavers folder. Off shows the Kindle's screensaver.",
             }],
             Page::Apps => &[Group { header: "Grid", rows: &[Row::Hidden], footer: "Long-press an icon to hide it." }],
+            Page::Store => &[Group {
+                header: "Catalog",
+                rows: &[Row::StoreDailyCheck, Row::StoreClearCache],
+                footer: "The Store checks for updates over Wi-Fi when it opens.",
+            }],
             Page::Device => &[
                 Group { header: "Startup", rows: &[Row::Autostart], footer: "Not active yet: the boot job comes in a later phase." },
                 Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
@@ -124,7 +131,7 @@ impl Page {
 pub const HOME_GROUPS: &[(&str, &[Page])] = &[
     ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
     ("Display", &[Page::Display, Page::Sleep]),
-    ("System", &[Page::Apps, Page::Device, Page::About]),
+    ("System", &[Page::Apps, Page::Store, Page::Device, Page::About]),
 ];
 
 /// A group of the Settings list: its header, its card, and the page rows in it.
@@ -157,6 +164,8 @@ pub enum Button {
     PublicDns,
     Autostart,
     ShowHidden,
+    StoreDailyCheck,
+    StoreClearCache,
     SleepScreen,
     KindleUi,
     /// Settings > Device > Launcher: restart the launcher.
@@ -208,13 +217,15 @@ pub enum Row {
     PublicDns,
     Autostart,
     Hidden,
+    StoreDailyCheck,
+    StoreClearCache,
     SleepScreen,
     KindleUi,
     Restart,
 }
 
 impl Row {
-    pub const ALL: [Row; 16] = [
+    pub const ALL: [Row; 18] = [
         Row::Frontlight,
         Row::Warmth,
         Row::DarkMode,
@@ -228,6 +239,8 @@ impl Row {
         Row::PublicDns,
         Row::Autostart,
         Row::Hidden,
+        Row::StoreDailyCheck,
+        Row::StoreClearCache,
         Row::SleepScreen,
         Row::KindleUi,
         Row::Restart,
@@ -248,6 +261,8 @@ impl Row {
             Row::PublicDns => "Public DNS",
             Row::Autostart => "Start with the Kindle",
             Row::Hidden => "Hidden apps",
+            Row::StoreDailyCheck => "Check for updates daily",
+            Row::StoreClearCache => "Clear saved catalog",
             Row::SleepScreen => "Sleep screen",
             Row::KindleUi => "Kindle UI",
             Row::Restart => "Restart the launcher",
@@ -308,7 +323,7 @@ const TITLE_H: i32 = 130;
 const LIST_ROW_H: i32 = 120;
 /// One setting row (a switch, a value, or two round buttons), and one Settings list row (title and value).
 const ROW_H: i32 = 120;
-const HOME_ROW_H: i32 = 130;
+const HOME_ROW_H: i32 = 120;
 /// Settings sections: the first header's top, a header, the space after a footer, and the footer's height.
 const SECTION_TOP: i32 = 24;
 const SECTION_HEAD_H: i32 = 56;
@@ -360,6 +375,8 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
             (Button::RotationAuto, switch),
         ],
         Row::Hidden => vec![(Button::ShowHidden, Rect::new(r.right() - SWITCH_INSET - 200, r.y + (r.h - SWITCH_H) / 2, 200, SWITCH_H))],
+        Row::StoreDailyCheck => vec![(Button::StoreDailyCheck, r)],
+        Row::StoreClearCache => vec![(Button::StoreClearCache, r)],
         Row::KindleUi => vec![(Button::KindleUi, r)],
         Row::Restart => vec![(Button::Restart, r)],
         Row::Wifi => vec![(Button::Wifi, r)],

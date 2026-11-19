@@ -728,6 +728,30 @@ impl Ui {
         Action::Redraw { full: false }
     }
 
+    fn confirm_clear_store_cache(&mut self, input: Input) -> Action {
+        let [(_, cancel), (_, clear)] = self.layout.confirm_buttons();
+        match input {
+            Input::Tap(x, y) if clear.contains(x, y) => {
+                self.store_clear_confirm = false;
+                if self.store_busy {
+                    self.notice = Some("Wait for the store to finish updating.".to_string());
+                    Action::Redraw { full: true }
+                } else {
+                    Action::Device(DeviceCmd::StoreClearCache)
+                }
+            }
+            Input::PageBack => {
+                self.store_clear_confirm = false;
+                Action::Redraw { full: true }
+            }
+            Input::Tap(x, y) if cancel.contains(x, y) || !self.layout.store_settings_box().contains(x, y) => {
+                self.store_clear_confirm = false;
+                Action::Redraw { full: true }
+            }
+            _ => Action::None,
+        }
+    }
+
     fn store_list_popup(&mut self, input: Input) -> Option<Action> {
         let l = self.layout;
         let tap = match input {
@@ -735,22 +759,12 @@ impl Ui {
             _ => None,
         };
         if self.store_settings_open {
-            let [(_, cancel), (_, done)] = l.confirm_buttons();
+            if self.store_clear_confirm {
+                return Some(self.confirm_clear_store_cache(input));
+            }
+            let [_, (_, done)] = l.confirm_buttons();
             if let Some((x, y)) = tap {
-                if self.store_clear_confirm {
-                    if done.contains(x, y) {
-                        if self.store_busy {
-                            self.notice = Some("Wait for the store to finish updating.".to_string());
-                            return Some(Action::Redraw { full: false });
-                        }
-                        self.store_clear_confirm = false;
-                        return Some(Action::Device(DeviceCmd::StoreClearCache));
-                    }
-                    if cancel.contains(x, y) || !l.store_settings_box().contains(x, y) {
-                        self.store_clear_confirm = false;
-                        return Some(Action::Redraw { full: true });
-                    }
-                } else if l.store_daily_check_button().contains(x, y) {
+                if l.store_daily_check_button().contains(x, y) {
                     return Some(Action::Device(DeviceCmd::StoreToggleDailyCheck));
                 } else if l.store_clear_button().contains(x, y) {
                     if self.store_busy {
@@ -765,11 +779,7 @@ impl Ui {
                 }
             }
             if input == Input::PageBack {
-                if self.store_clear_confirm {
-                    self.store_clear_confirm = false;
-                } else {
-                    self.store_settings_open = false;
-                }
+                self.store_settings_open = false;
                 return Some(Action::Redraw { full: true });
             }
             return Some(Action::None);
@@ -1635,6 +1645,9 @@ impl Ui {
 
     /// One page of Settings: its rows' buttons. Back (or the back key) returns to the Settings list.
     fn settings_page(&mut self, input: Input, page: Page) -> Action {
+        if page == Page::Store && self.store_clear_confirm {
+            return self.confirm_clear_store_cache(input);
+        }
         match input {
             Input::PageBack => self.go(Screen::Settings),
             Input::Swipe { dy, dx, .. } if page == Page::Wifi && dy.abs() > SWIPE_MIN && dy.abs() > dx.abs() => {
@@ -1689,6 +1702,11 @@ impl Ui {
                 }
                 Some(Button::Autostart) => Action::Device(DeviceCmd::ToggleAutostart),
                 Some(Button::ShowHidden) => self.show_all(),
+                Some(Button::StoreDailyCheck) => Action::Device(DeviceCmd::StoreToggleDailyCheck),
+                Some(Button::StoreClearCache) => {
+                    self.store_clear_confirm = true;
+                    Action::Redraw { full: false }
+                }
                 Some(Button::SleepScreen) => Action::Device(DeviceCmd::ToggleSleepScreen),
                 Some(Button::RotationAuto) => Action::Device(DeviceCmd::AutoRotation),
                 Some(Button::DarkMode) => Action::Device(DeviceCmd::ToggleDarkMode),
@@ -1756,6 +1774,26 @@ mod tests {
 
     fn centre(r: crate::Rect) -> Input {
         Input::Tap((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)
+    }
+
+    #[test]
+    fn launcher_settings_can_toggle_daily_checks_and_confirm_clearing_the_catalog() {
+        let mut u = ui(0);
+        u.screen = Screen::Settings;
+        let page = u.layout.settings_home_rows().into_iter().find(|(page, _)| *page == Page::Store).unwrap().1;
+        u.handle(centre(page));
+        assert_eq!(u.screen, Screen::Page(Page::Store));
+        let rows = &u.layout.page_sections(Page::Store)[0].rows;
+        assert_eq!(u.handle(centre(rows[0].rect)), Action::Device(DeviceCmd::StoreToggleDailyCheck));
+        u.handle(centre(rows[1].rect));
+        assert!(u.store_clear_confirm);
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Page(Page::Store));
+        assert!(!u.store_clear_confirm);
+        u.handle(centre(rows[1].rect));
+        let [_, (_, clear)] = u.layout.confirm_buttons();
+        assert_eq!(u.handle(centre(clear)), Action::Device(DeviceCmd::StoreClearCache));
+        assert!(!u.store_clear_confirm);
     }
 
     #[test]

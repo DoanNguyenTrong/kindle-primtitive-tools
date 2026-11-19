@@ -471,6 +471,7 @@ impl Renderer {
             Screen::QuickSettings => Some(l.quick_panel()),
             Screen::StoreApp if ui.store_sheet.is_some() => Some(l.store_sheet()),
             Screen::StoreApp if ui.store_remove_armed.is_some() => Some(l.confirm_box()),
+            Screen::Page(kl_core::layout::Page::Store) if ui.store_clear_confirm => Some(l.store_settings_box()),
             Screen::Store if ui.store_settings_open => Some(l.store_settings_box()),
             Screen::Store if ui.store_category_picker || ui.store_batch_confirm => Some(l.store_sheet()),
             _ => None,
@@ -487,6 +488,7 @@ impl Renderer {
                 Screen::QuickSettings => self.quick_panel(&l, status),
                 Screen::StoreApp if ui.store_sheet.is_some() => self.store_install_sheet(ui),
                 Screen::StoreApp => self.store_remove_dialog(ui),
+                Screen::Page(kl_core::layout::Page::Store) => self.store_settings_dialog(ui),
                 Screen::Store if ui.store_settings_open => self.store_settings_dialog(ui),
                 Screen::Store if ui.store_category_picker => self.store_category_dialog(ui),
                 Screen::Store => self.store_batch_dialog(ui),
@@ -1723,6 +1725,7 @@ impl Renderer {
                 Button::Ssh => self.switch(switch_rect(r), s.ssh),
                 Button::Autostart => self.switch(switch_rect(r), s.autostart),
                 Button::SleepScreen => self.switch(switch_rect(r), s.sleep_launcher),
+                Button::StoreDailyCheck => self.switch(switch_rect(r), ui.store_daily_check),
                 _ => {}
             }
         }
@@ -1955,6 +1958,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
         Page::Display => format!("Frontlight {} · Dark mode {} · Animation {}", s.light, onoff(s.dark_mode), onoff(s.animation)),
         Page::Sleep => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },
         Page::Apps => format!("{} hidden", ui.hidden_count()),
+        Page::Store => format!("Daily update check {}", onoff(ui.store_daily_check)),
         Page::Connection => format!("SSH {} · Public DNS {}", onoff(s.ssh), onoff(s.public_dns)),
         Page::FileTransfer => "Send documents from another device".into(),
         Page::Device => format!("Start with the Kindle {}", onoff(s.autostart)),
@@ -1997,6 +2001,8 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
             n => format!("{n} hidden"),
         },
         Row::KindleUi => "Stock Kindle UI".into(),
+        Row::StoreDailyCheck => if ui.store_daily_check { "On".into() } else { "Off".into() },
+        Row::StoreClearCache => "Remove offline catalog data".into(),
         Row::Restart => "Tap to restart".into(),
     }
 }
