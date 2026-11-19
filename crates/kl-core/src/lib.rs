@@ -11,6 +11,7 @@ pub mod layout;
 pub mod rotation;
 pub mod scriptlet;
 pub mod settings;
+pub mod storage_lease;
 pub mod store;
 pub mod store_open;
 pub mod tz;
