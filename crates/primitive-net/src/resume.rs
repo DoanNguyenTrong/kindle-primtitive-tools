@@ -7,7 +7,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use ureq::{http::Response, Body};
 
-use super::{allowed, body_error, request, Download, NetError, Policy};
+use super::{allowed, body_error, refused_url, request, Download, NetError, Policy};
 
 /// Downloads a package of the exact catalog size and SHA-256. On a transient failure the partial
 /// bytes are available for the next call. The destination is replaced only after verification.
@@ -20,7 +20,7 @@ pub fn download_resumable(
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Download, NetError> {
     if !allowed(url, policy) {
-        return Err(NetError::NotAllowed(url.to_string()));
+        return Err(refused_url(url));
     }
     if expected_size > policy.max_bytes {
         return Err(NetError::TooLarge {

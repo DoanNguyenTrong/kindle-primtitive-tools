@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
+use ureq::http::Uri;
 
 mod resume;
 pub use resume::download_resumable;
@@ -45,7 +46,7 @@ impl Policy {
 
 #[derive(Debug)]
 pub enum NetError {
-    /// The URL or a redirect points at a host not on the list, or at plain HTTP.
+    /// The URL or a redirect violates the policy. Contains only the host or a generic label.
     NotAllowed(String),
     TooLarge { limit: u64 },
     Status(u16),
@@ -62,7 +63,7 @@ pub enum NetError {
 impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NetError::NotAllowed(u) => write!(f, "the download is not from an allowed host: {u}"),
+            NetError::NotAllowed(host) => write!(f, "the download URL is not allowed: {host}"),
             NetError::TooLarge { limit } => write!(f, "the download is larger than {limit} bytes"),
             NetError::Status(s) => write!(f, "the server answered with status {s}"),
             NetError::TooManyRedirects => write!(f, "too many redirects"),
@@ -85,31 +86,39 @@ impl From<std::io::Error> for NetError {
 
 /// The host of a URL, lower case, without user information or port. `None` for anything that is not `scheme://host…`.
 pub fn host_of(url: &str) -> Option<(String, String)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if let Some(stripped) = host_port.strip_prefix('[') {
-        stripped.split(']').next()?
-    } else {
-        host_port.split(':').next()?
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some((scheme, host.to_ascii_lowercase()))
+    let uri = url.parse::<Uri>().ok()?;
+    Some((uri.scheme_str()?.to_ascii_lowercase(), normalize_host(uri.host()?)))
 }
 
-/// Whether `url` may be fetched under `policy`: the host is on the list, and the scheme is HTTPS (or plain HTTP when the
-/// policy allows it).
+fn normalize_host(host: &str) -> String {
+    let literal = host.strip_prefix('[').and_then(|host| host.strip_suffix(']'));
+    literal.filter(|host| host.parse::<std::net::Ipv6Addr>().is_ok()).unwrap_or(host).to_ascii_lowercase()
+}
+
+/// Whether `url` may be fetched under `policy`: exact approved host and no credentials.
+/// Production HTTPS uses the default port. Tests can allow HTTP on a temporary port.
 pub fn allowed(url: &str, policy: &Policy) -> bool {
-    match host_of(url) {
-        Some((scheme, host)) => {
-            let scheme_ok = scheme == "https" || (scheme == "http" && policy.allow_plain_http);
-            scheme_ok && policy.allowed_hosts.contains(&host)
-        }
-        None => false,
+    approved_uri(url, policy).is_some()
+}
+
+fn approved_uri(url: &str, policy: &Policy) -> Option<Uri> {
+    let uri = url.parse::<Uri>().ok()?;
+    let authority = uri.authority()?;
+    let port = authority.port().filter(|port| port.as_str().bytes().all(|byte| byte.is_ascii_digit()));
+    if authority.as_str().contains('@') || (authority.as_str() != authority.host() && port.is_none()) {
+        return None;
     }
+    let allowed_scheme = match uri.scheme_str()? {
+        "https" => port.is_none_or(|port| port.as_u16() == 443),
+        "http" => policy.allow_plain_http,
+        _ => false,
+    };
+    (allowed_scheme && policy.allowed_hosts.contains(&normalize_host(authority.host()))).then_some(uri)
+}
+
+fn refused_url(url: &str) -> NetError {
+    let host = host_of(url).map_or_else(|| "invalid URL".to_string(), |(_, host)| host);
+    NetError::NotAllowed(host)
 }
 
 /// Resolves a redirect's `Location` against the URL that produced it.
@@ -166,20 +175,15 @@ fn request(url: &str, policy: &Policy, verified_offset: Option<u64>) -> Result<(
     let agent = agent(policy);
     let mut current = url.to_string();
     for _ in 0..=policy.max_redirects {
-        if !allowed(&current, policy) {
-            return Err(NetError::NotAllowed(current));
-        }
-        let mut request = agent.get(&current);
+        let uri = approved_uri(&current, policy).ok_or_else(|| refused_url(&current))?;
+        let mut request = agent.get(uri);
         if let Some(offset) = verified_offset {
             request = request.header("accept-encoding", "identity");
             if offset > 0 {
                 request = request.header("range", format!("bytes={offset}-"));
             }
         }
-        let resp = request.call().map_err(|error| match error {
-            ureq::Error::Timeout(_) => NetError::Timeout,
-            _ => NetError::Transport(error.to_string()),
-        })?;
+        let resp = request.call().map_err(transport_error)?;
         let status = resp.status().as_u16();
         if (300..400).contains(&status) {
             let location = resp
@@ -245,13 +249,23 @@ pub fn download(
 }
 
 fn body_error(error: std::io::Error, limit: u64) -> NetError {
-    let message = error.to_string();
-    if error.kind() == std::io::ErrorKind::TimedOut || message.starts_with("timeout:") {
-        NetError::Timeout
-    } else if message.contains("limit") {
-        NetError::TooLarge { limit }
-    } else {
-        NetError::Transport(message)
+    match ureq::Error::from(error) {
+        ureq::Error::BodyExceedsLimit(_) => NetError::TooLarge { limit },
+        error => transport_error(error),
+    }
+}
+
+fn transport_error(error: ureq::Error) -> NetError {
+    // Client and response errors may include the request URL or remote text. Log only known details.
+    match error {
+        ureq::Error::Timeout(_) => NetError::Timeout,
+        ureq::Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => NetError::Timeout,
+        ureq::Error::Io(error) => NetError::Transport(error.kind().to_string()),
+        ureq::Error::HostNotFound => NetError::Transport("host not found".into()),
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
+            NetError::Transport("could not establish a secure connection".into())
+        }
+        _ => NetError::Transport("could not read a response from the server".into()),
     }
 }
 
@@ -304,6 +318,25 @@ mod tests {
     }
 
     #[test]
+    fn production_urls_require_the_default_https_port_and_no_userinfo() {
+        let policy = Policy::store(1000);
+        assert!(allowed("https://GitHub.com:443/files", &policy));
+        for url in [
+            "https://github.com:8443/files",
+            "https://github.com:missing/files",
+            "https://github.com:65536/files",
+            "https://github.com:+443/files",
+            "https://[github.com]/files",
+            "https://reviewer@github.com/files",
+            "https://reviewer:fixture-password@github.com/files",
+        ] {
+            assert!(!allowed(url, &policy));
+        }
+        assert!(allowed("http://127.0.0.1:12345/file", &local_policy()));
+        assert!(!allowed("http://reviewer@127.0.0.1:12345/file", &local_policy()));
+    }
+
+    #[test]
     fn resolves_redirect_locations() {
         assert_eq!(resolve("https://github.com/a/b", "https://objects.githubusercontent.com/x"), "https://objects.githubusercontent.com/x");
         assert_eq!(resolve("https://github.com/a/b", "/c/d"), "https://github.com/c/d");
@@ -335,7 +368,7 @@ mod tests {
                     "/file" => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes()
                         .into_iter().chain(body.clone()).collect::<Vec<u8>>(),
                     "/big" => b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n".to_vec(),
-                    "/redirect-out" => b"HTTP/1.1 302 Found\r\nLocation: http://localhost:1/elsewhere\r\nConnection: close\r\n\r\n".to_vec(),
+                    "/redirect-out" => b"HTTP/1.1 302 Found\r\nLocation: http://localhost:1/elsewhere?sig=fixture-signature\r\nConnection: close\r\n\r\n".to_vec(),
                     _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
                 };
                 let _ = stream.write_all(&response);
@@ -378,8 +411,9 @@ mod tests {
     fn refuses_a_redirect_to_a_host_not_on_the_list() {
         let (base, _h) = server();
         let dir = std::env::temp_dir().join(format!("pn-redir-{}", std::process::id()));
-        let r = download(&format!("{base}/redirect-out"), &dir.join("x"), &local_policy(), |_, _| {});
-        assert!(matches!(r, Err(NetError::NotAllowed(_))), "{r:?}");
+        let error = download(&format!("{base}/redirect-out"), &dir.join("x"), &local_policy(), |_, _| {}).unwrap_err();
+        assert!(matches!(&error, NetError::NotAllowed(host) if host == "localhost"));
+        assert!(!format!("{error} {error:?}").contains("fixture-signature"));
     }
 
     #[test]
@@ -393,7 +427,25 @@ mod tests {
 
     #[test]
     fn refuses_a_url_outside_the_list_without_connecting() {
-        let r = fetch_text("https://evil.example/x", &Policy::store(100));
-        assert!(matches!(r, Err(NetError::NotAllowed(_))));
+        let url = "https://fixture-user:fixture-password@github.com/file?token=fixture-token";
+        let policy = Policy::store(100);
+        let fetch_error = fetch_text(url, &policy).unwrap_err();
+        let dest = std::env::temp_dir().join("unused-store-network-fixture.zip");
+        let resume_error = download_resumable(url, &dest, &policy, 5, &"a".repeat(64), |_, _| {}).unwrap_err();
+        for error in [fetch_error, resume_error] {
+            assert!(matches!(&error, NetError::NotAllowed(host) if host == "github.com"));
+            assert!(!format!("{error} {error:?}").contains("fixture-"));
+        }
+    }
+
+    #[test]
+    fn transport_errors_omit_details_from_the_client_and_response() {
+        let uri = "https://release-assets.githubusercontent.com/file?sig=fixture-signature";
+        let request_error = transport_error(ureq::Error::BadUri(uri.into()));
+        let response_error = body_error(std::io::Error::new(std::io::ErrorKind::InvalidData, uri), 100);
+        for error in [request_error, response_error] {
+            assert!(matches!(error, NetError::Transport(_)));
+            assert!(!format!("{error} {error:?}").contains("fixture-signature"));
+        }
     }
 }
