@@ -47,6 +47,7 @@ pub enum NetError {
     TooLarge { limit: u64 },
     Status(u16),
     TooManyRedirects,
+    Timeout,
     Transport(String),
     Io(std::io::Error),
 }
@@ -58,6 +59,7 @@ impl fmt::Display for NetError {
             NetError::TooLarge { limit } => write!(f, "the download is larger than {limit} bytes"),
             NetError::Status(s) => write!(f, "the server answered with status {s}"),
             NetError::TooManyRedirects => write!(f, "too many redirects"),
+            NetError::Timeout => write!(f, "the download took too long"),
             NetError::Transport(e) => write!(f, "the download failed: {e}"),
             NetError::Io(e) => write!(f, "cannot write the download: {e}"),
         }
@@ -148,7 +150,10 @@ fn open(url: &str, policy: &Policy) -> Result<(String, ureq::http::Response<ureq
         if !allowed(&current, policy) {
             return Err(NetError::NotAllowed(current));
         }
-        let resp = agent.get(&current).call().map_err(|e| NetError::Transport(e.to_string()))?;
+        let resp = agent.get(&current).call().map_err(|error| match error {
+            ureq::Error::Timeout(_) => NetError::Timeout,
+            _ => NetError::Transport(error.to_string()),
+        })?;
         let status = resp.status().as_u16();
         if (300..400).contains(&status) {
             let location = resp
@@ -189,29 +194,42 @@ pub fn download(
         fs::create_dir_all(parent)?;
     }
     let part = dest.with_extension("part");
-    let mut out = File::create(&part)?;
-    let mut body = resp.into_body();
-    let mut reader = body.with_config().limit(policy.max_bytes).reader();
-    let mut buf = [0u8; 32 * 1024];
-    let mut bytes = 0u64;
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                let _ = fs::remove_file(&part);
-                let msg = e.to_string();
-                return Err(if msg.contains("limit") { NetError::TooLarge { limit: policy.max_bytes } } else { NetError::Transport(msg) });
+    let result = (|| {
+        let mut out = File::create(&part)?;
+        let mut body = resp.into_body();
+        let limit = policy.max_bytes;
+        let mut reader = body.with_config().limit(limit).reader();
+        let mut buf = [0u8; 32 * 1024];
+        let mut bytes = 0u64;
+        loop {
+            let n = reader.read(&mut buf).map_err(|error| body_error(error, limit))?;
+            if n == 0 {
+                break;
             }
-        };
-        out.write_all(&buf[..n])?;
-        bytes += n as u64;
-        progress(bytes, total);
+            out.write_all(&buf[..n])?;
+            bytes += n as u64;
+            progress(bytes, total);
+        }
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&part, dest)?;
+        Ok(Download { bytes, final_url })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
     }
-    out.sync_all()?;
-    drop(out);
-    fs::rename(&part, dest)?;
-    Ok(Download { bytes, final_url })
+    result
+}
+
+fn body_error(error: std::io::Error, limit: u64) -> NetError {
+    let message = error.to_string();
+    if error.kind() == std::io::ErrorKind::TimedOut || message.starts_with("timeout:") {
+        NetError::Timeout
+    } else if message.contains("limit") {
+        NetError::TooLarge { limit }
+    } else {
+        NetError::Transport(message)
+    }
 }
 
 /// Reads a small text document (a catalog index, a listing) under the same policy, with the same size limit.
@@ -220,14 +238,7 @@ pub fn fetch_text(url: &str, policy: &Policy) -> Result<String, NetError> {
     let mut text = String::new();
     let mut body = resp.into_body();
     let mut reader = body.with_config().limit(policy.max_bytes).reader();
-    reader.read_to_string(&mut text).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("limit") {
-            NetError::TooLarge { limit: policy.max_bytes }
-        } else {
-            NetError::Transport(msg)
-        }
-    })?;
+    reader.read_to_string(&mut text).map_err(|error| body_error(error, policy.max_bytes))?;
     Ok(text)
 }
 
@@ -237,14 +248,7 @@ pub fn fetch_bytes(url: &str, policy: &Policy) -> Result<Vec<u8>, NetError> {
     let mut body = resp.into_body();
     let mut reader = body.with_config().limit(policy.max_bytes).reader();
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("limit") {
-            NetError::TooLarge { limit: policy.max_bytes }
-        } else {
-            NetError::Transport(msg)
-        }
-    })?;
+    reader.read_to_end(&mut bytes).map_err(|error| body_error(error, policy.max_bytes))?;
     Ok(bytes)
 }
 

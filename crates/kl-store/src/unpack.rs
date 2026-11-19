@@ -9,6 +9,9 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const RESERVED: [&str; 6] = ["documents", "extensions", "system", "fonts", "screensaver", "koreader"];
+
 /// Limits on a package. A Kindle has a few hundred megabytes free; a package is refused past these.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -33,6 +36,7 @@ pub enum UnpackError {
     Io(io::Error),
     NotInManifest(String),
     MissingFromPackage(String),
+    DuplicateFile(String),
     ReservedPlace(String),
     BadManifest(String),
 }
@@ -49,6 +53,7 @@ impl fmt::Display for UnpackError {
             UnpackError::Io(e) => write!(f, "cannot write the package: {e}"),
             UnpackError::NotInManifest(n) => write!(f, "{n} is in the package but not in its manifest"),
             UnpackError::MissingFromPackage(n) => write!(f, "{n} is in the manifest but not in the package"),
+            UnpackError::DuplicateFile(n) => write!(f, "{n} appears more than once in the package"),
             UnpackError::ReservedPlace(n) => write!(f, "{n} is outside the places an app may use"),
             UnpackError::BadManifest(e) => write!(f, "the manifest is not valid: {e}"),
         }
@@ -84,14 +89,23 @@ pub fn is_safe_relative(name: &str) -> bool {
 /// Whether an installed path is in a place a module may write to: its own folder (`dir/`), its KUAL extension
 /// (`extensions/dir/`), or the library entries (`documents/`). Reserved folders are never allowed.
 pub fn is_allowed_place(name: &str, dir: &str) -> bool {
-    const RESERVED: [&str; 6] = ["documents", "extensions", "system", "fonts", "screensaver", "koreader"];
+    if !valid_module_dir(dir) {
+        return false;
+    }
     let mut parts = name.splitn(3, '/');
     let first = parts.next().unwrap_or("");
     match first {
         "documents" => parts.next().is_some(),
         "extensions" => parts.next() == Some(dir) && parts.next().is_some(),
-        other => other == dir && !RESERVED.contains(&other) && parts.next().is_some(),
+        "launcher" if parts.next().is_some_and(|part| part.eq_ignore_ascii_case("store")) => false,
+        other => other == dir && name.contains('/'),
     }
+}
+
+pub fn valid_module_dir(dir: &str) -> bool {
+    !dir.is_empty() && !dir.starts_with('-') && dir.len() <= 40
+        && dir.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !RESERVED.contains(&dir)
 }
 
 /// Unpacks a package into `dest` and checks it against `manifest`. Returns the installed file names, relative to the
@@ -106,7 +120,8 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
     // First pass: every name, the top folder, the sizes and the links, before anything is written.
     let mut top: Option<String> = None;
     let mut total = 0u64;
-    let mut entries: Vec<(usize, String, bool)> = Vec::new();
+    let mut entries: Vec<(usize, String)> = Vec::new();
+    let mut names = BTreeSet::new();
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| UnpackError::Zip(e.to_string()))?;
         let name = entry.name().to_string();
@@ -115,6 +130,9 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
         }
         if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return Err(UnpackError::Symlink(name));
+        }
+        if !names.insert(name.trim_end_matches('/').to_ascii_lowercase()) {
+            return Err(UnpackError::DuplicateFile(name));
         }
         let (folder, rest) = name.split_once('/').unwrap_or((name.as_str(), ""));
         if !rest.is_empty() && !is_safe_relative(rest) {
@@ -132,7 +150,7 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
         if total > limits.max_total_bytes {
             return Err(UnpackError::TooLarge { limit: limits.max_total_bytes });
         }
-        entries.push((i, rest.to_string(), false));
+        entries.push((i, rest.to_string()));
     }
     top.ok_or_else(|| UnpackError::Zip("the package is empty".into()))?;
 
@@ -145,7 +163,8 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
 
     // Second pass: write the files.
     let mut written: Vec<String> = Vec::new();
-    for (i, rest, _) in &entries {
+    let mut remaining = limits.max_total_bytes;
+    for (i, rest) in &entries {
         let mut entry = archive.by_index(*i).map_err(|e| UnpackError::Zip(e.to_string()))?;
         if rest.is_empty() || is_package_only(rest) {
             continue;
@@ -162,6 +181,8 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
             if n == 0 {
                 break;
             }
+            remaining = remaining.checked_sub(n as u64)
+                .ok_or(UnpackError::TooLarge { limit: limits.max_total_bytes })?;
             out_file.write_all(&buf[..n])?;
         }
         drop(out_file);
@@ -176,6 +197,9 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
 
     // The files must match the manifest exactly.
     let listed: BTreeSet<&str> = manifest.files.iter().map(String::as_str).collect();
+    if listed.len() != manifest.files.len() {
+        return Err(UnpackError::BadManifest("a file appears twice in the manifest".into()));
+    }
     let present: BTreeSet<&str> = written.iter().map(String::as_str).collect();
     if let Some(extra) = present.difference(&listed).next() {
         return Err(UnpackError::NotInManifest((*extra).to_string()));
@@ -190,14 +214,27 @@ pub fn unpack(zip_path: &Path, dest: &Path, manifest: &Manifest, limits: Limits)
 pub fn read_manifest(zip_path: &Path) -> Result<Manifest, UnpackError> {
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| UnpackError::Zip(e.to_string()))?;
-    let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
-        .filter(|n| n.ends_with("/manifest.json") && n.matches('/').count() == 1)
-        .collect();
-    let name = names.first().ok_or_else(|| UnpackError::BadManifest("no manifest.json at the top folder".into()))?;
-    let mut entry = archive.by_name(name).map_err(|e| UnpackError::Zip(e.to_string()))?;
+    let file_limit = Limits::default().max_files;
+    if archive.len() > file_limit {
+        return Err(UnpackError::TooManyFiles { limit: file_limit });
+    }
+    let mut manifest = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|e| UnpackError::Zip(e.to_string()))?;
+        let name = entry.name();
+        if !name.ends_with("/manifest.json") || name.matches('/').count() != 1 {
+            continue;
+        }
+        if manifest.replace(index).is_some() {
+            return Err(UnpackError::BadManifest("more than one manifest.json".into()));
+        }
+    }
+    let index = manifest.ok_or_else(|| UnpackError::BadManifest("no manifest.json at the top folder".into()))?;
+    let entry = archive.by_index(index).map_err(|e| UnpackError::Zip(e.to_string()))?;
     let mut text = String::new();
-    entry.read_to_string(&mut text)?;
+    if entry.size() > MAX_MANIFEST_BYTES || entry.take(MAX_MANIFEST_BYTES + 1).read_to_string(&mut text)? as u64 > MAX_MANIFEST_BYTES {
+        return Err(UnpackError::TooLarge { limit: MAX_MANIFEST_BYTES });
+    }
     serde_json::from_str(&text).map_err(|e| UnpackError::BadManifest(e.to_string()))
 }
 
@@ -361,6 +398,9 @@ mod tests {
         assert!(!is_allowed_place("terminal/kt", "browser"));
         assert!(!is_allowed_place("extensions/terminal/x", "browser"));
         assert!(!is_allowed_place("browser", "browser"));
+        assert!(!is_allowed_place("launcher/STORE/installed.json", "launcher"));
+        assert!(!is_allowed_place("documents/Protected.sh", "koreader"));
+        assert!(is_allowed_place("launcher/kl-launcher", "launcher"));
     }
 }
 

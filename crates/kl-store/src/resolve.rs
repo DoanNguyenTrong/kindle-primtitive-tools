@@ -31,6 +31,9 @@ impl fmt::Display for ResolveError {
         match self {
             ResolveError::NotInstallable => write!(f, "this app is listed by link and is not installed by the store"),
             ResolveError::NoArch(arch) => write!(f, "no version is built for this Kindle ({arch})"),
+            ResolveError::NoFirmware { need } if need.is_empty() => {
+                write!(f, "no version supports this Kindle firmware")
+            }
             ResolveError::NoFirmware { need } => write!(f, "needs Kindle firmware {need} or later"),
             ResolveError::AllWithdrawn => write!(f, "every version for this Kindle has been withdrawn"),
         }
@@ -61,17 +64,18 @@ pub fn pick_version<'a>(listing: &'a Listing, device: &Device) -> Result<&'a Ver
     let mut lowest_need: Option<String> = None;
     for (_, v) in &live {
         let min = Version::parse(&v.firmware.min);
-        let max = v.firmware.max.as_deref().and_then(Version::parse);
         let fits_min = min.as_ref().is_some_and(|m| device.firmware >= *m);
-        let fits_max = max.as_ref().is_none_or(|m| device.firmware <= *m);
+        let fits_max = v.firmware.max.as_deref().is_none_or(|max| {
+            Version::parse(max).is_some_and(|max| device.firmware <= max)
+        });
         if fits_min && fits_max {
             return Ok(v);
         }
-        if !fits_min && lowest_need.as_ref().is_none_or(|n| min.as_ref() < Version::parse(n).as_ref()) {
+        if fits_max && min.is_some() && !fits_min && lowest_need.as_ref().is_none_or(|n| min.as_ref() < Version::parse(n).as_ref()) {
             lowest_need = Some(v.firmware.min.clone());
         }
     }
-    Err(ResolveError::NoFirmware { need: lowest_need.unwrap_or_else(|| "a newer one".into()) })
+    Err(ResolveError::NoFirmware { need: lowest_need.unwrap_or_default() })
 }
 
 /// The requirements that are not met, as `(app id, needed range, installed version or none)`.
@@ -84,10 +88,11 @@ pub fn missing_requirements(
     requires
         .iter()
         .filter_map(|(id, range)| {
-            let need = Version::parse(range.trim_start_matches(">="))?;
-            match installed(id) {
-                Some(have) if have >= need => None,
-                have => Some((id.clone(), range.clone(), have)),
+            let have = installed(id);
+            let need = range.strip_prefix(">=").and_then(Version::parse);
+            match (&have, need) {
+                (Some(have), Some(need)) if *have >= need => None,
+                _ => Some((id.clone(), range.clone(), have)),
             }
         })
         .collect()

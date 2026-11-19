@@ -46,7 +46,13 @@ impl Record {
 /// Loads the record; a missing file is an empty record. A file that cannot be read is an error, never silently empty.
 pub fn load(path: &Path) -> io::Result<Record> {
     match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Ok(text) => {
+            let record: Record = serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if record.schema != SCHEMA {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "the Store record has an unsupported version"));
+            }
+            Ok(record)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Record::new()),
         Err(e) => Err(e),
     }
