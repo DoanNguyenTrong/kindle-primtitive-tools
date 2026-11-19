@@ -28,7 +28,7 @@ impl StoreTab {
 }
 
 pub const STORE_ID: &str = "primitive-store";
-pub const LAUNCHER_ID: &str = "primitive-launcher";
+pub use kl_store::install::LAUNCHER_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionNotes {

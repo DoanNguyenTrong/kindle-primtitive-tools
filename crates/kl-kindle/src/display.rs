@@ -15,6 +15,7 @@ const H: u32 = profile::ACTIVE.screen_h;
 pub struct Display {
     panel: Option<eink::Panel>,
     last: Vec<u8>,
+    presented_frame: bool,
 }
 
 impl Display {
@@ -26,11 +27,15 @@ impl Display {
                 None
             }
         };
-        Display { panel, last: Vec::new() }
+        Display { panel, last: Vec::new(), presented_frame: false }
     }
 
     pub fn fb_turn(&self) -> u32 {
         self.panel.as_ref().map_or(0, |p| p.turn())
+    }
+
+    pub fn has_presented_frame(&self) -> bool {
+        self.presented_frame
     }
 
     pub fn show(&mut self, upright: Vec<u8>, settings: &Settings, full: bool) {
@@ -53,11 +58,20 @@ impl Display {
             Ok((true, "unchanged", (0, 0, 0, 0)))
         };
         match result {
-            Ok((true, wave, (x, y, w, h))) => log(&format!("draw {wave} {w}x{h} at {x},{y} in {} ms (fb turn {fb_turn})", t.elapsed().as_millis())),
-            Ok((false, ..)) => log("draw: the framebuffer is not in a drawable state"),
-            Err(e) => log(&format!("draw: {e}")),
+            Ok((true, wave, (x, y, w, h))) => {
+                self.presented_frame |= w > 0 && h > 0;
+                self.last = frame;
+                log(&format!("draw {wave} {w}x{h} at {x},{y} in {} ms (fb turn {fb_turn})", t.elapsed().as_millis()));
+            }
+            Ok((false, ..)) => {
+                self.last.clear();
+                log("draw: the framebuffer is not in a drawable state");
+            }
+            Err(e) => {
+                self.last.clear();
+                log(&format!("draw: {e}"));
+            }
         }
-        self.last = frame;
     }
 
     /// Show only `area` of `upright` (a pop-up), leaving the rest of the panel as it is. The next `show` draws

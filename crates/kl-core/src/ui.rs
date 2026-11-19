@@ -577,7 +577,9 @@ impl Ui {
     }
 
     pub fn store_pending_updates(&self) -> impl Iterator<Item = &crate::store::StoreEntry> {
-        self.store.iter().filter(|app| matches!(app.status, crate::store::Status::Update { .. }))
+        self.store.iter().filter(|app| {
+            app.id != crate::store::LAUNCHER_ID && matches!(app.status, crate::store::Status::Update { .. })
+        })
     }
 
     pub fn store_has_toolbar(&self) -> bool {

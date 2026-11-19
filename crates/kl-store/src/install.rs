@@ -15,6 +15,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+pub const LAUNCHER_ID: &str = "primitive-launcher";
+const LAUNCHER_TRIAL_LIMIT: u8 = 3;
+
 /// Where the store keeps its files. `root` is the Kindle's storage (`/mnt/us`); the others are inside `store`.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -71,12 +74,17 @@ impl From<io::Error> for InstallError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum State {
+    /// A verified launcher update is staged and waiting for the supervisor.
+    Prepared,
     /// Files are being moved; the record is not yet updated.
     Moving,
     /// The record is saved; the old files are being cleaned up.
     Recorded,
     Removing,
     Removed,
+    /// The candidate files are in place and the original files are kept until a healthy start.
+    Trial,
+    Reverting,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +106,14 @@ pub struct Journal {
     pub obsolete: Vec<String>,
     /// The record before this install, so rollback can restore it.
     pub previous: Option<Installed>,
+    #[serde(default)]
+    pub trial: Option<Trial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Trial {
+    candidate: Installed,
+    attempts: u8,
 }
 
 fn write_journal(path: &Path, j: &Journal) -> io::Result<()> {
@@ -140,7 +156,7 @@ fn invalid_data(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn require_idle(paths: &Paths) -> io::Result<()> {
+pub(crate) fn require_idle(paths: &Paths) -> io::Result<()> {
     if paths.journal.try_exists()? {
         return Err(invalid_data("an unfinished Store change needs recovery before another app can be changed".into()));
     }
@@ -213,16 +229,26 @@ fn undo(paths: &Paths, done: &[Done]) -> io::Result<()> {
     Ok(())
 }
 
-/// Installs or updates an app. `unpacked` is the staging folder for this app (already verified and unpacked there).
-/// `fail_after` makes the install fail after that many moves; it is for tests.
-pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) -> Result<(), InstallError> {
-    require_idle(paths)?;
-    let mut rec = record::load(&paths.record)?;
+fn installed_entry(source: &Source<'_>) -> Installed {
+    Installed {
+        id: source.manifest.id.clone(),
+        dir: source.manifest.dir.clone(),
+        version: source.manifest.version.clone(),
+        arch: source.manifest.arch.clone(),
+        installed_at: source.installed_at.to_string(),
+        source_url: source.source_url.to_string(),
+        sha256: source.sha256.to_string(),
+        files: source.manifest.files.clone(),
+        requires: source.manifest.requires.clone(),
+    }
+}
+
+fn journal_for_install(paths: &Paths, rec: &Record, source: &Source<'_>) -> io::Result<Journal> {
     let id = source.manifest.id.clone();
     let previous = rec.apps.get(&id).cloned();
-    validate_changes(paths, &rec, &id, &source.manifest.dir, &source.manifest.files)?;
+    validate_changes(paths, rec, &id, &source.manifest.dir, &source.manifest.files)?;
     if let Some(previous) = &previous {
-        validate_changes(paths, &rec, &id, &previous.dir, &previous.files)?;
+        validate_changes(paths, rec, &id, &previous.dir, &previous.files)?;
     }
     let obsolete: Vec<String> = previous
         .as_ref()
@@ -231,60 +257,59 @@ pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) ->
             .cloned().collect())
         .unwrap_or_default();
 
-    let mut journal = Journal {
-        id: id.clone(),
+    Ok(Journal {
+        id,
         version: source.manifest.version.clone(),
         dir: Some(source.manifest.dir.clone()),
         state: State::Moving,
         done: Vec::new(),
-        obsolete: obsolete.clone(),
-        previous: previous.clone(),
-    };
+        obsolete,
+        previous,
+        trial: None,
+    })
+}
+
+fn move_files(paths: &Paths, journal: &mut Journal, files: &[String], fail_after: Option<usize>) -> io::Result<()> {
+    for (n, relative) in files.iter().enumerate() {
+        if fail_after == Some(n) {
+            return Err(io::Error::other("a test asked for a failure"));
+        }
+        let src = paths.staging.join(&journal.id).join(relative);
+        let dst = paths.root.join(relative);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let had_old = dst.is_file();
+        journal.done.push(Done { path: relative.clone(), prev: had_old });
+        write_journal(&paths.journal, journal)?;
+        if had_old {
+            fs::rename(&dst, prev_of(&dst))?;
+        }
+        fs::rename(&src, &dst).map_err(|e| io::Error::new(e.kind(), format!("{relative}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Installs or updates an app from verified unpacked staging. `fail_after` is used by rollback tests.
+pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) -> Result<(), InstallError> {
+    require_idle(paths)?;
+    if source.manifest.id == LAUNCHER_ID {
+        return Err(invalid_data("Launcher updates must restart through the Store".into()).into());
+    }
+    let mut rec = record::load(&paths.record)?;
+    let mut journal = journal_for_install(paths, &rec, source)?;
     write_journal(&paths.journal, &journal)?;
 
-    // Move the files into place, keeping what they replace.
-    let moved: Result<(), String> = (|| {
-        for (n, f) in source.manifest.files.iter().enumerate() {
-            if fail_after == Some(n) {
-                return Err("a test asked for a failure".into());
-            }
-            let src = paths.staging.join(&id).join(f);
-            let dst = paths.root.join(f);
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let had_old = dst.is_file();
-            journal.done.push(Done { path: f.clone(), prev: had_old });
-            write_journal(&paths.journal, &journal).map_err(|e| e.to_string())?;
-            if had_old {
-                fs::rename(&dst, prev_of(&dst)).map_err(|e| e.to_string())?;
-            }
-            fs::rename(&src, &dst).map_err(|e| format!("{f}: {e}"))?;
-        }
-        Ok(())
-    })();
-    if let Err(why) = moved {
+    if let Err(error) = move_files(paths, &mut journal, &source.manifest.files, fail_after) {
         undo(paths, &journal.done)?;
         remove_if_exists(&paths.journal)?;
-        return Err(InstallError::RolledBack(why));
+        return Err(InstallError::RolledBack(error.to_string()));
     }
 
     // Record the new version, then clean up.
     rec.schema = record::SCHEMA;
-    rec.apps.insert(
-        id.clone(),
-        Installed {
-            id: id.clone(),
-            dir: source.manifest.dir.clone(),
-            version: source.manifest.version.clone(),
-            arch: source.manifest.arch.clone(),
-            installed_at: source.installed_at.to_string(),
-            source_url: source.source_url.to_string(),
-            sha256: source.sha256.to_string(),
-            files: source.manifest.files.clone(),
-            requires: source.manifest.requires.clone(),
-        },
-    );
+    let installed = installed_entry(source);
+    rec.apps.insert(installed.id.clone(), installed);
     if let Err(e) = record::save(&paths.record, &rec) {
         undo(paths, &journal.done)?;
         remove_if_exists(&paths.journal)?;
@@ -294,6 +319,114 @@ pub fn install(paths: &Paths, source: &Source<'_>, fail_after: Option<usize>) ->
     write_journal(&paths.journal, &journal)?;
     finish(paths, &journal)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherUpdate {
+    Idle,
+    Trial,
+    Reverted,
+}
+
+fn launcher_candidate(journal: &Journal) -> io::Result<&Trial> {
+    let trial = journal.trial.as_ref().ok_or_else(|| invalid_data("missing Launcher trial data".into()))?;
+    let candidate = &trial.candidate;
+    if journal.id != LAUNCHER_ID || candidate.id != journal.id || candidate.dir != "launcher"
+        || candidate.version != journal.version
+    {
+        return Err(invalid_data("the Store journal does not identify this Launcher update".into()));
+    }
+    for required in ["launcher/kl-launcher", "launcher/supervisor.sh", "launcher/setup-boot.sh"] {
+        if !candidate.files.iter().any(|file| file == required) {
+            return Err(invalid_data(format!("the Launcher update is missing {required}")));
+        }
+    }
+    Ok(trial)
+}
+
+/// Records an already verified update for the supervisor. The running Launcher remains untouched.
+pub fn prepare_launcher_update(paths: &Paths, source: &Source<'_>) -> io::Result<()> {
+    require_idle(paths)?;
+    let record = record::load(&paths.record)?;
+    let mut journal = journal_for_install(paths, &record, source)?;
+    journal.state = State::Prepared;
+    journal.trial = Some(Trial { candidate: installed_entry(source), attempts: 0 });
+    launcher_candidate(&journal)?;
+    write_journal(&paths.journal, &journal)
+}
+
+/// Applies a prepared update and reserves one persistent attempt before the supervisor starts it.
+pub fn launcher_update_begin(paths: &Paths) -> io::Result<LauncherUpdate> {
+    let Some(mut journal) = read_journal(&paths.journal)? else { return Ok(LauncherUpdate::Idle) };
+    if journal.id != LAUNCHER_ID || journal.trial.is_none() {
+        return Ok(LauncherUpdate::Idle);
+    }
+    let record = record::load(&paths.record)?;
+    validate_journal(paths, &journal, &record)?;
+    let trial = launcher_candidate(&journal)?.clone();
+    match journal.state {
+        State::Moving | State::Reverting => {
+            recover(paths)?;
+            return Ok(LauncherUpdate::Reverted);
+        }
+        State::Recorded => {
+            recover(paths)?;
+            return Ok(LauncherUpdate::Idle);
+        }
+        State::Prepared => {
+            validate_changes(paths, &record, LAUNCHER_ID, "launcher", &trial.candidate.files)?;
+            journal.state = State::Moving;
+            write_journal(&paths.journal, &journal)?;
+            if let Err(error) = move_files(paths, &mut journal, &trial.candidate.files, None) {
+                recover(paths)?;
+                return Err(error);
+            }
+            journal.state = State::Trial;
+        }
+        State::Trial => {}
+        State::Removing | State::Removed => return Ok(LauncherUpdate::Idle),
+    }
+    if trial.attempts >= LAUNCHER_TRIAL_LIMIT {
+        launcher_update_revert(paths)?;
+        return Ok(LauncherUpdate::Reverted);
+    }
+    journal.trial = Some(Trial { attempts: trial.attempts + 1, ..trial });
+    write_journal(&paths.journal, &journal)?;
+    Ok(LauncherUpdate::Trial)
+}
+
+/// Records a trial that presented a healthy Launcher screen and commits its files.
+pub fn launcher_update_accept(paths: &Paths) -> io::Result<bool> {
+    let Some(mut journal) = read_journal(&paths.journal)? else { return Ok(false) };
+    if journal.id != LAUNCHER_ID || journal.state != State::Trial {
+        return Ok(false);
+    }
+    let mut record = record::load(&paths.record)?;
+    validate_journal(paths, &journal, &record)?;
+    let candidate = launcher_candidate(&journal)?.candidate.clone();
+    record.apps.insert(candidate.id.clone(), candidate);
+    record::save(&paths.record, &record)?;
+    journal.state = State::Recorded;
+    write_journal(&paths.journal, &journal)?;
+    finish(paths, &journal)?;
+    Ok(true)
+}
+
+/// Cancels a prepared update or restores the original files of a trial.
+pub fn launcher_update_revert(paths: &Paths) -> io::Result<bool> {
+    let Some(mut journal) = read_journal(&paths.journal)? else { return Ok(false) };
+    if journal.id != LAUNCHER_ID || journal.trial.is_none()
+        || !matches!(journal.state, State::Prepared | State::Moving | State::Trial | State::Reverting)
+    {
+        return Ok(false);
+    }
+    let record = record::load(&paths.record)?;
+    validate_journal(paths, &journal, &record)?;
+    launcher_candidate(&journal)?;
+    journal.state = State::Reverting;
+    write_journal(&paths.journal, &journal)?;
+    recover(paths)?;
+    Ok(true)
 }
 
 /// The last steps of an install: delete the old-only files and the kept `.prev` copies, then the journal and the
@@ -375,7 +508,8 @@ pub fn recover(paths: &Paths) -> io::Result<Option<String>> {
             finish(paths, &journal)?;
             Ok(Some(format!("finished the {description} of {}", journal.id)))
         }
-        State::Moving | State::Removing => {
+        State::Prepared | State::Trial => Ok(None),
+        State::Moving | State::Removing | State::Reverting => {
             undo(paths, &journal.done)?;
             // Restore the record exactly as it was before this install.
             match &journal.previous {
@@ -416,6 +550,7 @@ pub fn remove(paths: &Paths, id: &str) -> Result<(), InstallError> {
         done: Vec::new(),
         obsolete: Vec::new(),
         previous: Some(app.clone()),
+        trial: None,
     };
     write_journal(&paths.journal, &journal)?;
     let moved = (|| -> io::Result<()> {
@@ -558,6 +693,7 @@ mod tests {
             done: vec![Done { path: "notes/a".into(), prev: true }],
             obsolete: vec![],
             previous: Some(record::load(&w.paths.record).unwrap().apps["notes"].clone()),
+            trial: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
 
@@ -591,6 +727,7 @@ mod tests {
             done: vec![Done { path: "notes/a".into(), prev: false }],
             obsolete: vec!["notes/gone".into()],
             previous: None,
+            trial: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
 
@@ -615,6 +752,7 @@ mod tests {
             done: vec![Done { path: "notes/app".into(), prev: true }],
             obsolete: Vec::new(),
             previous: Some(previous),
+            trial: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
         recover(&w.paths).unwrap();
@@ -638,6 +776,7 @@ mod tests {
             done: vec![Done { path: "notes/app".into(), prev: true }],
             obsolete: Vec::new(),
             previous: Some(previous),
+            trial: None,
         };
         write_journal(&w.paths.journal, &journal).unwrap();
         fs::rename(&file, prev_of(&file)).unwrap();
@@ -657,6 +796,74 @@ mod tests {
         stage(&w.paths, &second, "cards");
         assert!(install(&w.paths, &src(&second), None).unwrap_err().to_string().contains("another installed app"));
         assert_eq!(fs::read_to_string(w.paths.root.join("documents/Notes.sh")).unwrap(), "1.0.0 notes");
+    }
+
+    fn launcher_fixture(paths: &Paths) -> Manifest {
+        let mut candidate = manifest(
+            LAUNCHER_ID,
+            "1.2.0",
+            &["launcher/kl-launcher", "launcher/setup-boot.sh", "launcher/supervisor.sh"],
+            &[],
+        );
+        candidate.dir = "launcher".to_string();
+        fs::create_dir_all(paths.root.join("launcher")).unwrap();
+        for file in &candidate.files {
+            fs::write(paths.root.join(file), b"old launcher").unwrap();
+        }
+        stage(paths, &candidate, "candidate");
+        candidate
+    }
+
+    #[test]
+    fn a_launcher_update_is_staged_then_committed_after_a_healthy_trial() {
+        let w = world("launcher-accept");
+        let candidate = launcher_fixture(&w.paths);
+        let binary = w.paths.root.join("launcher/kl-launcher");
+        assert!(install(&w.paths, &src(&candidate), None).is_err());
+        prepare_launcher_update(&w.paths, &src(&candidate)).unwrap();
+        assert!(recover(&w.paths).unwrap().is_none(), "startup recovery leaves staged updates alone");
+        assert_eq!(fs::read(&binary).unwrap(), b"old launcher");
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Trial);
+        assert!(recover(&w.paths).unwrap().is_none(), "startup recovery preserves a healthy trial");
+        assert_eq!(fs::read(&binary).unwrap(), b"1.2.0 candidate");
+        assert_eq!(fs::read(prev_of(&binary)).unwrap(), b"old launcher");
+        assert!(!record::load(&w.paths.record).unwrap().apps.contains_key(LAUNCHER_ID));
+        assert!(launcher_update_accept(&w.paths).unwrap());
+        assert_eq!(record::load(&w.paths.record).unwrap().apps[LAUNCHER_ID].version, "1.2.0");
+        assert!(!prev_of(&binary).exists());
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Idle);
+    }
+
+    #[test]
+    fn three_launcher_attempts_restore_the_launcher_and_leave_the_old_record() {
+        let w = world("launcher-revert");
+        let candidate = launcher_fixture(&w.paths);
+        let record = record::load(&w.paths.record).unwrap();
+        prepare_launcher_update(&w.paths, &src(&candidate)).unwrap();
+        for _ in 0..LAUNCHER_TRIAL_LIMIT {
+            assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Trial);
+        }
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Reverted);
+        for file in &candidate.files {
+            let file = w.paths.root.join(file);
+            assert_eq!(fs::read(&file).unwrap(), b"old launcher");
+            assert!(!prev_of(&file).exists());
+        }
+        assert_eq!(record::load(&w.paths.record).unwrap(), record);
+        assert!(!w.paths.journal.exists());
+    }
+
+    #[test]
+    fn a_missing_staged_launcher_file_restores_any_file_already_moved() {
+        let w = world("launcher-interrupted");
+        let candidate = launcher_fixture(&w.paths);
+        prepare_launcher_update(&w.paths, &src(&candidate)).unwrap();
+        fs::remove_file(w.paths.staging.join(LAUNCHER_ID).join("launcher/supervisor.sh")).unwrap();
+        assert!(launcher_update_begin(&w.paths).is_err());
+        for file in &candidate.files {
+            assert_eq!(fs::read(w.paths.root.join(file)).unwrap(), b"old launcher");
+        }
+        assert_eq!(launcher_update_begin(&w.paths).unwrap(), LauncherUpdate::Idle);
     }
 
     #[test]

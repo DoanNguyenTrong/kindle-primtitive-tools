@@ -55,6 +55,7 @@ fn install_inner(
     installed_at: &str,
     progress: &mut impl FnMut(Stage),
 ) -> Result<String, String> {
+    install::require_idle(paths).map_err(|error| error.to_string())?;
     let chosen = resolve::pick_version(listing, device).map_err(|e| e.to_string())?;
     if listing.schema != 1 || !valid_app_id(&listing.id) || !unpack::valid_module_dir(listing.dir()) {
         return Err("the catalog listing has an invalid app name or folder".into());
@@ -109,7 +110,11 @@ fn install_inner(
     }
     let source = Source { manifest: &manifest, source_url, sha256: &asset.sha256, installed_at };
     progress(Stage::Installing);
-    install::install(paths, &source, None).map_err(|e| e.to_string())?;
+    if manifest.id == install::LAUNCHER_ID {
+        install::prepare_launcher_update(paths, &source).map_err(|error| error.to_string())?;
+    } else {
+        install::install(paths, &source, None).map_err(|error| error.to_string())?;
+    }
     Ok(manifest.version.clone())
 }
 
