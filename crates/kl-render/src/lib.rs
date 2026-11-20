@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use kl_core::{
     layout::{Button, QuickTile, Rect, Row, LABEL_SIZE, QUICK_LEVEL_MAX},
+    wallpaper::{WallpaperChoice, WallpaperDraft, WallpaperTarget},
     App, IconSource, Launch, Layout, Rotation, Screen, Status, Ui,
 };
 use parley::{FontContext, FontWeight, LayoutContext, PositionedLayoutItem, StyleProperty};
@@ -93,6 +94,8 @@ pub struct Renderer {
     icons: HashMap<String, GrayImage>,
     /// The photo behind the Launcher grid, already prepared at the screen size.
     home_wallpaper: Option<GrayImage>,
+    /// The picture under consideration in Settings, prepared at the screen size.
+    wallpaper_preview: Option<GrayImage>,
     /// The launcher's own sleep screen picture, when one is set (screensavers folder).
     sleep_image: Option<GrayImage>,
     /// The drive-mode picture (`assets/usb-drive-mode.png`), fitted to the screen and snapped to black and white.
@@ -179,6 +182,7 @@ impl Renderer {
             high_contrast: false,
             icons: HashMap::new(),
             home_wallpaper: None,
+            wallpaper_preview: None,
             sleep_image: None,
             store_blits: Vec::new(),
             usb_picture: None,
@@ -209,6 +213,11 @@ impl Renderer {
     /// The screen-sized photo behind the home grid (`None` for a plain background).
     pub fn set_home_wallpaper(&mut self, picture: Option<GrayImage>) {
         self.home_wallpaper = picture;
+    }
+
+    /// Set the preview's screen-sized picture before applying the draft's opacity.
+    pub fn set_wallpaper_preview(&mut self, picture: Option<GrayImage>) {
+        self.wallpaper_preview = picture;
     }
 
     /// The picture for the next sleep screen (`None`: the text sleep screen).
@@ -450,15 +459,42 @@ impl Renderer {
         if ui.usb == kl_core::Usb::Drive {
             return self.usb_drive_frame(ui);
         }
-        self.ctx.reset();
         let l = ui.layout;
+        let preview = match ui.screen {
+            Screen::WallpaperPreview => ui.wallpaper_preview.as_ref(),
+            _ => None,
+        };
+        if let Some((draft, notice)) = preview.zip(ui.notice.as_deref()) {
+            return self.wallpaper_preview_frame(&l, status, draft, None, Some(notice));
+        }
+        let home_preview = preview.filter(|draft| {
+            draft.target == WallpaperTarget::Home
+                && draft.can_apply()
+                && (draft.choice == WallpaperChoice::Default || self.wallpaper_preview.is_some())
+        });
+        if let Some(draft) = preview.filter(|_| home_preview.is_none()) {
+            let area = l.wallpaper_preview().picture.inset(4);
+            let miniature = self.wallpaper_preview.as_ref().filter(|_| draft.can_apply() && draft.has_opacity()).map(|source| {
+                let mut picture = image::fit(source, area.w as u32, area.h as u32);
+                if draft.opacity == 100 {
+                    image::dither16(&mut picture);
+                } else {
+                    image::blend_wallpaper(&mut picture, draft.opacity);
+                }
+                picture
+            });
+            return self.wallpaper_preview_frame(&l, status, draft, miniature.as_ref(), None);
+        }
+        self.ctx.reset();
         self.fill(l.screen(), WHITE);
         let mut icon_blits: Vec<(Rect, String)> = Vec::new();
-        match ui.screen {
+        let screen = if home_preview.is_some() { Screen::Home } else { ui.screen };
+        match screen {
             Screen::Home => self.home(ui, status, &mut icon_blits),
             Screen::Settings => self.settings_home(ui, status),
             Screen::Page(page) => self.settings_page(ui, status, page),
             Screen::WallpaperPicker(target) => self.settings_wallpaper_picker(ui, target),
+            Screen::WallpaperPreview => {},
             Screen::NetworkDetail => self.network_detail(ui),
             Screen::Password => self.password_screen(ui),
             Screen::NetworkName => self.network_name_screen(ui),
@@ -482,11 +518,15 @@ impl Renderer {
         icon_blits.append(&mut self.store_blits);
         let width = self.width as usize;
         let mut out = self.finish_gray();
-        let wallpaper = self.home_wallpaper.as_ref().filter(|_| {
-            matches!(ui.screen, Screen::Home | Screen::ConfirmKindle | Screen::PowerMenu | Screen::AppMenu | Screen::QuickSettings)
-        });
-        if let Some(picture) = wallpaper {
-            shade_home_wallpaper(&mut out, &l, picture, status.dark_mode);
+        let wallpaper = if let Some(draft) = home_preview {
+            self.wallpaper_preview.as_ref().filter(|_| draft.has_opacity()).map(|picture| (picture, draft.opacity))
+        } else if matches!(screen, Screen::Home | Screen::ConfirmKindle | Screen::PowerMenu | Screen::AppMenu | Screen::QuickSettings) {
+            self.home_wallpaper.as_ref().map(|picture| (picture, ui.wallpapers.opacity(WallpaperTarget::Home)))
+        } else {
+            None
+        }.filter(|(_, opacity)| *opacity > 0);
+        if let Some((picture, opacity)) = wallpaper {
+            shade_home_wallpaper(&mut out, &l, picture, status.dark_mode, opacity);
         }
         // Pictures (icons, the sleep picture) keep their look in dark mode.
         let mut pictures = Vec::new();
@@ -559,6 +599,13 @@ impl Renderer {
         // The pressed look: only the touched icon darkens.
         if let (Screen::Home, Some(r)) = (ui.screen, ui.pressed) {
             image::darken_icon(&mut out, width, r.x, r.y, r.w);
+        }
+        if let Some(draft) = home_preview {
+            let source = GrayImage { width: l.width as u32, height: l.height as u32, pixels: out };
+            let area = l.wallpaper_preview().picture.inset(4);
+            let mut miniature = image::fit(&source, area.w as u32, area.h as u32);
+            image::dither16(&mut miniature);
+            return self.wallpaper_preview_frame(&l, status, draft, Some(&miniature), None);
         }
         out
     }
@@ -1741,6 +1788,62 @@ impl Renderer {
         self.settings_scrollbar(viewport, ui.settings_scroll, l.settings_scroll_max());
     }
 
+    fn wallpaper_preview_frame(
+        &mut self, layout: &Layout, status: &Status, draft: &WallpaperDraft,
+        picture: Option<&GrayImage>, notice: Option<&str>,
+    ) -> Vec<u8> {
+        self.ctx.reset();
+        self.fill(layout.screen(), WHITE);
+        let area = layout.wallpaper_preview();
+        let back = layout.done_button();
+        let title = format!("{} preview", draft.target.title());
+        self.text(Text { text: &title, x: MARGIN_X as f32, y: 36.0, w: (back.x - 2 * MARGIN_X) as f32, size: 56.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        self.button(back, "Back", true);
+        let title = layout.title();
+        self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
+
+        let label = area.choice_label;
+        self.text(Text { text: draft.choice.label(draft.target), x: label.x as f32, y: label.y as f32, w: label.w as f32, size: 30.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
+        self.frame(area.picture, 4, BLACK);
+        if picture.is_none() {
+            let hint = draft.error.as_deref().or(notice).unwrap_or(match draft.target {
+                WallpaperTarget::Sleep if draft.choice == WallpaperChoice::Default => "The Kindle chooses the sleep picture.",
+                WallpaperTarget::Startup if draft.choice == WallpaperChoice::Default => "Launcher uses its standard startup screen.",
+                _ => "No picture available to preview.",
+            });
+            let frame = area.picture.inset(32);
+            self.text(Text { text: hint, x: frame.x as f32, y: (frame.y + frame.h / 2 - 48) as f32, w: frame.w as f32, size: 30.0, bold: false, align: Align::Center, lines: 3, gray: 85 });
+        }
+
+        if draft.has_opacity() {
+            let label = area.opacity_label;
+            let text = format!("Opacity {}%", draft.opacity);
+            self.text(Text { text: &text, x: label.x as f32, y: label.y as f32, w: label.w as f32, size: 32.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
+            self.round_button(area.opacity_down, false);
+            self.round_button(area.opacity_up, true);
+            let track = area.opacity_track;
+            let cy = track.y + track.h / 2;
+            let bar = Rect::new(track.x, cy - 7, track.w, 14);
+            self.rounded_frame(bar, 7.0, 2, BLACK, WHITE);
+            let cx = track.x + 14 + (track.w - 28) * i32::from(draft.opacity) / 100;
+            self.rounded(Rect::new(bar.x, bar.y, cx - bar.x, bar.h), 7.0, BLACK);
+            self.rounded(Rect::new(cx - 14, cy - 14, 28, 28), 14.0, BLACK);
+        }
+        if draft.can_apply() {
+            self.button(area.apply, "Apply", true);
+        }
+
+        let mut out = self.finish_gray();
+        let width = self.width as usize;
+        if status.dark_mode {
+            image::invert_except(&mut out, width, &[], None);
+        }
+        if let Some(picture) = picture {
+            blit(&mut out, width, area.picture.inset(4), picture, 0.0);
+        }
+        out
+    }
+
     /// One page of Settings: its title and Back, then its sections (header, card of rows, footer). The Wi-Fi page
     /// adds the current network and the scan list; About is key and value text.
     fn settings_page(&mut self, ui: &Ui, s: &Status, page: kl_core::layout::Page) {
@@ -2189,24 +2292,23 @@ fn capitalise(s: &str) -> String {
     }
 }
 
-/// Shade the photo for legibility behind the grid. The status strip, page dots, and notices keep the
-/// normal background. App artwork and dialogs are drawn over this afterward.
-fn shade_home_wallpaper(out: &mut [u8], layout: &Layout, picture: &GrayImage, dark: bool) {
+/// Shade the full Home photo for legibility behind the grid, status strip, and page dots.
+/// App artwork and dialogs are drawn over this afterward.
+fn shade_home_wallpaper(out: &mut [u8], layout: &Layout, picture: &GrayImage, dark: bool, opacity: u8) {
+    let opacity = u32::from(opacity.min(100));
     if picture.width as i32 != layout.width || picture.height as i32 != layout.height || picture.pixels.len() != out.len() {
         return;
     }
-    let top = layout.status().bottom() as usize * layout.width as usize;
-    let bottom = layout.home_footer().y as usize * layout.width as usize;
-    let Some(grid) = out.get_mut(top..bottom) else { return };
-    for (ink, &sample) in grid.iter_mut().zip(&picture.pixels[top..bottom]) {
+    for (ink, &sample) in out.iter_mut().zip(&picture.pixels) {
         if *ink == BLACK {
             continue;
         }
         // The final dark-mode pass inverts the entire chrome. Pre-invert the photo's samples so it
         // stays a darkened picture in dark mode instead of becoming a negative.
-        let tone = u16::from(if dark { WHITE - sample } else { sample });
-        let shaded = (9 + (tone * 6 + 127) / 255) * 17;
-        *ink = (u16::from(*ink) * shaded / 255) as u8;
+        let distance = u32::from(if dark { sample } else { WHITE - sample });
+        let steps = (6 * distance * opacity + 12_750) / 25_500;
+        let shaded = (15 - steps) * 17;
+        *ink = (u32::from(*ink) * shaded / 255) as u8;
     }
 }
 
@@ -2398,22 +2500,34 @@ mod tests {
     }
 
     #[test]
-    fn wallpaper_leaves_chrome_and_black_labels_intact() {
+    fn wallpaper_spans_the_home_screen_with_adjustable_opacity() {
         let layout = Layout::new(128, 600, 3, 3);
         let mut picture = GrayImage::blank(128, 600);
-        picture.pixels.fill(0);
+        picture.pixels.fill(BLACK);
         let mut frame = vec![WHITE; picture.pixels.len()];
         let top = layout.status().bottom() as usize * 128;
         let bottom = layout.home_footer().y as usize * 128;
+        frame[0] = BLACK;
         frame[top] = BLACK;
+        frame[bottom] = BLACK;
         picture.pixels[top + 2] = WHITE;
+        picture.pixels[1] = WHITE;
+        picture.pixels[bottom + 2] = WHITE;
+        let mut faded = frame.clone();
         let mut dark = frame.clone();
-        shade_home_wallpaper(&mut frame, &layout, &picture, false);
-        shade_home_wallpaper(&mut dark, &layout, &picture, true);
+        shade_home_wallpaper(&mut faded, &layout, &picture, false, 0);
+        assert_eq!(faded, frame);
+        shade_home_wallpaper(&mut faded, &layout, &picture, false, 50);
+        assert_eq!((faded[2], faded[top + 1], faded[bottom + 1]), (204, 204, 204));
+        shade_home_wallpaper(&mut frame, &layout, &picture, false, 100);
+        shade_home_wallpaper(&mut dark, &layout, &picture, true, 100);
         image::invert_except(&mut dark, 128, &[], None);
-        assert_eq!(&frame[top - 1..top + 3], &[WHITE, BLACK, 153, WHITE]);
-        assert_eq!(&dark[top - 1..top + 3], &[BLACK, WHITE, BLACK, 102]);
-        assert_eq!((frame[bottom], dark[bottom]), (WHITE, BLACK));
+        assert_eq!(&frame[..3], &[BLACK, WHITE, 153]);
+        assert_eq!(&dark[..3], &[WHITE, 102, BLACK]);
+        for y in [top, bottom] {
+            assert_eq!(&frame[y..y + 3], &[BLACK, 153, WHITE]);
+            assert_eq!(&dark[y..y + 3], &[WHITE, BLACK, 102]);
+        }
     }
 
     #[test]

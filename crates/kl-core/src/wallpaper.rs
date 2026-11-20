@@ -38,12 +38,48 @@ impl WallpaperChoice {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Temporary preview values. Changing them does not change the applied wallpaper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallpaperDraft {
+    pub target: WallpaperTarget,
+    pub choice: WallpaperChoice,
+    pub opacity: u8,
+    pub error: Option<String>,
+}
+
+impl WallpaperDraft {
+    pub fn has_opacity(&self) -> bool {
+        self.choice != WallpaperChoice::Default
+    }
+
+    pub fn can_apply(&self) -> bool {
+        !matches!(self.choice, WallpaperChoice::File(_)) || self.error.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WallpaperSettings {
     pub images: Vec<String>,
     pub home: WallpaperChoice,
     pub sleep: WallpaperChoice,
     pub startup: WallpaperChoice,
+    pub home_opacity: u8,
+    pub sleep_opacity: u8,
+    pub startup_opacity: u8,
+}
+
+impl Default for WallpaperSettings {
+    fn default() -> Self {
+        Self {
+            images: Vec::new(),
+            home: WallpaperChoice::Default,
+            sleep: WallpaperChoice::Default,
+            startup: WallpaperChoice::Default,
+            home_opacity: 100,
+            sleep_opacity: 100,
+            startup_opacity: 100,
+        }
+    }
 }
 
 impl WallpaperSettings {
@@ -61,6 +97,24 @@ impl WallpaperSettings {
             WallpaperTarget::Sleep => self.sleep = choice,
             WallpaperTarget::Startup => self.startup = choice,
         }
+    }
+
+    pub fn opacity(&self, target: WallpaperTarget) -> u8 {
+        let opacity = match target {
+            WallpaperTarget::Home => self.home_opacity,
+            WallpaperTarget::Sleep => self.sleep_opacity,
+            WallpaperTarget::Startup => self.startup_opacity,
+        };
+        opacity.min(100)
+    }
+
+    pub fn set_opacity(&mut self, target: WallpaperTarget, opacity: u8) {
+        let slot = match target {
+            WallpaperTarget::Home => &mut self.home_opacity,
+            WallpaperTarget::Sleep => &mut self.sleep_opacity,
+            WallpaperTarget::Startup => &mut self.startup_opacity,
+        };
+        *slot = opacity.min(100);
     }
 
     pub fn choices(&self, target: WallpaperTarget) -> impl Iterator<Item = WallpaperChoice> + '_ {

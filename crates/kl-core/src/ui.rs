@@ -10,7 +10,7 @@ use crate::{
     battery::{self, Warning},
     layout::{Button, Layout, Page, QuickTile, Rect},
     settings::Rotation,
-    wallpaper::{WallpaperChoice, WallpaperSettings, WallpaperTarget},
+    wallpaper::{WallpaperChoice, WallpaperDraft, WallpaperSettings, WallpaperTarget},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum Screen {
     /// One page of Settings (Settings > page; Back returns to the Settings list).
     Page(Page),
     WallpaperPicker(WallpaperTarget),
+    WallpaperPreview,
     /// One network from the Wi-Fi scan: connect, or forget a saved one.
     NetworkDetail,
     /// The password of a new secured network, typed on the on-screen keyboard.
@@ -120,7 +121,8 @@ pub enum Action {
     SetOrder(Vec<(String, i64)>),
     /// Set (`Some`) or clear (`None`) an app's icon file. Written to apps.toml; the driver reloads the tile.
     SetIcon { id: String, icon: Option<String> },
-    SetWallpaper { target: WallpaperTarget, choice: WallpaperChoice },
+    PreviewWallpaper { target: WallpaperTarget, choice: WallpaperChoice },
+    SetWallpaper { target: WallpaperTarget, choice: WallpaperChoice, opacity: u8 },
     /// Run an app while the launcher stays in front (background mode); the driver shows its last output line.
     RunBackground(App),
     /// Scan for Wi-Fi networks (the Wi-Fi page's Scan button, or opening the page). The driver sends the result back.
@@ -336,6 +338,7 @@ pub struct Ui {
     pub visibility_scroll: i32,
     pub wallpapers: WallpaperSettings,
     pub wallpaper_scroll: i32,
+    pub wallpaper_preview: Option<WallpaperDraft>,
     pub managed_count: Option<usize>,
     pub firmware: Option<String>,
     pub device_profile: Option<String>,
@@ -437,6 +440,7 @@ impl Ui {
             visibility_scroll: 0,
             wallpapers: WallpaperSettings::default(),
             wallpaper_scroll: 0,
+            wallpaper_preview: None,
             managed_count: None,
             firmware: None,
             device_profile: None,
@@ -1332,9 +1336,29 @@ impl Ui {
     pub fn set_wallpapers(&mut self, wallpapers: WallpaperSettings) {
         self.wallpapers = wallpapers;
         let screen = if self.screen == Screen::Sleep { self.before_sleep } else { self.screen };
-        if let Screen::WallpaperPicker(target) = screen {
+        let target = match screen {
+            Screen::WallpaperPicker(target) => Some(target),
+            Screen::WallpaperPreview => {
+                self.wallpaper_preview.as_mut().map(|draft| {
+                    if let WallpaperChoice::File(name) = &draft.choice {
+                        if !self.wallpapers.images.contains(name) {
+                            draft.error = Some("This picture is no longer available.".into());
+                        }
+                    }
+                    draft.target
+                })
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
             self.wallpaper_scroll = self.wallpaper_scroll.min(self.wallpaper_scroll_max(target));
         }
+    }
+
+    /// Return from a cancelled or successfully applied preview, keeping the picker position.
+    pub fn finish_wallpaper_preview(&mut self) -> Action {
+        let Some(draft) = self.wallpaper_preview.take() else { return Action::None };
+        self.go(Screen::WallpaperPicker(draft.target))
     }
 
     pub fn visible_visibility_apps(&self) -> impl Iterator<Item = (usize, &App)> {
@@ -1570,6 +1594,7 @@ impl Ui {
             Screen::Settings => self.settings_home(input),
             Screen::Page(page) => self.settings_page(input, page),
             Screen::WallpaperPicker(target) => self.wallpaper_picker(input, target),
+            Screen::WallpaperPreview => self.wallpaper_preview(input),
             Screen::NetworkDetail => self.network_detail(input),
             Screen::Password => self.password_screen(input),
             Screen::NetworkName => self.network_name_screen(input),
@@ -1864,16 +1889,60 @@ impl Ui {
             Input::Tap(x, y) => {
                 let Some(index) = self.layout.visibility_at(self.wallpaper_scroll, x, y) else { return Action::None };
                 let Some(choice) = self.wallpapers.choices(target).nth(index) else { return Action::None };
-                if self.wallpapers.selection(target) == &choice {
-                    return Action::None;
-                }
-                Action::SetWallpaper { target, choice }
+                self.wallpaper_preview = Some(WallpaperDraft {
+                    target,
+                    choice: choice.clone(),
+                    opacity: self.wallpapers.opacity(target),
+                    error: None,
+                });
+                self.go(Screen::WallpaperPreview);
+                Action::PreviewWallpaper { target, choice }
             }
             _ => {
                 let max = self.wallpaper_scroll_max(target);
                 scroll_settings_list(input, self.layout.visibility_viewport(), &mut self.wallpaper_scroll, max)
             }
         }
+    }
+
+    fn wallpaper_preview(&mut self, input: Input) -> Action {
+        let (x, y) = match input {
+            Input::PageBack => return self.finish_wallpaper_preview(),
+            Input::Tap(x, y) if self.layout.done_button().inset(-20).contains(x, y) => {
+                return self.finish_wallpaper_preview();
+            }
+            Input::Tap(x, y) => (x, y),
+            _ => return Action::None,
+        };
+        let layout = self.layout.wallpaper_preview();
+        let Some(draft) = &mut self.wallpaper_preview else { return Action::None };
+        if layout.apply.contains(x, y) && draft.can_apply() {
+            return Action::SetWallpaper {
+                target: draft.target,
+                choice: draft.choice.clone(),
+                opacity: draft.opacity,
+            };
+        }
+        if !draft.has_opacity() {
+            return Action::None;
+        }
+
+        const OPACITY_STEP: u8 = 10;
+        let opacity = if layout.opacity_down.contains(x, y) {
+            draft.opacity.saturating_sub(OPACITY_STEP)
+        } else if layout.opacity_up.contains(x, y) {
+            draft.opacity.saturating_add(OPACITY_STEP).min(100)
+        } else if layout.opacity_track.contains(x, y) {
+            let ratio = (x - layout.opacity_track.x as f32) / layout.opacity_track.w as f32;
+            (ratio * (100 / OPACITY_STEP) as f32).round() as u8 * OPACITY_STEP
+        } else {
+            return Action::None;
+        };
+        if opacity == draft.opacity {
+            return Action::None;
+        }
+        draft.opacity = opacity;
+        Action::Redraw { full: false }
     }
 
     /// One page of Settings: its rows' buttons. Back (or the back key) returns to the Settings list.
@@ -2070,20 +2139,29 @@ mod tests {
         u.handle(centre(row(&u, Page::Wallpaper, Row::Wallpaper(target))));
         assert_eq!(u.screen, Screen::WallpaperPicker(target));
         assert_eq!(u.wallpaper_scroll, 0);
-        assert_eq!(u.handle(centre(u.layout.visibility_row(0, 0))), Action::None);
-        assert_eq!(u.handle(centre(u.layout.visibility_row(1, 0))), Action::SetWallpaper {
+        assert_eq!(u.handle(centre(u.layout.visibility_row(0, 0))), Action::PreviewWallpaper {
+            target,
+            choice: WallpaperChoice::Default,
+        });
+        assert_eq!(u.screen, Screen::WallpaperPreview);
+        assert!(!u.wallpaper_preview.as_ref().unwrap().has_opacity());
+        u.handle(Input::PageBack);
+        assert_eq!(u.handle(centre(u.layout.visibility_row(1, 0))), Action::PreviewWallpaper {
             target,
             choice: WallpaperChoice::Rotate,
         });
+        u.handle(Input::PageBack);
         u.handle(Input::Swipe { dx: 0.0, dy: -3000.0, start_y: 1400.0 });
         assert_eq!(u.wallpaper_scroll, u.wallpaper_scroll_max(target));
-        assert_eq!(u.handle(centre(u.layout.visibility_row(26, u.wallpaper_scroll))), Action::SetWallpaper {
+        assert_eq!(u.handle(centre(u.layout.visibility_row(26, u.wallpaper_scroll))), Action::PreviewWallpaper {
             target,
             choice: WallpaperChoice::File("Image 24.png".into()),
         });
         wallpapers.images.truncate(1);
         u.set_wallpapers(wallpapers);
         assert_eq!(u.wallpaper_scroll, 0);
+        assert_eq!(u.handle(centre(u.layout.wallpaper_preview().apply)), Action::None);
+        u.handle(Input::PageBack);
         for expected in [Screen::Page(Page::Wallpaper), Screen::Page(Page::Display),
             Screen::Page(Page::Battery), Screen::Settings]
         {
@@ -2091,6 +2169,44 @@ mod tests {
             assert_eq!(u.screen, expected);
         }
         assert_eq!(u.wallpapers.choices(WallpaperTarget::Startup).count(), 2);
+    }
+
+    #[test]
+    fn wallpaper_opacity_is_a_per_target_draft_until_apply() {
+        let mut u = ui(22);
+        let target = WallpaperTarget::Home;
+        let choice = WallpaperChoice::File("Pines.png".into());
+        let mut wallpapers = WallpaperSettings {
+            images: vec!["Pines.png".into()],
+            home: choice.clone(),
+            ..WallpaperSettings::default()
+        };
+        wallpapers.set_opacity(target, 60);
+        u.set_wallpapers(wallpapers.clone());
+        u.screen = Screen::WallpaperPicker(target);
+        let picture_row = u.layout.visibility_row(1, 0);
+        let controls = u.layout.wallpaper_preview();
+        assert_eq!(u.handle(centre(picture_row)), Action::PreviewWallpaper { target, choice: choice.clone() });
+        assert_eq!(u.wallpaper_preview.as_ref().unwrap().opacity, 60);
+        assert_eq!(u.handle(centre(controls.opacity_down)), Action::Redraw { full: false });
+        assert_eq!(u.wallpaper_preview.as_ref().unwrap().opacity, 50);
+        u.handle(centre(u.layout.done_button()));
+        assert_eq!(u.screen, Screen::WallpaperPicker(target));
+        assert_eq!(u.wallpapers, wallpapers);
+        assert!(u.wallpaper_preview.is_none());
+
+        u.handle(centre(picture_row));
+        assert_eq!(u.handle(centre(controls.opacity_track)), Action::Redraw { full: false });
+        for _ in 0..2 {
+            assert_eq!(u.handle(centre(controls.opacity_up)), Action::Redraw { full: false });
+        }
+        assert_eq!(u.handle(centre(controls.apply)), Action::SetWallpaper { target, choice, opacity: 70 });
+        assert_eq!(u.wallpapers.opacity(WallpaperTarget::Home), 60);
+        assert_eq!(u.wallpapers.opacity(WallpaperTarget::Sleep), 100);
+        assert_eq!(u.wallpapers.opacity(WallpaperTarget::Startup), 100);
+        u.finish_wallpaper_preview();
+        assert_eq!(u.screen, Screen::WallpaperPicker(target));
+        assert!(u.wallpaper_preview.is_none());
     }
 
     #[test]

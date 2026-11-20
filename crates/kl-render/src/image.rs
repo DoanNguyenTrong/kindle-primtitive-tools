@@ -174,6 +174,21 @@ pub fn wallpaper_tile(png_bytes: &[u8], width: u32, height: u32) -> Result<GrayI
     Ok(tile)
 }
 
+/// Fade a prepared Sleep or Startup picture toward white, then restore the panel's gray steps.
+pub fn blend_wallpaper(tile: &mut GrayImage, opacity: u8) {
+    let opacity = u16::from(opacity.min(100));
+    if opacity == 100 {
+        return;
+    }
+    for pixel in &mut tile.pixels {
+        let distance = u16::from(255 - *pixel);
+        *pixel = 255 - ((distance * opacity + 50) / 100) as u8;
+    }
+    if opacity > 0 {
+        dither16(tile);
+    }
+}
+
 /// Corner radius of the rounded-square icons, as a share of their side (as on iOS).
 pub const ICON_RADIUS: f32 = 0.225;
 /// The icon outline's width in pixels: white icons keep their shape on the white page.
@@ -366,6 +381,19 @@ mod tests {
 
         let tall = png_bytes(2, 4, png::ColorType::Grayscale, &[0, 0, 85, 85, 170, 170, 255, 255]);
         assert_eq!(wallpaper_tile(&tall, 2, 2).unwrap().pixels, [85, 85, 170, 170]);
+    }
+
+    #[test]
+    fn wallpaper_opacity_blends_toward_white_at_panel_steps() {
+        let source = GrayImage { width: 8, height: 8, pixels: vec![0; 64] };
+        let mut faded = source.clone();
+        blend_wallpaper(&mut faded, 100);
+        assert_eq!(faded, source);
+        blend_wallpaper(&mut faded, 50);
+        assert!(faded.pixels.iter().all(|&pixel| matches!(pixel, 119 | 136)));
+        assert!((126..=129).contains(&(faded.pixels.iter().map(|&pixel| u16::from(pixel)).sum::<u16>() / 64)));
+        blend_wallpaper(&mut faded, 0);
+        assert_eq!(faded, GrayImage::blank(8, 8));
     }
 
     #[test]

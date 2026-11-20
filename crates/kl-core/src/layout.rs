@@ -404,6 +404,17 @@ pub struct Layout {
     pub rows: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallpaperPreviewLayout {
+    pub picture: Rect,
+    pub choice_label: Rect,
+    pub opacity_label: Rect,
+    pub opacity_down: Rect,
+    pub opacity_up: Rect,
+    pub opacity_track: Rect,
+    pub apply: Rect,
+}
+
 /// The status bar and the quick settings header have the same height, so their clock, Wi-Fi and battery line up.
 pub const STATUS_H: i32 = 120;
 /// The row of page dots (and notices) at the bottom of the home screen.
@@ -743,6 +754,27 @@ impl Layout {
             return None;
         }
         Some(((y - first.y as f32) / first.h as f32) as usize)
+    }
+
+    /// A device-proportioned picture above the preview's opacity and Apply controls.
+    pub fn wallpaper_preview(&self) -> WallpaperPreviewLayout {
+        let width = self.width - 2 * MARGIN;
+        let choice_label = Rect::new(MARGIN, TITLE_H + 8, width, 54);
+        let apply_w = width.min(460);
+        let apply = Rect::new((self.width - apply_w) / 2, self.height - MARGIN - BUTTON_H, apply_w, BUTTON_H);
+        let opacity_y = apply.y - BUTTON_H - 20;
+        let opacity_label = Rect::new(MARGIN, opacity_y - 56, width, 48);
+        let opacity_down = Rect::new(MARGIN, opacity_y, BUTTON_H, BUTTON_H);
+        let opacity_up = Rect::new(self.width - MARGIN - BUTTON_H, opacity_y, BUTTON_H, BUTTON_H);
+        let track_x = opacity_down.right() + 16;
+        let opacity_track = Rect::new(track_x, opacity_y, opacity_up.x - 16 - track_x, BUTTON_H);
+
+        let picture_y = choice_label.bottom() + 16;
+        let max_picture_h = (opacity_label.y - 20 - picture_y).max(0);
+        let picture_w = (max_picture_h * self.width / self.height).min(width);
+        let picture_h = picture_w * self.height / self.width;
+        let picture = Rect::new((self.width - picture_w) / 2, picture_y, picture_w, picture_h);
+        WallpaperPreviewLayout { picture, choice_label, opacity_label, opacity_down, opacity_up, opacity_track, apply }
     }
 
     /// The Wi-Fi page's own area under its Wi-Fi section: the current network, then the scan list.
