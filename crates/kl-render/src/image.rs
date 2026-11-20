@@ -149,6 +149,31 @@ pub fn picture_tile(png_bytes: &[u8], w: u32, h: u32) -> Result<GrayImage, Strin
     Ok(tile)
 }
 
+/// A Home Screen picture, centre-cropped to fill the frame and dithered to the panel's gray steps.
+pub fn wallpaper_tile(png_bytes: &[u8], width: u32, height: u32) -> Result<GrayImage, String> {
+    let source = decode_png(png_bytes)?;
+    let mut tile = GrayImage::blank(width, height);
+    if width == 0 || height == 0 {
+        return Ok(tile);
+    }
+    let source_w = f64::from(source.width);
+    let source_h = f64::from(source.height);
+    let scale = (f64::from(width) / source_w).max(f64::from(height) / source_h);
+    let left = ((source_w - f64::from(width) / scale) / 2.0).max(0.0);
+    let top = ((source_h - f64::from(height) / scale) / 2.0).max(0.0);
+    for y in 0..height {
+        let y0 = top + f64::from(y) / scale;
+        let y1 = (top + f64::from(y + 1) / scale).min(source_h);
+        for x in 0..width {
+            let x0 = left + f64::from(x) / scale;
+            let x1 = (left + f64::from(x + 1) / scale).min(source_w);
+            tile.pixels[(y * width + x) as usize] = area_average(&source, x0, y0, x1, y1);
+        }
+    }
+    dither16(&mut tile);
+    Ok(tile)
+}
+
 /// Corner radius of the rounded-square icons, as a share of their side (as on iOS).
 pub const ICON_RADIUS: f32 = 0.225;
 /// The icon outline's width in pixels: white icons keep their shape on the white page.
@@ -329,6 +354,18 @@ mod tests {
         let tile = fit(&big, 240, 360);
         assert_eq!((tile.width, tile.height), (240, 360));
         assert_eq!(tile.pixels[(180 * 240 + 120) as usize], 0);
+    }
+
+    #[test]
+    fn wallpaper_crops_to_the_centre_without_stretching() {
+        let stripes = [0, 85, 170, 255, 0, 85, 170, 255];
+        let wide = png_bytes(4, 2, png::ColorType::Grayscale, &stripes);
+        let cropped = wallpaper_tile(&wide, 2, 2).unwrap();
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(cropped.pixels, [85, 170, 85, 170]);
+
+        let tall = png_bytes(2, 4, png::ColorType::Grayscale, &[0, 0, 85, 85, 170, 170, 255, 255]);
+        assert_eq!(wallpaper_tile(&tall, 2, 2).unwrap().pixels, [85, 85, 170, 170]);
     }
 
     #[test]

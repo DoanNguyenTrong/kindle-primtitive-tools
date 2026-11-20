@@ -580,12 +580,22 @@ pub fn orientation_loop(start: Rotation, mut report: impl FnMut(Rotation) -> boo
 /// sleep. KOReader does the same in its framework-stopped mode. It stays unloaded until blanket restarts
 /// (Kindle mode or a reboot).
 pub fn unload_stock_screensaver() {
+    set_stock_screensaver(false);
+}
+
+pub fn stock_screensaver_loaded() -> bool {
+    get_text("com.lab126.blanket", "load").split_whitespace().any(|module| module == "screensaver")
+}
+
+pub fn set_stock_screensaver(enabled: bool) -> bool {
+    let operation = if enabled { "load" } else { "unload" };
     let ok = Command::new("lipc-set-prop")
-        .args(["com.lab126.blanket", "unload", "screensaver"])
+        .args(["com.lab126.blanket", operation, "screensaver"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    log(&format!("stock screensaver unloaded: {ok}"));
+    log(&format!("stock screensaver {operation}: {ok}"));
+    ok
 }
 
 /// The launcher's folder (`KL_DIR`, default /mnt/us/launcher).

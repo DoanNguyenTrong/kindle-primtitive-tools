@@ -91,6 +91,8 @@ pub struct Renderer {
     large_text: bool,
     high_contrast: bool,
     icons: HashMap<String, GrayImage>,
+    /// The photo behind the Launcher grid, already prepared at the screen size.
+    home_wallpaper: Option<GrayImage>,
     /// The launcher's own sleep screen picture, when one is set (screensavers folder).
     sleep_image: Option<GrayImage>,
     /// The drive-mode picture (`assets/usb-drive-mode.png`), fitted to the screen and snapped to black and white.
@@ -176,6 +178,7 @@ impl Renderer {
             large_text: false,
             high_contrast: false,
             icons: HashMap::new(),
+            home_wallpaper: None,
             sleep_image: None,
             store_blits: Vec::new(),
             usb_picture: None,
@@ -201,6 +204,11 @@ impl Renderer {
         let tile = image::picture_tile(png, STORE_SHOT_W, STORE_SHOT_H)?;
         self.set_icon(&store_shot_key(id, index), tile);
         Ok(())
+    }
+
+    /// The screen-sized photo behind the home grid (`None` for a plain background).
+    pub fn set_home_wallpaper(&mut self, picture: Option<GrayImage>) {
+        self.home_wallpaper = picture;
     }
 
     /// The picture for the next sleep screen (`None`: the text sleep screen).
@@ -450,6 +458,7 @@ impl Renderer {
             Screen::Home => self.home(ui, status, &mut icon_blits),
             Screen::Settings => self.settings_home(ui, status),
             Screen::Page(page) => self.settings_page(ui, status, page),
+            Screen::WallpaperPicker(target) => self.settings_wallpaper_picker(ui, target),
             Screen::NetworkDetail => self.network_detail(ui),
             Screen::Password => self.password_screen(ui),
             Screen::NetworkName => self.network_name_screen(ui),
@@ -473,6 +482,11 @@ impl Renderer {
         icon_blits.append(&mut self.store_blits);
         let width = self.width as usize;
         let mut out = self.finish_gray();
+        if matches!(ui.screen, Screen::Home | Screen::ConfirmKindle | Screen::PowerMenu | Screen::AppMenu | Screen::QuickSettings) {
+            if let Some(picture) = &self.home_wallpaper {
+                shade_home_wallpaper(&mut out, &l, picture, status.dark_mode);
+            }
+        }
         // Pictures (icons, the sleep picture) keep their look in dark mode.
         let mut pictures = Vec::new();
         for (rect, id) in icon_blits {
@@ -1828,7 +1842,7 @@ impl Renderer {
                     self.button(Rect::new(r.right() - 240, r.y + 28, 200, 64), "Sync", false);
                 }
                 Button::RefreshTimeZone => self.button(Rect::new(r.right() - 240, r.y + 28, 200, 64), "Refresh", false),
-                Button::OpenPage(_) | Button::ManageInstalled | Button::GridColumns | Button::GridRows => self.chevron(r),
+                Button::OpenPage(_) | Button::OpenWallpaperPicker(_) | Button::ManageInstalled | Button::GridColumns | Button::GridRows => self.chevron(r),
                 Button::LowPower => self.switch(switch_rect(r), s.low_power),
                 Button::KindleUi => self.chevron(r),
                 Button::Restart => {}
@@ -2077,6 +2091,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
     match page {
         Page::Wifi => wifi_word(s),
         Page::Display => format!("Front light {} · Dark mode {}", light_description(s.light, s.display_support.front_light), onoff(s.dark_mode)),
+        Page::Wallpaper => "Home, sleep, and startup pictures".into(),
         Page::Accessibility => format!("Larger text {} · Higher contrast {}", onoff(s.large_text), onoff(s.high_contrast)),
         Page::Sleep => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },
         Page::Apps => format!("{} hidden", ui.hidden_count()),
@@ -2116,6 +2131,8 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
         Row::TextPreview => "Read at your own pace.".into(),
         Row::Wifi => wifi_word(s),
         Row::DarkMode => if s.dark_mode { "On: white on black".into() } else { "Off".into() },
+        Row::WallpaperLink => "Home, sleep, and startup pictures".into(),
+        Row::Wallpaper(target) => ui.wallpapers.selection(target).label(target).into(),
         Row::Animation => if s.animation { "On: a zoom when an app opens".into() } else { "Off".into() },
         Row::Rotation => match (s.auto_rotation, s.rotation) {
             (true, Rotation::Upright) => "Automatic: upright".into(),
@@ -2166,6 +2183,27 @@ fn capitalise(s: &str) -> String {
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+/// Shade the photo for legibility behind the grid. The status strip, page dots, and notices keep the
+/// normal background. App artwork and dialogs are drawn over this afterward.
+fn shade_home_wallpaper(out: &mut [u8], layout: &Layout, picture: &GrayImage, dark: bool) {
+    if picture.width as i32 != layout.width || picture.height as i32 != layout.height || picture.pixels.len() != out.len() {
+        return;
+    }
+    let top = layout.status().bottom() as usize * layout.width as usize;
+    let bottom = layout.home_footer().y as usize * layout.width as usize;
+    let Some(grid) = out.get_mut(top..bottom) else { return };
+    for (ink, &sample) in grid.iter_mut().zip(&picture.pixels[top..bottom]) {
+        if *ink == BLACK {
+            continue;
+        }
+        // The final dark-mode pass inverts the entire chrome. Pre-invert the photo's samples so it
+        // stays a darkened picture in dark mode instead of becoming a negative.
+        let tone = u16::from(if dark { WHITE - sample } else { sample });
+        let shaded = (9 + (tone * 6 + 127) / 255) * 17;
+        *ink = (u16::from(*ink) * shaded / 255) as u8;
     }
 }
 
@@ -2334,6 +2372,25 @@ mod tests {
         let tile = GrayImage { width: 3, height: 3, pixels: vec![0; 9] };
         blit(&mut out, 10, Rect::new(8, 2, 3, 3), &tile);
         assert_eq!(out.iter().filter(|&&p| p == 0).count(), 4);
+    }
+
+    #[test]
+    fn wallpaper_leaves_chrome_and_black_labels_intact() {
+        let layout = Layout::new(128, 600, 3, 3);
+        let mut picture = GrayImage::blank(128, 600);
+        picture.pixels.fill(0);
+        let mut frame = vec![WHITE; picture.pixels.len()];
+        let top = layout.status().bottom() as usize * 128;
+        let bottom = layout.home_footer().y as usize * 128;
+        frame[top] = BLACK;
+        picture.pixels[top + 2] = WHITE;
+        let mut dark = frame.clone();
+        shade_home_wallpaper(&mut frame, &layout, &picture, false);
+        shade_home_wallpaper(&mut dark, &layout, &picture, true);
+        image::invert_except(&mut dark, 128, &[], None);
+        assert_eq!(&frame[top - 1..top + 3], &[WHITE, BLACK, 153, WHITE]);
+        assert_eq!(&dark[top - 1..top + 3], &[BLACK, WHITE, BLACK, 102]);
+        assert_eq!((frame[bottom], dark[bottom]), (WHITE, BLACK));
     }
 
     #[test]

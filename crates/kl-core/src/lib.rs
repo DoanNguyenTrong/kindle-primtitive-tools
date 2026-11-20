@@ -16,6 +16,7 @@ pub mod store;
 pub mod store_open;
 pub mod tz;
 pub mod ui;
+pub mod wallpaper;
 pub mod wifi;
 
 pub use apps::{discover, App, IconSource, Launch};

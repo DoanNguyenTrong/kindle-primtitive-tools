@@ -4,6 +4,7 @@ use super::{
 use kl_core::{
     battery::{Sample, Source, HISTORY_SECS},
     layout::Page,
+    wallpaper::WallpaperTarget,
     Usb,
 };
 use vello_cpu::kurbo::{self, Affine, Shape};
@@ -90,6 +91,86 @@ impl Renderer {
         }
         self.ctx.pop_clip();
         self.settings_scrollbar(viewport, scroll, ui.visibility_scroll_max());
+    }
+
+    pub(super) fn settings_wallpaper_picker(&mut self, ui: &Ui, target: WallpaperTarget) {
+        let layout = ui.layout;
+        let title = layout.title();
+        let back = layout.done_button();
+        self.text(Text {
+            text: target.title(),
+            x: MARGIN_X as f32,
+            y: 36.0,
+            w: (back.x - 2 * MARGIN_X) as f32,
+            size: 56.0,
+            bold: true,
+            align: Align::Start,
+            lines: 1,
+            gray: BLACK,
+        });
+        self.button(back, "Back", true);
+        self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
+
+        let viewport = layout.visibility_viewport();
+        let scroll = ui.wallpaper_scroll;
+        let choices: Vec<_> = ui.wallpapers.choices(target).collect();
+        let max_scroll = layout.visibility_scroll_max(choices.len());
+        let first = layout.visibility_row(0, scroll);
+        let last = layout.visibility_row(choices.len() - 1, scroll);
+        let card = Rect::new(first.x, first.y, first.w, last.bottom() - first.y);
+        let active = ui.wallpapers.selection(target);
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.push_clip_rect(&krect(viewport));
+        self.card(card);
+        for (index, choice) in choices.iter().enumerate() {
+            let row = layout.visibility_row(index, scroll);
+            if row.bottom() <= viewport.y || row.y >= viewport.bottom() {
+                continue;
+            }
+            self.text(Text {
+                text: choice.label(target),
+                x: (row.x + 32) as f32,
+                y: (row.y + (row.h - 50) / 2) as f32,
+                w: (row.w - 140) as f32,
+                size: 36.0,
+                bold: choice == active,
+                align: Align::Start,
+                lines: 1,
+                gray: BLACK,
+            });
+            let radio = Rect::new(row.right() - 82, row.y + (row.h - 42) / 2, 42, 42);
+            self.rounded_frame(radio, 21.0, 3, BLACK, WHITE);
+            if choice == active {
+                self.rounded(radio.inset(10), 11.0, BLACK);
+            }
+            if index + 1 < choices.len() {
+                self.hairline(row.bottom() - 1, card.x + 32, card.right() - 32);
+            }
+        }
+        self.ctx.pop_clip();
+        self.settings_scrollbar(viewport, scroll, max_scroll);
+
+        let (hint, bold, y) = if let Some(notice) = &ui.notice {
+            (notice.as_str(), true, viewport.bottom() + 12)
+        } else {
+            let hint = if ui.wallpapers.images.is_empty() {
+                "No PNG files found. Copy pictures to launcher/wallpapers/."
+            } else {
+                "Copy more PNG files to launcher/wallpapers/."
+            };
+            (hint, false, (card.bottom() + 24).min(viewport.bottom() + 12))
+        };
+        self.text(Text {
+            text: hint,
+            x: MARGIN_X as f32,
+            y: y as f32,
+            w: (layout.width - 2 * MARGIN_X) as f32,
+            size: 28.0,
+            bold,
+            align: Align::Start,
+            lines: 2,
+            gray: if bold { BLACK } else { 85 },
+        });
     }
 
     pub(super) fn level_meter(&mut self, row: Rect, level: u64, total: u64) {

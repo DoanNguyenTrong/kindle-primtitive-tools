@@ -10,6 +10,7 @@ use crate::{
     battery::{self, Warning},
     layout::{Button, Layout, Page, QuickTile, Rect},
     settings::Rotation,
+    wallpaper::{WallpaperChoice, WallpaperSettings, WallpaperTarget},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub enum Screen {
     QuickSettings,
     /// One page of Settings (Settings > page; Back returns to the Settings list).
     Page(Page),
+    WallpaperPicker(WallpaperTarget),
     /// One network from the Wi-Fi scan: connect, or forget a saved one.
     NetworkDetail,
     /// The password of a new secured network, typed on the on-screen keyboard.
@@ -118,6 +120,7 @@ pub enum Action {
     SetOrder(Vec<(String, i64)>),
     /// Set (`Some`) or clear (`None`) an app's icon file. Written to apps.toml; the driver reloads the tile.
     SetIcon { id: String, icon: Option<String> },
+    SetWallpaper { target: WallpaperTarget, choice: WallpaperChoice },
     /// Run an app while the launcher stays in front (background mode); the driver shows its last output line.
     RunBackground(App),
     /// Scan for Wi-Fi networks (the Wi-Fi page's Scan button, or opening the page). The driver sends the result back.
@@ -329,8 +332,10 @@ pub struct Ui {
     pub page: usize,
     pub settings_scroll: i32,
     pub clock_syncing: bool,
-    settings_parent: Option<Page>,
+    settings_parents: Vec<Page>,
     pub visibility_scroll: i32,
+    pub wallpapers: WallpaperSettings,
+    pub wallpaper_scroll: i32,
     pub managed_count: Option<usize>,
     pub firmware: Option<String>,
     pub device_profile: Option<String>,
@@ -428,8 +433,10 @@ impl Ui {
             page: 0,
             settings_scroll: 0,
             clock_syncing: false,
-            settings_parent: None,
+            settings_parents: Vec::new(),
             visibility_scroll: 0,
+            wallpapers: WallpaperSettings::default(),
+            wallpaper_scroll: 0,
             managed_count: None,
             firmware: None,
             device_profile: None,
@@ -1318,6 +1325,18 @@ impl Ui {
         self.layout.visibility_scroll_max(self.visibility_len())
     }
 
+    pub fn wallpaper_scroll_max(&self, target: WallpaperTarget) -> i32 {
+        self.layout.visibility_scroll_max(self.wallpapers.choices(target).count())
+    }
+
+    pub fn set_wallpapers(&mut self, wallpapers: WallpaperSettings) {
+        self.wallpapers = wallpapers;
+        let screen = if self.screen == Screen::Sleep { self.before_sleep } else { self.screen };
+        if let Screen::WallpaperPicker(target) = screen {
+            self.wallpaper_scroll = self.wallpaper_scroll.min(self.wallpaper_scroll_max(target));
+        }
+    }
+
     pub fn visible_visibility_apps(&self) -> impl Iterator<Item = (usize, &App)> {
         let viewport = self.layout.visibility_viewport();
         self.visibility_apps().into_iter().enumerate().filter(move |(index, _)| {
@@ -1490,12 +1509,12 @@ impl Ui {
 
     fn open_settings(&mut self) -> Action {
         self.settings_scroll = 0;
-        self.settings_parent = None;
+        self.settings_parents.clear();
         self.go(Screen::Settings)
     }
 
     fn back_from_setting(&mut self) -> Action {
-        let target = self.settings_parent.take().map_or(Screen::Settings, Screen::Page);
+        let target = self.settings_parents.pop().map_or(Screen::Settings, Screen::Page);
         self.go(target)
     }
 
@@ -1550,6 +1569,7 @@ impl Ui {
             Screen::Home => self.home(input),
             Screen::Settings => self.settings_home(input),
             Screen::Page(page) => self.settings_page(input, page),
+            Screen::WallpaperPicker(target) => self.wallpaper_picker(input, target),
             Screen::NetworkDetail => self.network_detail(input),
             Screen::Password => self.password_screen(input),
             Screen::NetworkName => self.network_name_screen(input),
@@ -1620,7 +1640,7 @@ impl Ui {
                 }
                 if l.header_battery().inset(-12).contains(x, y) {
                     self.settings_scroll = 0;
-                    self.settings_parent = None;
+                    self.settings_parents.clear();
                     return self.go(Screen::Page(Page::Battery));
                 }
                 if let Some((tile, _)) = l.quick_buttons().into_iter().find(|(_, slot)| slot.contains(x, y)) {
@@ -1800,7 +1820,7 @@ impl Ui {
                 }
                 match self.layout.settings_home_at(self.settings_scroll, x, y) {
                     Some(page) => {
-                        self.settings_parent = None;
+                        self.settings_parents.clear();
                         self.go(Screen::Page(page))
                     }
                     None => Action::None,
@@ -1831,6 +1851,27 @@ impl Ui {
             _ => {
                 let max = self.visibility_scroll_max();
                 scroll_settings_list(input, self.layout.visibility_viewport(), &mut self.visibility_scroll, max)
+            }
+        }
+    }
+
+    fn wallpaper_picker(&mut self, input: Input, target: WallpaperTarget) -> Action {
+        match input {
+            Input::PageBack if self.wallpaper_scroll == 0 => self.go(Screen::Page(Page::Wallpaper)),
+            Input::Tap(x, y) if self.layout.done_button().inset(-20).contains(x, y) => {
+                self.go(Screen::Page(Page::Wallpaper))
+            }
+            Input::Tap(x, y) => {
+                let Some(index) = self.layout.visibility_at(self.wallpaper_scroll, x, y) else { return Action::None };
+                let Some(choice) = self.wallpapers.choices(target).nth(index) else { return Action::None };
+                if self.wallpapers.selection(target) == &choice {
+                    return Action::None;
+                }
+                Action::SetWallpaper { target, choice }
+            }
+            _ => {
+                let max = self.wallpaper_scroll_max(target);
+                scroll_settings_list(input, self.layout.visibility_viewport(), &mut self.wallpaper_scroll, max)
             }
         }
     }
@@ -1896,9 +1937,13 @@ impl Ui {
             Input::Tap(x, y) => match self.layout.settings_button_at(page, x, y) {
                 Some(Button::Done) => self.back_from_setting(),
                 Some(Button::OpenPage(target)) => {
-                    self.settings_parent = Some(page);
+                    self.settings_parents.push(page);
                     self.visibility_scroll = 0;
                     self.go(Screen::Page(target))
+                }
+                Some(Button::OpenWallpaperPicker(target)) => {
+                    self.wallpaper_scroll = 0;
+                    self.go(Screen::WallpaperPicker(target))
                 }
                 Some(Button::ManageInstalled) => Action::Device(DeviceCmd::OpenInstalledApps),
                 Some(Button::LowPower) => Action::Device(DeviceCmd::ToggleLowPower),
@@ -2002,6 +2047,50 @@ mod tests {
         assert_eq!(u.handle(centre(refresh)), Action::Device(DeviceCmd::RefreshTimeZone));
         u.usb = Usb::Drive;
         assert_eq!(u.handle(centre(refresh)), Action::None);
+    }
+
+    #[test]
+    fn wallpaper_picker_scrolls_selects_and_returns_through_nested_settings() {
+        use crate::layout::Row;
+        let mut u = ui(22);
+        let mut wallpapers = WallpaperSettings {
+            images: (0..25).map(|i| format!("Image {i:02}.png")).collect(),
+            ..WallpaperSettings::default()
+        };
+        u.set_wallpapers(wallpapers.clone());
+        u.open_settings();
+        let row = |u: &Ui, page, label| u.layout.page_sections(page).into_iter()
+            .flat_map(|section| section.rows).find(|item| item.row == label).unwrap().rect;
+        let battery = u.layout.settings_home_rows(0).into_iter().find(|(page, _)| *page == Page::Battery).unwrap().1;
+        u.handle(centre(battery));
+        u.handle(centre(row(&u, Page::Battery, Row::BatteryDisplay)));
+        u.handle(centre(row(&u, Page::Display, Row::WallpaperLink)));
+        assert_eq!(u.screen, Screen::Page(Page::Wallpaper));
+        let target = WallpaperTarget::Sleep;
+        u.handle(centre(row(&u, Page::Wallpaper, Row::Wallpaper(target))));
+        assert_eq!(u.screen, Screen::WallpaperPicker(target));
+        assert_eq!(u.wallpaper_scroll, 0);
+        assert_eq!(u.handle(centre(u.layout.visibility_row(0, 0))), Action::None);
+        assert_eq!(u.handle(centre(u.layout.visibility_row(1, 0))), Action::SetWallpaper {
+            target,
+            choice: WallpaperChoice::Rotate,
+        });
+        u.handle(Input::Swipe { dx: 0.0, dy: -3000.0, start_y: 1400.0 });
+        assert_eq!(u.wallpaper_scroll, u.wallpaper_scroll_max(target));
+        assert_eq!(u.handle(centre(u.layout.visibility_row(26, u.wallpaper_scroll))), Action::SetWallpaper {
+            target,
+            choice: WallpaperChoice::File("Image 24.png".into()),
+        });
+        wallpapers.images.truncate(1);
+        u.set_wallpapers(wallpapers);
+        assert_eq!(u.wallpaper_scroll, 0);
+        for expected in [Screen::Page(Page::Wallpaper), Screen::Page(Page::Display),
+            Screen::Page(Page::Battery), Screen::Settings]
+        {
+            u.handle(centre(u.layout.done_button()));
+            assert_eq!(u.screen, expected);
+        }
+        assert_eq!(u.wallpapers.choices(WallpaperTarget::Startup).count(), 2);
     }
 
     #[test]

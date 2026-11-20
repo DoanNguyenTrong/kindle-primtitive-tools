@@ -1,6 +1,8 @@
 //! Screen geometry, shared by drawing and hit testing so a tap lands on what is drawn. All values are
 //! device pixels of the upright portrait screen (1264 × 1680 on the Oasis 3).
 
+use crate::wallpaper::WallpaperTarget;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
     pub x: i32,
@@ -53,6 +55,7 @@ pub enum Page {
     Connection,
     FileTransfer,
     Display,
+    Wallpaper,
     Accessibility,
     Battery,
     Sleep,
@@ -73,8 +76,8 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 14] = [
-        Page::Battery, Page::Display, Page::Accessibility, Page::Sleep, Page::Wifi,
+    pub const ALL: [Page; 15] = [
+        Page::Battery, Page::Display, Page::Wallpaper, Page::Accessibility, Page::Sleep, Page::Wifi,
         Page::Connection, Page::FileTransfer, Page::Apps, Page::AppVisibility, Page::Store,
         Page::Storage, Page::Device, Page::DateTime, Page::About,
     ];
@@ -85,6 +88,7 @@ impl Page {
             Page::Connection => "SSH & DNS",
             Page::FileTransfer => "Wi-Fi file transfer",
             Page::Display => "Display",
+            Page::Wallpaper => "Wallpaper",
             Page::Accessibility => "Accessibility",
             Page::Battery => "Battery",
             Page::Sleep => "Sleep",
@@ -116,9 +120,21 @@ impl Page {
             ],
             Page::Display => &[
                 Group { header: "Brightness", rows: &[Row::Frontlight, Row::Warmth], footer: "" },
-                Group { header: "Appearance", rows: &[Row::DarkMode], footer: "White on black for the launcher's screens. Pictures keep their colours." },
+                Group { header: "Appearance", rows: &[Row::DarkMode, Row::WallpaperLink], footer: "Dark mode lightens text against a dark background." },
                 Group { header: "Motion", rows: &[Row::Animation], footer: "A card zooms out of the icon when an app opens." },
                 Group { header: "Screen", rows: &[Row::Rotation], footer: "Turns with the Kindle while Auto is on. Tap the value to set it by hand." },
+            ],
+            Page::Wallpaper => &[
+                Group {
+                    header: "Launcher",
+                    rows: &[Row::Wallpaper(WallpaperTarget::Home), Row::Wallpaper(WallpaperTarget::Sleep)],
+                    footer: "The Sleep Screen picture is used when the Kindle goes to sleep with Launcher open.",
+                },
+                Group {
+                    header: "Startup",
+                    rows: &[Row::Wallpaper(WallpaperTarget::Startup)],
+                    footer: "Shown after the Kindle startup screen when Launcher is set to start automatically.",
+                },
             ],
             Page::Accessibility => &[
                 Group {
@@ -207,6 +223,7 @@ pub enum Button {
     Autostart,
     ShowHidden,
     OpenPage(Page),
+    OpenWallpaperPicker(WallpaperTarget),
     ManageInstalled,
     GridColumns,
     GridRows,
@@ -258,6 +275,8 @@ pub enum Row {
     Frontlight,
     Warmth,
     DarkMode,
+    WallpaperLink,
+    Wallpaper(WallpaperTarget),
     Wifi,
     Rotation,
     Animation,
@@ -294,10 +313,14 @@ pub enum Row {
 }
 
 impl Row {
-    pub const ALL: [Row; 36] = [
+    pub const ALL: [Row; 40] = [
         Row::Frontlight,
         Row::Warmth,
         Row::DarkMode,
+        Row::WallpaperLink,
+        Row::Wallpaper(WallpaperTarget::Home),
+        Row::Wallpaper(WallpaperTarget::Sleep),
+        Row::Wallpaper(WallpaperTarget::Startup),
         Row::Wifi,
         Row::Rotation,
         Row::Animation,
@@ -327,6 +350,8 @@ impl Row {
             Row::Frontlight => "Front light",
             Row::Warmth => "Warmth",
             Row::DarkMode => "Dark mode",
+            Row::WallpaperLink => "Wallpaper",
+            Row::Wallpaper(target) => target.title(),
             Row::Animation => "Opening animation",
             Row::Wifi => "Wi-Fi",
             Row::Rotation => "Rotation",
@@ -491,6 +516,8 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
         ],
         Row::Hidden => vec![(Button::ShowHidden, Rect::new(r.right() - SWITCH_INSET - 200, r.y + (r.h - SWITCH_H) / 2, 200, SWITCH_H))],
         Row::AppVisibility => vec![(Button::OpenPage(Page::AppVisibility), r)],
+        Row::WallpaperLink => vec![(Button::OpenPage(Page::Wallpaper), r)],
+        Row::Wallpaper(target) => vec![(Button::OpenWallpaperPicker(target), r)],
         Row::ManageInstalled => vec![(Button::ManageInstalled, r)],
         Row::GridColumns => vec![(Button::GridColumns, r)],
         Row::GridRows => vec![(Button::GridRows, r)],
@@ -1328,7 +1355,7 @@ mod tests {
         let d = l.done_button();
         assert_eq!(l.settings_button_at(Page::Display, (d.x + 1) as f32, (d.y + 1) as f32), Some(Button::Done));
         let top = l.settings_home_rows(0);
-        assert_eq!(top.len() + 1, Page::ALL.len()); // App visibility is inside Apps.
+        assert_eq!(top.len() + 2, Page::ALL.len()); // App visibility and Wallpaper are nested.
         let viewport = l.settings_viewport();
         assert!(top.last().unwrap().1.bottom() > viewport.bottom());
         let scroll = l.settings_scroll_max();
