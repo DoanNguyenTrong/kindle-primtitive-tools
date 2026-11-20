@@ -482,10 +482,11 @@ impl Renderer {
         icon_blits.append(&mut self.store_blits);
         let width = self.width as usize;
         let mut out = self.finish_gray();
-        if matches!(ui.screen, Screen::Home | Screen::ConfirmKindle | Screen::PowerMenu | Screen::AppMenu | Screen::QuickSettings) {
-            if let Some(picture) = &self.home_wallpaper {
-                shade_home_wallpaper(&mut out, &l, picture, status.dark_mode);
-            }
+        let wallpaper = self.home_wallpaper.as_ref().filter(|_| {
+            matches!(ui.screen, Screen::Home | Screen::ConfirmKindle | Screen::PowerMenu | Screen::AppMenu | Screen::QuickSettings)
+        });
+        if let Some(picture) = wallpaper {
+            shade_home_wallpaper(&mut out, &l, picture, status.dark_mode);
         }
         // Pictures (icons, the sleep picture) keep their look in dark mode.
         let mut pictures = Vec::new();
@@ -502,8 +503,10 @@ impl Renderer {
                     }
                     pictures.push(((rect.x, top, rect.w, bottom - top), 0.0));
                 } else {
-                    blit(&mut out, width, rect, tile);
-                    pictures.push(((rect.x, rect.y, rect.w, rect.h), rect.w as f32 * image::ICON_RADIUS));
+                    let radius = rect.w as f32 * image::ICON_RADIUS;
+                    let clip_radius = if wallpaper.is_some() { radius } else { 0.0 };
+                    blit(&mut out, width, rect, tile, clip_radius);
+                    pictures.push(((rect.x, rect.y, rect.w, rect.h), radius));
                 }
             }
         }
@@ -511,7 +514,7 @@ impl Renderer {
             if let Some(picture) = &self.sleep_image {
                 let s = l.screen();
                 let r = Rect::new((s.w - picture.width as i32) / 2, (s.h - picture.height as i32) / 2, picture.width as i32, picture.height as i32);
-                blit(&mut out, width, r, picture);
+                blit(&mut out, width, r, picture, 0.0);
                 pictures.push(((r.x, r.y, r.w, r.h), 0.0));
             }
         }
@@ -2068,7 +2071,7 @@ impl Renderer {
             let inner = tile(4).inset(18);
             let mut fitted = image::fit(logo, inner.w as u32, inner.h as u32);
             image::dither16(&mut fitted);
-            blit(&mut out, w as usize, inner, &fitted);
+            blit(&mut out, w as usize, inner, &fitted, 0.0);
         }
         out
     }
@@ -2207,8 +2210,8 @@ fn shade_home_wallpaper(out: &mut [u8], layout: &Layout, picture: &GrayImage, da
     }
 }
 
-/// Copy a tile into the screen buffer at `r` (clipped to the tile and screen).
-fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage) {
+/// Copy a tile into the screen buffer at `r`, clipping to the tile, screen, and any rounded corners.
+fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, radius: f32) {
     let height = out.len() / width;
     for ty in 0..(tile.height as usize).min(r.h.max(0) as usize) {
         let y = r.y as usize + ty;
@@ -2217,7 +2220,16 @@ fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage) {
         }
         let n = (tile.width as usize).min(r.w.max(0) as usize).min(width.saturating_sub(r.x as usize));
         let src = &tile.pixels[ty * tile.width as usize..ty * tile.width as usize + n];
-        out[y * width + r.x as usize..y * width + r.x as usize + n].copy_from_slice(src);
+        let dst = &mut out[y * width + r.x as usize..y * width + r.x as usize + n];
+        if radius == 0.0 {
+            dst.copy_from_slice(src);
+            continue;
+        }
+        for (x, (ink, &sample)) in dst.iter_mut().zip(src).enumerate() {
+            if image::rect_distance(x as i32, ty as i32, r.w, r.h, radius) < 0.0 {
+                *ink = sample;
+            }
+        }
     }
 }
 
@@ -2370,8 +2382,19 @@ mod tests {
     fn blit_stays_inside() {
         let mut out = vec![255u8; 10 * 4];
         let tile = GrayImage { width: 3, height: 3, pixels: vec![0; 9] };
-        blit(&mut out, 10, Rect::new(8, 2, 3, 3), &tile);
+        blit(&mut out, 10, Rect::new(8, 2, 3, 3), &tile, 0.0);
         assert_eq!(out.iter().filter(|&&p| p == 0).count(), 4);
+    }
+
+    #[test]
+    fn rounded_icon_corners_show_the_wallpaper_in_both_themes() {
+        let tile = GrayImage::blank(20, 20);
+        let mut frame = vec![170; tile.pixels.len()];
+        let radius = 20.0 * image::ICON_RADIUS;
+        blit(&mut frame, 20, Rect::new(0, 0, 20, 20), &tile, radius);
+        assert_eq!((frame[0], frame[10 * 20 + 10]), (170, WHITE));
+        image::invert_except(&mut frame, 20, &[((0, 0, 20, 20), radius)], None);
+        assert_eq!((frame[0], frame[10 * 20 + 10]), (85, WHITE));
     }
 
     #[test]
