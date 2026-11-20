@@ -1695,13 +1695,22 @@ impl Renderer {
         let l = ui.layout;
         self.text(Text { text: "Settings", x: 40.0, y: 36.0, w: 700.0, size: 64.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         self.button(l.done_button(), "Done", true);
-        for (header, card, rows) in l.home_sections(ui.settings_index) {
+        let viewport = l.settings_viewport();
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.push_clip_rect(&krect(viewport));
+        for (header, card, rows) in l.home_sections(ui.settings_scroll) {
+            if card.bottom() <= viewport.y || card.y - 44 >= viewport.bottom() {
+                continue;
+            }
             if !header.is_empty() {
                 self.section_header(card.x, card.y - 44, header);
             }
             self.card(card);
             let count = rows.len();
             for (i, (page, r)) in rows.into_iter().enumerate() {
+                if r.bottom() <= viewport.y || r.y >= viewport.bottom() {
+                    continue;
+                }
                 let value = page_value(page, ui, s);
                 self.text(Text { text: page.title(), x: (r.x + 32) as f32, y: (r.y + 22) as f32, w: (r.w - 120) as f32, size: 38.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
                 self.text(Text { text: &value, x: (r.x + 32) as f32, y: (r.y + 72) as f32, w: (r.w - 120) as f32, size: 28.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
@@ -1711,7 +1720,8 @@ impl Renderer {
                 }
             }
         }
-        self.settings_pager(l, ui.settings_index, l.settings_pages());
+        self.ctx.pop_clip();
+        self.settings_scrollbar(viewport, ui.settings_scroll, l.settings_scroll_max());
     }
 
     /// One page of Settings: its title and Back, then its sections (header, card of rows, footer). The Wi-Fi page
@@ -1756,12 +1766,7 @@ impl Renderer {
         // A result of an action on this page (a Wi-Fi join, an SSH check or password): shown at the bottom on every page.
         if let Some(notice) = ui.notice.clone() {
             let width = (l.width - 2 * MARGIN_X) as f32;
-            let y = if page == kl_core::layout::Page::AppVisibility && ui.visibility_pages() > 1 {
-                l.footer().y - 76
-            } else {
-                l.height - 84
-            };
-            self.text(Text { text: &notice, x: MARGIN_X as f32, y: y as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+            self.text(Text { text: &notice, x: MARGIN_X as f32, y: (l.height - 84) as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
         }
     }
 

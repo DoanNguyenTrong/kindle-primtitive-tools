@@ -169,15 +169,11 @@ impl Page {
 }
 
 /// The Settings list: its groups, each a header, a card of pages, and nothing under it.
-const HOME_PAGES: &[&[(&str, &[Page])]] = &[
-    &[
-        ("Power and display", &[Page::Battery, Page::Display, Page::Accessibility, Page::Sleep]),
-        ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
-    ],
-    &[
-        ("Applications", &[Page::Apps, Page::Store]),
-        ("System", &[Page::Storage, Page::Device, Page::DateTime, Page::About]),
-    ],
+const SETTINGS_GROUPS: &[(&str, &[Page])] = &[
+    ("Power and display", &[Page::Battery, Page::Display, Page::Accessibility, Page::Sleep]),
+    ("Network", &[Page::Wifi, Page::Connection, Page::FileTransfer]),
+    ("Applications", &[Page::Apps, Page::Store]),
+    ("System", &[Page::Storage, Page::Device, Page::DateTime, Page::About]),
 ];
 
 /// A group of the Settings list: its header, its card, and the page rows in it.
@@ -657,24 +653,25 @@ impl Layout {
         y
     }
 
-    pub fn settings_pages(&self) -> usize {
-        HOME_PAGES.len()
+    pub fn settings_viewport(&self) -> Rect {
+        Rect::new(0, TITLE_H, self.width, (self.height - TITLE_H - SECTION_GAP).max(0))
     }
 
-    pub fn settings_nav(&self) -> [Rect; 2] {
-        let y = self.footer().y;
-        let w = (self.width / 3).min(260);
-        [Rect::new(MARGIN, y, w, 84), Rect::new(self.width - MARGIN - w, y, w, 84)]
+    pub fn settings_scroll_max(&self) -> i32 {
+        let groups_height: i32 = SETTINGS_GROUPS.iter()
+            .map(|(_, pages)| SECTION_HEAD_H + pages.len() as i32 * HOME_ROW_H + SECTION_GAP)
+            .sum();
+        (SECTION_TOP + groups_height - self.settings_viewport().h).max(0)
     }
 
     /// The Settings list: the groups of pages, each a header and a card with one row per page.
-    pub fn home_sections(&self, page: usize) -> Vec<HomeSection> {
+    pub fn home_sections(&self, scroll: i32) -> Vec<HomeSection> {
         let w = self.width - 2 * MARGIN;
-        let mut y = TITLE_H + SECTION_TOP;
-        HOME_PAGES[page.min(self.settings_pages() - 1)]
+        let mut y = TITLE_H + SECTION_TOP - scroll;
+        SETTINGS_GROUPS
             .iter()
             .map(|&(header, pages)| {
-                y += if header.is_empty() { 0 } else { SECTION_HEAD_H };
+                y += SECTION_HEAD_H;
                 let card = Rect::new(MARGIN, y, w, pages.len() as i32 * HOME_ROW_H);
                 let rows = pages.iter().enumerate().map(|(i, &p)| (p, Rect::new(card.x, card.y + i as i32 * HOME_ROW_H, card.w, HOME_ROW_H))).collect();
                 y = card.bottom() + SECTION_GAP;
@@ -683,14 +680,42 @@ impl Layout {
             .collect()
     }
 
-    /// The Settings list's rows (one per page), flat.
-    pub fn settings_home_rows(&self, page: usize) -> Vec<(Page, Rect)> {
-        self.home_sections(page).into_iter().flat_map(|(_, _, rows)| rows).collect()
+    /// The Settings list's rows at this scroll position, including rows outside the viewport.
+    pub fn settings_home_rows(&self, scroll: i32) -> Vec<(Page, Rect)> {
+        self.home_sections(scroll).into_iter().flat_map(|(_, _, rows)| rows).collect()
     }
 
-    /// The Settings list row under a point.
-    pub fn settings_home_at(&self, page: usize, x: f32, y: f32) -> Option<Page> {
-        self.settings_home_rows(page).into_iter().find(|(_, r)| r.contains(x, y)).map(|(p, _)| p)
+    /// The visible Settings list row under a point.
+    pub fn settings_home_at(&self, scroll: i32, x: f32, y: f32) -> Option<Page> {
+        if !self.settings_viewport().contains(x, y) {
+            return None;
+        }
+        self.settings_home_rows(scroll).into_iter().find(|(_, r)| r.contains(x, y)).map(|(p, _)| p)
+    }
+
+    pub fn visibility_viewport(&self) -> Rect {
+        // Keep space below the list for a save error.
+        Rect::new(0, TITLE_H, self.width, (self.height - TITLE_H - 92).max(0))
+    }
+
+    pub fn visibility_row(&self, index: usize, scroll: i32) -> Rect {
+        let row = self.list_row(index);
+        Rect::new(row.x, row.y - scroll, row.w, row.h)
+    }
+
+    pub fn visibility_scroll_max(&self, count: usize) -> i32 {
+        let count = i32::try_from(count).unwrap_or(i32::MAX);
+        (count.saturating_mul(LIST_ROW_H).saturating_add(20) - self.visibility_viewport().h).max(0)
+    }
+
+    pub fn visibility_at(&self, scroll: i32, x: f32, y: f32) -> Option<usize> {
+        let first = self.visibility_row(0, scroll);
+        if !self.visibility_viewport().contains(x, y)
+            || x < first.x as f32 || x >= first.right() as f32 || y < first.y as f32
+        {
+            return None;
+        }
+        Some(((y - first.y as f32) / first.h as f32) as usize)
     }
 
     /// The Wi-Fi page's own area under its Wi-Fi section: the current network, then the scan list.
@@ -1302,16 +1327,19 @@ mod tests {
         assert_eq!(l.settings_button_at(Page::Display, (r.x + 10) as f32, (r.y + 10) as f32), Some(b));
         let d = l.done_button();
         assert_eq!(l.settings_button_at(Page::Display, (d.x + 1) as f32, (d.y + 1) as f32), Some(Button::Done));
-        let mut pages = Vec::new();
-        for page_index in 0..l.settings_pages() {
-            for (page, r) in l.settings_home_rows(page_index) {
-                assert_eq!(l.settings_home_at(page_index, (r.x + 5) as f32, (r.y + 5) as f32), Some(page));
-                assert!(r.bottom() < l.settings_nav()[0].y);
-                assert!(!pages.contains(&page));
-                pages.push(page);
-            }
-        }
-        assert_eq!(pages.len() + 1, Page::ALL.len()); // App visibility is inside Apps.
+        let top = l.settings_home_rows(0);
+        assert_eq!(top.len() + 1, Page::ALL.len()); // App visibility is inside Apps.
+        let viewport = l.settings_viewport();
+        assert!(top.last().unwrap().1.bottom() > viewport.bottom());
+        let scroll = l.settings_scroll_max();
+        let bottom = l.settings_home_rows(scroll);
+        let (page, r) = *bottom.last().unwrap();
+        assert_eq!(page, Page::About);
+        assert!(r.bottom() <= viewport.bottom());
+        assert_eq!(l.settings_home_at(scroll, (r.x + 5) as f32, (r.y + 5) as f32), Some(Page::About));
+        assert_eq!(l.settings_home_at(scroll, 50.0, (viewport.y - 1) as f32), None);
+        assert_eq!(l.visibility_at(200, 50.0, (l.visibility_viewport().y - 1) as f32), None);
+        assert_eq!(l.visibility_at(200, 50.0, l.visibility_viewport().y as f32), Some(1));
     }
 
     #[test]

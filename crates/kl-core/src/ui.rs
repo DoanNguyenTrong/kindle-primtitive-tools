@@ -279,6 +279,29 @@ pub fn valid_ssh_password(pw: &str) -> bool {
 
 /// A horizontal swipe longer than this (pixels) turns the page.
 const SWIPE_MIN: f32 = 150.0;
+const SETTINGS_SWIPE_MIN: f32 = 40.0;
+
+/// Scroll once per completed gesture, so the e-ink display only draws the final position.
+fn scroll_settings_list(input: Input, viewport: Rect, offset: &mut i32, max: i32) -> Action {
+    let button_step = (viewport.h - 120).max(120);
+    let delta = match input {
+        Input::PageForward => button_step,
+        Input::PageBack => -button_step,
+        Input::Swipe { dx, dy, start_y }
+            if dy.abs() >= SETTINGS_SWIPE_MIN && dy.abs() > dx.abs()
+                && (viewport.y as f32..viewport.bottom() as f32).contains(&start_y) =>
+        {
+            (-dy).round() as i32
+        }
+        _ => return Action::None,
+    };
+    let next = offset.saturating_add(delta).clamp(0, max);
+    if next == *offset {
+        return Action::None;
+    }
+    *offset = next;
+    Action::Redraw { full: false }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRequirementReview {
@@ -304,10 +327,10 @@ pub struct Ui {
     pub layout: Layout,
     pub display_support: DisplaySupport,
     pub page: usize,
-    pub settings_index: usize,
+    pub settings_scroll: i32,
     pub clock_syncing: bool,
     settings_parent: Option<Page>,
-    pub visibility_index: usize,
+    pub visibility_scroll: i32,
     pub managed_count: Option<usize>,
     pub firmware: Option<String>,
     pub device_profile: Option<String>,
@@ -403,10 +426,10 @@ impl Ui {
             layout,
             display_support: DisplaySupport::default(),
             page: 0,
-            settings_index: 0,
+            settings_scroll: 0,
             clock_syncing: false,
             settings_parent: None,
-            visibility_index: 0,
+            visibility_scroll: 0,
             managed_count: None,
             firmware: None,
             device_profile: None,
@@ -475,7 +498,7 @@ impl Ui {
     pub fn set_apps(&mut self, apps: Vec<App>) {
         self.original_icons = apps.iter().map(|app| (app.id.clone(), app.icon.clone())).collect();
         (self.hidden_apps, self.apps) = apps.into_iter().partition(|app| app.hidden);
-        self.visibility_index = self.visibility_index.min(self.visibility_pages() - 1);
+        self.visibility_scroll = self.visibility_scroll.min(self.visibility_scroll_max());
         self.page = 0;
         self.pressed = None;
     }
@@ -1287,14 +1310,20 @@ impl Ui {
         apps
     }
 
-    pub fn visibility_pages(&self) -> usize {
-        let count = self.apps.iter().chain(&self.hidden_apps).filter(|app| !is_builtin(app)).count();
-        self.layout.list_pages(count)
+    pub fn visibility_len(&self) -> usize {
+        self.apps.iter().chain(&self.hidden_apps).filter(|app| !is_builtin(app)).count()
     }
 
-    pub fn visible_visibility_apps(&self) -> impl Iterator<Item = &App> {
-        let limit = self.layout.list_rows_per_page();
-        self.visibility_apps().into_iter().skip(self.visibility_index * limit).take(limit)
+    pub fn visibility_scroll_max(&self) -> i32 {
+        self.layout.visibility_scroll_max(self.visibility_len())
+    }
+
+    pub fn visible_visibility_apps(&self) -> impl Iterator<Item = (usize, &App)> {
+        let viewport = self.layout.visibility_viewport();
+        self.visibility_apps().into_iter().enumerate().filter(move |(index, _)| {
+            let row = self.layout.visibility_row(*index, self.visibility_scroll);
+            row.bottom() > viewport.y && row.y < viewport.bottom()
+        })
     }
 
     /// Reconcile an optimistic visibility change if its write fails.
@@ -1460,7 +1489,7 @@ impl Ui {
     }
 
     fn open_settings(&mut self) -> Action {
-        self.settings_index = 0;
+        self.settings_scroll = 0;
         self.settings_parent = None;
         self.go(Screen::Settings)
     }
@@ -1590,7 +1619,7 @@ impl Ui {
                     return Action::Device(DeviceCmd::ToggleWifi);
                 }
                 if l.header_battery().inset(-12).contains(x, y) {
-                    self.settings_index = 0;
+                    self.settings_scroll = 0;
                     self.settings_parent = None;
                     return self.go(Screen::Page(Page::Battery));
                 }
@@ -1763,22 +1792,13 @@ impl Ui {
 
     /// Settings: the list of pages. A tap on a page opens it; Done (or the back key) goes to the home screen.
     fn settings_home(&mut self, input: Input) -> Action {
-        let [previous, next] = self.layout.settings_nav();
         match input {
-            Input::PageForward => self.turn_settings(1),
-            Input::PageBack if self.settings_index > 0 => self.turn_settings(-1),
-            Input::PageBack => self.go(Screen::Home),
+            Input::PageBack if self.settings_scroll == 0 => self.go(Screen::Home),
             Input::Tap(x, y) => {
                 if self.layout.done_button().inset(-20).contains(x, y) {
                     return self.go(Screen::Home);
                 }
-                if self.settings_index > 0 && previous.contains(x, y) {
-                    return self.turn_settings(-1);
-                }
-                if self.settings_index + 1 < self.layout.settings_pages() && next.contains(x, y) {
-                    return self.turn_settings(1);
-                }
-                match self.layout.settings_home_at(self.settings_index, x, y) {
+                match self.layout.settings_home_at(self.settings_scroll, x, y) {
                     Some(page) => {
                         self.settings_parent = None;
                         self.go(Screen::Page(page))
@@ -1786,32 +1806,17 @@ impl Ui {
                     None => Action::None,
                 }
             }
-            _ => Action::None,
+            _ => scroll_settings_list(input, self.layout.settings_viewport(), &mut self.settings_scroll, self.layout.settings_scroll_max()),
         }
-    }
-
-    fn turn_settings(&mut self, step: isize) -> Action {
-        let next = self.settings_index.saturating_add_signed(step).min(self.layout.settings_pages() - 1);
-        if next == self.settings_index {
-            return Action::None;
-        }
-        self.settings_index = next;
-        Action::Redraw { full: false }
     }
 
     fn app_visibility(&mut self, input: Input) -> Action {
-        let pages = self.visibility_pages();
-        let [previous, next] = self.layout.settings_nav();
-        let forward = match input {
-            Input::PageForward => true,
-            Input::PageBack if self.visibility_index == 0 => return self.back_from_setting(),
-            Input::PageBack => false,
-            Input::Tap(x, y) if self.layout.done_button().inset(-20).contains(x, y) => return self.back_from_setting(),
-            Input::Tap(x, y) if self.visibility_index > 0 && previous.contains(x, y) => false,
-            Input::Tap(x, y) if self.visibility_index + 1 < pages && next.contains(x, y) => true,
+        match input {
+            Input::PageBack if self.visibility_scroll == 0 => self.back_from_setting(),
+            Input::Tap(x, y) if self.layout.done_button().inset(-20).contains(x, y) => self.back_from_setting(),
             Input::Tap(x, y) => {
-                let Some(index) = self.layout.list_row_at(x, y) else { return Action::None };
-                let Some((id, hidden)) = self.visible_visibility_apps().nth(index).map(|app| (app.id.clone(), app.hidden)) else {
+                let Some(index) = self.layout.visibility_at(self.visibility_scroll, x, y) else { return Action::None };
+                let Some((id, hidden)) = self.visibility_apps().get(index).map(|app| (app.id.clone(), app.hidden)) else {
                     return Action::None;
                 };
                 if hidden {
@@ -1821,16 +1826,13 @@ impl Ui {
                     return Action::SetHidden(vec![(id, false)]);
                 }
                 let Some(index) = self.apps.iter().position(|app| app.id == id) else { return Action::None };
-                return self.hide_at(index);
+                self.hide_at(index)
             }
-            _ => return Action::None,
-        };
-        let index = if forward { (self.visibility_index + 1).min(pages - 1) } else { self.visibility_index.saturating_sub(1) };
-        if index == self.visibility_index {
-            return Action::None;
+            _ => {
+                let max = self.visibility_scroll_max();
+                scroll_settings_list(input, self.layout.visibility_viewport(), &mut self.visibility_scroll, max)
+            }
         }
-        self.visibility_index = index;
-        Action::Redraw { full: false }
     }
 
     /// One page of Settings: its rows' buttons. Back (or the back key) returns to the Settings list.
@@ -1895,7 +1897,7 @@ impl Ui {
                 Some(Button::Done) => self.back_from_setting(),
                 Some(Button::OpenPage(target)) => {
                     self.settings_parent = Some(page);
-                    self.visibility_index = 0;
+                    self.visibility_scroll = 0;
                     self.go(Screen::Page(target))
                 }
                 Some(Button::ManageInstalled) => Action::Device(DeviceCmd::OpenInstalledApps),
@@ -1986,8 +1988,8 @@ mod tests {
         use crate::layout::Row;
         let mut u = ui(22);
         u.open_settings();
-        u.handle(centre(u.layout.settings_nav()[1]));
-        let page = u.layout.settings_home_rows(u.settings_index).into_iter()
+        u.handle(Input::Swipe { dx: 0.0, dy: -900.0, start_y: 1200.0 });
+        let page = u.layout.settings_home_rows(u.settings_scroll).into_iter()
             .find(|(page, _)| *page == Page::DateTime).unwrap().1;
         u.handle(centre(page));
         assert_eq!(u.screen, Screen::Page(Page::DateTime));
@@ -2007,8 +2009,10 @@ mod tests {
         use crate::layout::Row;
         let mut u = ui(22);
         u.open_settings();
-        assert!(matches!(u.handle(centre(u.layout.settings_nav()[1])), Action::Redraw { .. }));
-        let home_row = |ui: &Ui, page| ui.layout.settings_home_rows(ui.settings_index)
+        let swipe = |dy| Input::Swipe { dx: 0.0, dy, start_y: 1300.0 };
+        assert!(matches!(u.handle(swipe(-900.0)), Action::Redraw { .. }));
+        let home_scroll = u.settings_scroll;
+        let home_row = |ui: &Ui, page| ui.layout.settings_home_rows(ui.settings_scroll)
             .into_iter().find(|(candidate, _)| *candidate == page).unwrap().1;
         let setting_row = |ui: &Ui, page, row| ui.layout.page_sections(page).into_iter()
             .flat_map(|section| section.rows).find(|entry| entry.row == row).unwrap().rect;
@@ -2024,7 +2028,7 @@ mod tests {
 
         u.handle(centre(setting_row(&u, Page::Apps, Row::AppVisibility)));
         assert_eq!(u.screen, Screen::Page(Page::AppVisibility));
-        let row = u.layout.list_row(0);
+        let row = u.layout.visibility_row(0, 0);
         let Action::SetHidden(changes) = u.handle(centre(row)) else { panic!("visibility row did not toggle") };
         assert_eq!(u.hidden_count(), 1);
         u.restore_visibility(&changes);
@@ -2032,12 +2036,16 @@ mod tests {
         u.handle(centre(row));
         let Action::SetHidden(reveal) = u.handle(centre(row)) else { panic!("hidden app was not reachable") };
         assert_eq!(reveal, vec![(changes[0].0.clone(), false)]);
-        u.handle(centre(u.layout.settings_nav()[1]));
-        assert_eq!(u.visibility_index, 1);
+        u.handle(swipe(-2000.0));
+        assert_eq!(u.visibility_scroll, u.visibility_scroll_max());
+        let (index, last) = u.visible_visibility_apps().last().unwrap();
+        let id = last.id.clone();
+        let last_visible_row = u.layout.visibility_row(index, u.visibility_scroll);
+        assert_eq!(u.handle(centre(last_visible_row)), Action::SetHidden(vec![(id, true)]));
         u.handle(centre(u.layout.done_button()));
         assert_eq!(u.screen, Screen::Page(Page::Apps));
         u.handle(Input::PageBack);
-        assert_eq!(u.settings_index, 1);
+        assert_eq!(u.settings_scroll, home_scroll);
 
         u.go(Screen::QuickSettings);
         u.handle(centre(u.layout.header_battery()));
@@ -2048,6 +2056,29 @@ mod tests {
         assert_eq!(u.screen, Screen::Page(Page::Display));
         u.handle(Input::PageBack);
         assert_eq!(u.screen, Screen::Page(Page::Battery));
+    }
+
+    #[test]
+    fn settings_scrolls_by_swipe_distance_with_a_fixed_header_and_bounded_offsets() {
+        let mut u = ui(0);
+        u.open_settings();
+        let swipe = |dx, dy, start_y| Input::Swipe { dx, dy, start_y };
+        assert_eq!(u.handle(swipe(40.0, -180.0, 900.0)), Action::Redraw { full: false });
+        assert_eq!(u.settings_scroll, 180);
+        assert_eq!(u.handle(swipe(180.0, -40.0, 900.0)), Action::None);
+        assert_eq!(u.handle(swipe(0.0, -250.0, 85.0)), Action::None);
+        assert_eq!(u.settings_scroll, 180);
+        u.handle(swipe(0.0, 80.0, 950.0));
+        assert_eq!(u.settings_scroll, 100);
+        u.handle(swipe(0.0, 900.0, 900.0));
+        assert_eq!(u.settings_scroll, 0);
+        u.handle(Input::PageForward);
+        assert_eq!(u.settings_scroll, u.layout.settings_scroll_max());
+        assert_eq!(u.handle(Input::Tap(50.0, 80.0)), Action::None);
+        u.handle(Input::PageBack);
+        assert_eq!(u.settings_scroll, 0);
+        u.handle(Input::PageBack);
+        assert_eq!(u.screen, Screen::Home);
     }
     use crate::apps::IconSource;
 
@@ -2074,8 +2105,8 @@ mod tests {
     fn launcher_settings_can_toggle_daily_checks_and_confirm_clearing_the_catalog() {
         let mut u = ui(0);
         u.screen = Screen::Settings;
-        u.settings_index = 1;
-        let page = u.layout.settings_home_rows(1).into_iter().find(|(page, _)| *page == Page::Store).unwrap().1;
+        u.settings_scroll = u.layout.settings_scroll_max();
+        let page = u.layout.settings_home_rows(u.settings_scroll).into_iter().find(|(page, _)| *page == Page::Store).unwrap().1;
         u.handle(centre(page));
         assert_eq!(u.screen, Screen::Page(Page::Store));
         let rows = &u.layout.page_sections(Page::Store)[0].rows;

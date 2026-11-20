@@ -1,4 +1,6 @@
-use super::{switch_rect, Align, Layout, Rect, Renderer, Status, Text, Ui, BLACK, MARGIN_X, WHITE};
+use super::{
+    krect, switch_rect, Align, Layout, Rect, Renderer, Status, Text, Ui, BLACK, MARGIN_X, WHITE,
+};
 use kl_core::{
     battery::{Sample, Source, HISTORY_SECS},
     layout::Page,
@@ -7,53 +9,54 @@ use kl_core::{
 use vello_cpu::kurbo::{self, Affine, Shape};
 
 impl Renderer {
-    pub(super) fn settings_pager(&mut self, layout: Layout, index: usize, pages: usize) {
-        if pages <= 1 {
+    pub(super) fn settings_scrollbar(&mut self, viewport: Rect, scroll: i32, max_scroll: i32) {
+        let track_height = viewport.h - 24;
+        if max_scroll <= 0 || track_height <= 0 {
             return;
         }
-        let [previous, next] = layout.settings_nav();
-        if index > 0 {
-            self.button(previous, "Previous", false);
-        }
-        if index + 1 < pages {
-            self.button(next, "Next", false);
-        }
-        self.text(Text {
-            text: &format!("{} of {pages}", index + 1),
-            x: previous.right() as f32,
-            y: (previous.y + 20) as f32,
-            w: (next.x - previous.right()) as f32,
-            size: 29.0,
-            bold: false,
-            align: Align::Center,
-            lines: 1,
-            gray: 85,
-        });
+        let content_height = i64::from(viewport.h) + i64::from(max_scroll);
+        let thumb_height =
+            (i64::from(track_height) * i64::from(viewport.h) / content_height) as i32;
+        let thumb_height = thumb_height.clamp(32.min(track_height), track_height);
+        let travel =
+            i64::from(track_height - thumb_height) * i64::from(scroll.clamp(0, max_scroll));
+        let y = viewport.y + 12 + (travel / i64::from(max_scroll)) as i32;
+        let ink = if self.high_contrast { BLACK } else { 125 };
+        self.rounded(
+            Rect::new(viewport.right() - 20, y, 6, thumb_height),
+            3.0,
+            ink,
+        );
     }
 
     pub(super) fn settings_visibility(&mut self, ui: &Ui) {
         let layout = ui.layout;
-        let apps: Vec<_> = ui.visible_visibility_apps().collect();
-        if apps.is_empty() {
-            let r = layout.list_row(0);
+        let scroll = ui.visibility_scroll;
+        let count = ui.visibility_len();
+        let first_row = layout.visibility_row(0, scroll);
+        let viewport = layout.visibility_viewport();
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.push_clip_rect(&krect(viewport));
+        if count == 0 {
             self.text(Text {
                 text: "Apps that can be hidden will appear here.",
-                x: (r.x + 24) as f32,
-                y: (r.y + 25) as f32,
-                w: (r.w - 48) as f32,
+                x: (first_row.x + 24) as f32,
+                y: (first_row.y + 25) as f32,
+                w: (first_row.w - 48) as f32,
                 size: 34.0,
                 bold: false,
                 align: Align::Start,
                 lines: 2,
                 gray: BLACK,
             });
+            self.ctx.pop_clip();
             return;
         }
-        let mut card = layout.list_row(0);
-        card.h *= apps.len() as i32;
+        let mut card = first_row;
+        card.h = layout.visibility_row(count - 1, scroll).bottom() - card.y;
         self.card(card);
-        for (i, app) in apps.iter().enumerate() {
-            let r = layout.list_row(i);
+        for (i, app) in ui.visible_visibility_apps() {
+            let r = layout.visibility_row(i, scroll);
             self.text(Text {
                 text: &app.name,
                 x: (r.x + 32) as f32,
@@ -81,11 +84,12 @@ impl Renderer {
                 gray: 85,
             });
             self.switch(switch_rect(r), !app.hidden);
-            if i + 1 < apps.len() {
+            if i + 1 < count {
                 self.hairline(r.bottom() - 1, card.x + 32, card.right() - 32);
             }
         }
-        self.settings_pager(layout, ui.visibility_index, ui.visibility_pages());
+        self.ctx.pop_clip();
+        self.settings_scrollbar(viewport, scroll, ui.visibility_scroll_max());
     }
 
     pub(super) fn level_meter(&mut self, row: Rect, level: u64, total: u64) {
