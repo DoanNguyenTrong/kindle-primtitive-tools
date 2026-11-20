@@ -23,10 +23,19 @@ pub struct StorageLease {
 impl StorageLease {
     /// Use only when the supervisor advertises the storage lease capability to this process.
     pub fn new(run: &Path) -> Self {
+        let pid = std::process::id();
+        // Exec keeps the supervisor's foreground PID and its sequence. Continue from the RAM
+        // mailbox after one native app hands over to another under an active lease.
+        let sequence = [REQUEST, REPLY]
+            .into_iter()
+            .filter_map(|name| fs::read_to_string(run.join(name)).ok())
+            .filter_map(|line| mailbox_sequence(&line, pid))
+            .max()
+            .unwrap_or_default();
         Self {
             run: run.to_path_buf(),
-            pid: std::process::id(),
-            sequence: 0,
+            pid,
+            sequence,
             timeout: TIMEOUT,
         }
     }
@@ -95,6 +104,22 @@ impl StorageLease {
             thread::sleep(POLL);
         }
     }
+}
+
+fn mailbox_sequence(line: &str, pid: u32) -> Option<u32> {
+    let mut fields = line.split_whitespace();
+    let owner = fields.next()?.parse::<u32>().ok()?;
+    let sequence = fields.next()?;
+    let state = fields.next()?;
+    if owner != pid
+        || sequence.len() > 9
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || !matches!(state, "idle" | "write" | "paused" | "unavailable")
+        || fields.next().is_some()
+    {
+        return None;
+    }
+    sequence.parse().ok()
 }
 
 fn unavailable() -> io::Error {
@@ -193,5 +218,30 @@ mod tests {
         assert_eq!(fixture.request(), "42 1 write\n");
         controller.release().unwrap();
         assert_eq!(fixture.request(), "42 2 idle\n");
+    }
+
+    #[test]
+    fn a_replacement_app_continues_the_same_pid_sequence() {
+        let fixture = Fixture::new();
+        let pid = std::process::id();
+        fs::write(fixture.0.join(REQUEST), format!("{pid} 46 write\n")).unwrap();
+        fs::write(fixture.0.join(REPLY), format!("{pid} 46 paused\n")).unwrap();
+        let mut replacement = StorageLease::new(&fixture.0);
+        replacement.release().unwrap();
+        assert_eq!(fixture.request(), format!("{pid} 47 idle\n"));
+
+        fs::write(fixture.0.join(REPLY), format!("{pid} 48 paused\n")).unwrap();
+        replacement.begin_if(|| true).unwrap();
+        assert_eq!(fixture.request(), format!("{pid} 48 write\n"));
+    }
+
+    #[test]
+    fn restart_ignores_mailbox_rows_from_another_process_or_invalid_sequences() {
+        let fixture = Fixture::new();
+        let pid = std::process::id();
+        fs::write(fixture.0.join(REQUEST), format!("{} 300 idle\n", pid + 1)).unwrap();
+        fs::write(fixture.0.join(REPLY), format!("{pid} 1234567890 paused\n")).unwrap();
+        StorageLease::new(&fixture.0).release().unwrap();
+        assert_eq!(fixture.request(), format!("{pid} 1 idle\n"));
     }
 }
