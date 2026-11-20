@@ -47,7 +47,7 @@ pub trait App {
         None
     }
 
-    /// Override the inherited colors. `Some(true)` inverts the whole app, including pictures.
+    /// Override the inherited interface colors. Pictures retain their original shades.
     fn preferred_dark_mode(&self) -> Option<bool> {
         None
     }
@@ -217,14 +217,7 @@ fn persist(app: &mut impl App, on_save_error: impl FnOnce(io::Error)) {
 pub fn frame(app: &impl App, canvas: &mut Canvas, dark: bool) -> Vec<u8> {
     canvas.begin();
     app.draw(canvas);
-    let override_dark = app.preferred_dark_mode();
-    let mut image = canvas.finish(override_dark.is_none() && dark);
-    if override_dark == Some(true) {
-        for shade in &mut image {
-            *shade = 255 - *shade;
-        }
-    }
-    image
+    canvas.finish(app.preferred_dark_mode().unwrap_or(dark))
 }
 
 pub fn font_paths(directory: &Path) -> Vec<String> {
