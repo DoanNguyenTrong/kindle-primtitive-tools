@@ -353,13 +353,16 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         }
         if usb_drive {
             if lifecycle.is_awake() && (usb_changed || usb_redraw || change == Change::Full) {
-                canvas.begin();
-                full_screen_message(
-                    &mut canvas,
-                    "USB drive",
-                    "Eject the Kindle from your computer to return to the app.",
-                );
-                display.show(canvas.finish(settings.dark_mode), &settings, true);
+                let image = canvas.usb_drive_frame().unwrap_or_else(|| {
+                    canvas.begin();
+                    full_screen_message(
+                        &mut canvas,
+                        "USB drive",
+                        "Eject the Kindle from your computer to return to the app.",
+                    );
+                    canvas.finish(settings.dark_mode)
+                });
+                display.show(image, &settings, true);
             }
             continue;
         }

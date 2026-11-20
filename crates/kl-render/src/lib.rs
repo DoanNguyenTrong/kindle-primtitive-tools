@@ -412,34 +412,32 @@ impl Renderer {
         width
     }
 
-    /// Rasterise the recorded scene into a solidified gray buffer (premultiplied RGBA over an opaque white
-    /// page: the red channel is the gray).
-    /// The drive-mode screen: the Kindle shows on a computer. Eject it there, and the Kindle charges.
-    fn usb_drive_frame(&mut self, ui: &Ui) -> Vec<u8> {
-        self.ctx.reset();
-        let l = ui.layout;
+    /// Draw the shared drive-mode artwork using the embedded PNG and a white page.
+    fn usb_drive_frame(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
         if self.usb_picture.is_none() {
             self.usb_picture = image::decode_png(USB_PICTURE).ok().map(|img| {
-                let mut fitted = image::fit(&img, (l.width as u32).saturating_sub(120), (l.height as u32).saturating_sub(240));
+                let mut fitted = image::fit(
+                    &img,
+                    width.saturating_sub(120),
+                    height.saturating_sub(240),
+                );
                 image::solidify(&mut fitted.pixels);
                 fitted
             });
         }
-        self.fill(l.screen(), WHITE);
-        let mut out = self.finish_gray();
-        // The picture, centred on the white screen.
-        if let Some(pic) = &self.usb_picture {
-            let (w, h) = (l.width as usize, l.height as usize);
-            let (pw, ph) = (pic.width as usize, pic.height as usize);
-            let (ox, oy) = ((w - pw) / 2, (h - ph) / 2);
-            for y in 0..ph {
-                let dst = (oy + y) * w + ox;
-                out[dst..dst + pw].copy_from_slice(&pic.pixels[y * pw..(y + 1) * pw]);
-            }
+        let pic = self.usb_picture.as_ref()?;
+        let (w, h) = (width as usize, height as usize);
+        let (pw, ph) = (pic.width as usize, pic.height as usize);
+        let (ox, oy) = (w.checked_sub(pw)? / 2, h.checked_sub(ph)? / 2);
+        let mut out = vec![WHITE; w * h];
+        for y in 0..ph {
+            let dst = (oy + y) * w + ox;
+            out[dst..dst + pw].copy_from_slice(&pic.pixels[y * pw..(y + 1) * pw]);
         }
-        out
+        Some(out)
     }
 
+    /// Rasterise the recorded scene over opaque white and snap it to black and white.
     fn finish_gray(&mut self) -> Vec<u8> {
         self.ctx.flush();
         self.ctx.render(self.pixmap.as_mut(), &mut self.resources);
@@ -457,7 +455,10 @@ impl Renderer {
         self.high_contrast = launcher && status.high_contrast;
         // While the drive is shown on a computer, the drive-mode screen is all there is.
         if ui.usb == kl_core::Usb::Drive {
-            return self.usb_drive_frame(ui);
+            let (width, height) = (ui.layout.width as u32, ui.layout.height as u32);
+            return self
+                .usb_drive_frame(width, height)
+                .unwrap_or_else(|| vec![WHITE; (width * height) as usize]);
         }
         let l = ui.layout;
         let preview = match ui.screen {

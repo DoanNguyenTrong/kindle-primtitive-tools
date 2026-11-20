@@ -60,6 +60,11 @@ impl Canvas {
         self.bounds
     }
 
+    /// Return the upright USB drive screen without accessing user storage.
+    pub fn usb_drive_frame(&mut self) -> Option<Vec<u8>> {
+        self.renderer.usb_drive_frame(self.bounds.w as u32, self.bounds.h as u32)
+    }
+
     /// Scale a measurement from the reference width of 1264 pixels.
     pub fn px(&self, pixels: i32) -> i32 {
         ((pixels as f64 * f64::from(self.bounds.w)) / 1264.0).round() as i32
