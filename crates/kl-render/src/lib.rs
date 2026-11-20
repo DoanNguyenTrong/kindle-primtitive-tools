@@ -98,6 +98,9 @@ pub struct Renderer {
     wallpaper_preview: Option<GrayImage>,
     /// The launcher's own sleep screen picture, when one is set (screensavers folder).
     sleep_image: Option<GrayImage>,
+    /// Over an app (the system layer), the app's screen (upright): the backdrop of the system's pop-ups instead of
+    /// the home screen.
+    backdrop: Option<Vec<u8>>,
     /// The drive-mode picture (`assets/usb-drive-mode.png`), fitted to the screen and snapped to black and white.
     usb_picture: Option<GrayImage>,
     /// Store pictures (screenshots) to draw over the store's product page, collected while it is drawn.
@@ -184,6 +187,7 @@ impl Renderer {
             home_wallpaper: None,
             wallpaper_preview: None,
             sleep_image: None,
+            backdrop: None,
             store_blits: Vec::new(),
             usb_picture: None,
         })
@@ -223,6 +227,12 @@ impl Renderer {
     /// The picture for the next sleep screen (`None`: the text sleep screen).
     pub fn set_sleep_image(&mut self, image: Option<GrayImage>) {
         self.sleep_image = image;
+    }
+
+    /// The app's screen (upright, one byte a pixel, the screen's size) while the system layer shows its pop-ups over
+    /// an app; `None` when no app is under them.
+    pub fn set_backdrop(&mut self, picture: Option<Vec<u8>>) {
+        self.backdrop = picture;
     }
 
     /// Drop an app's tile (its icon was changed; the driver loads the new one).
@@ -595,6 +605,14 @@ impl Renderer {
         if status.dark_mode && ui.screen != Screen::Sleep {
             let over = popup.map(|b| (b.x - halo, b.y - halo, b.w + 2 * halo, b.h + 2 * halo));
             image::invert_except(&mut out, width, &pictures, over);
+        }
+        // Over an app, the system's pop-ups float over the app's screen: every pixel outside the pop-up is the app's.
+        if let (Some(backdrop), Some(b)) = (self.backdrop.as_ref(), popup) {
+            if matches!(ui.screen, Screen::QuickSettings | Screen::PowerMenu | Screen::ConfirmKindle | Screen::AppMenu)
+                && backdrop.len() == out.len()
+            {
+                image::keep_area(&mut out, backdrop, width, (b.x - halo, b.y - halo, b.w + 2 * halo, b.h + 2 * halo));
+            }
         }
         // The pressed look: only the touched icon darkens.
         if let (Screen::Home, Some(r)) = (ui.screen, ui.pressed) {

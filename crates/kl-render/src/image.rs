@@ -223,6 +223,25 @@ pub fn icon_tile(png_bytes: &[u8], size: u32) -> Result<GrayImage, String> {
     Ok(tile)
 }
 
+/// Keep `area` (x, y, w, h) of `out` and take every other pixel from `backdrop` (the same size as `out`).
+pub fn keep_area(out: &mut [u8], backdrop: &[u8], width: usize, area: (i32, i32, i32, i32)) {
+    if width == 0 || out.len() != backdrop.len() {
+        return;
+    }
+    let rows = out.len() / width;
+    let (x0, x1) = (area.0.clamp(0, width as i32) as usize, (area.0 + area.2).clamp(0, width as i32) as usize);
+    let (y0, y1) = (area.1.clamp(0, rows as i32) as usize, (area.1 + area.3).clamp(0, rows as i32) as usize);
+    for y in 0..rows {
+        let row = y * width;
+        if y < y0 || y >= y1 || x1 <= x0 {
+            out[row..row + width].copy_from_slice(&backdrop[row..row + width]);
+        } else {
+            out[row..row + x0].copy_from_slice(&backdrop[row..row + x0]);
+            out[row + x1..row + width].copy_from_slice(&backdrop[row + x1..row + width]);
+        }
+    }
+}
+
 /// Darken the inside of a rounded-square icon at `r` in a screen buffer: the pressed look.
 pub fn darken_icon(out: &mut [u8], width: usize, x0: i32, y0: i32, side: i32) {
     let height = (out.len() / width) as i32;
@@ -338,6 +357,14 @@ pub fn from_cache(bytes: &[u8]) -> Option<GrayImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_area_keeps_the_pop_up_and_takes_the_rest_from_the_backdrop() {
+        let mut out = vec![1u8; 16];
+        let backdrop = vec![9u8; 16];
+        keep_area(&mut out, &backdrop, 4, (1, 1, 2, 2));
+        assert_eq!(out, vec![9, 9, 9, 9, 9, 1, 1, 9, 9, 1, 1, 9, 9, 9, 9, 9]);
+    }
 
     fn png_bytes(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
