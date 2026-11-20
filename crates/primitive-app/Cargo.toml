@@ -6,6 +6,7 @@ license.workspace = true
 description = "Foreground app lifecycle shared by native PrimitiveOS apps."
 
 [dependencies]
+libc.workspace = true
 kl-core = { path = "../kl-core" }
 kl-kindle = { path = "../kl-kindle" }
 primitive-device = { path = "../primitive-device" }

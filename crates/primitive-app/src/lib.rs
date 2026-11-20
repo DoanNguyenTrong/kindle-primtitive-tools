@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -274,11 +274,33 @@ fn display_settings(launcher: &str, app: &str) -> Settings {
     settings
 }
 
+/// Set by SIGUSR1 (the system layer's redraw signal, `docs/system-architecture.md` §4.1 in the umbrella repo).
+static REDRAW: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_redraw(_: libc::c_int) {
+    REDRAW.store(true, Ordering::Relaxed);
+}
+
+/// Under Primitive Launcher the app answers the redraw signal: SIGUSR1 is turned into `Event::Redraw`. Without the
+/// launcher the signal is left alone.
+fn follow_redraw_signal(events: mpsc::Sender<Event>) {
+    // SAFETY: the handler only stores to an atomic, which is safe in a signal handler.
+    unsafe { libc::signal(libc::SIGUSR1, on_redraw as *const () as libc::sighandler_t) };
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(150));
+        if REDRAW.swap(false, Ordering::Relaxed) && events.send(Event::Redraw).is_err() {
+            break;
+        }
+    });
+}
+
 enum Event {
     Input(Input, Option<f32>),
     Turn(Rotation),
     StorageChanged,
     UsbRedraw,
+    /// Under Primitive Launcher: SIGUSR1, the launcher asks for the whole screen again in the current theme.
+    Redraw,
 }
 
 fn publish_rotation(run: &Path, rotation: Rotation) {
@@ -380,6 +402,12 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         let events = tx.clone();
         thread::spawn(move || watch_usb(events));
     }
+    // Under Primitive Launcher the launcher owns sleep, the lock screen and the theme; it asks for a redraw.
+    let under_launcher = std::env::var("PRIMITIVE_LAUNCHER").as_deref() == Ok("1");
+    if under_launcher {
+        follow_redraw_signal(tx.clone());
+    }
+    let mut redraw_on_wake = false;
     drop(tx);
 
     let mut lifecycle = Lifecycle::default();
@@ -405,7 +433,28 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                         pressed = true;
                     }
                 }
-                lifecycle.dispatch_input(&mut app, input, start_x, on_save_error)
+                let change = lifecycle.dispatch_input(&mut app, input, start_x, on_save_error);
+                // Under the launcher the screen is put back after the sleep picture: the app redraws on wake only
+                // when a redraw was asked for while it slept.
+                if under_launcher && input == Input::Wake && change == Change::Full {
+                    if std::mem::take(&mut redraw_on_wake) { Change::Full } else { Change::None }
+                } else {
+                    change
+                }
+            }
+            Ok(Event::Redraw) => {
+                // The theme may have changed: read it again from the launcher's settings (and the app's own).
+                let fresh = display_settings(
+                    &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
+                    &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
+                );
+                settings.dark_mode = fresh.dark_mode;
+                if lifecycle.is_awake() {
+                    Change::Full
+                } else {
+                    redraw_on_wake = true;
+                    Change::None
+                }
             }
             Ok(Event::Turn(rotation)) => {
                 inherited_rotation = rotation;
