@@ -124,6 +124,11 @@ fn page_button(code: u16, turn: u32) -> Option<Input> {
 
 /// Read touches from the device and report completed gestures.
 pub fn touch_loop(path: String, mut report: impl FnMut(Input)) {
+    touch_loop_with_origin(path, |input, _| report(input));
+}
+
+/// Report completed gestures together with their horizontal start in screen coordinates.
+pub fn touch_loop_with_origin(path: String, mut report: impl FnMut(Input, f32)) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(e) => return log(&format!("cannot open {path}: {e}")),
@@ -134,7 +139,7 @@ pub fn touch_loop(path: String, mut report: impl FnMut(Input)) {
     log(&format!("touch {path}: x {}..{} y {}..{}", xi.minimum, xi.maximum, yi.minimum, yi.maximum));
     let (mut raw_x, mut raw_y) = (0i32, 0i32);
     let mut active = false;
-    let mut start: Option<(f32, f32)> = None;
+    let mut start: Option<((f32, f32), u32)> = None;
     let mut last = (0.0f32, 0.0f32);
     let mut down_at = Instant::now();
     loop {
@@ -149,19 +154,18 @@ pub fn touch_loop(path: String, mut report: impl FnMut(Input)) {
                     down_at = Instant::now();
                 } else if active {
                     active = false;
-                    if let Some(s) = start {
-                        report(gesture(s, last, down_at.elapsed()));
+                    if let Some((point, _)) = start {
+                        report(gesture(point, last, down_at.elapsed()), point.0);
                     }
                 }
             }
             (EV_ABS, ABS_MT_POSITION_X) => raw_x = ev.value,
             (EV_ABS, ABS_MT_POSITION_Y) => raw_y = ev.value,
             (EV_SYN, SYN_REPORT) if active => {
-                let turn = TURN.load(Ordering::Relaxed);
+                // Use a single orientation for the gesture if the device turns mid-touch.
+                let turn = start.map_or_else(|| TURN.load(Ordering::Relaxed), |(_, turn)| turn);
                 last = turn_point(turn, scale(raw_x, &xi, NATIVE_W), scale(raw_y, &yi, NATIVE_H));
-                if start.is_none() {
-                    start = Some(last);
-                }
+                start.get_or_insert((last, turn));
             }
             _ => {}
         }

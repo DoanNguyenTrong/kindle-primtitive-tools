@@ -8,13 +8,17 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kl_core::{storage_lease::user_storage_is_mounted, Rotation, Settings, Usb};
-use kl_kindle::{device, display::Display, input, profile, Ev};
-use primitive_ui::{full_screen_message, Canvas, Input};
+use kl_core::{Settings, storage_lease::user_storage_is_mounted};
+use kl_kindle::{device, display::Display, profile};
+use primitive_input as input;
+use primitive_ui::{Canvas, Input, full_screen_message};
 
 mod storage;
 
-pub use kl_kindle::{display, eink, input as kindle_input, profile as kindle_profile};
+pub use kl_core::Rotation;
+pub use kl_kindle::{
+    device as kindle_device, display, eink, input as kindle_input, profile as kindle_profile,
+};
 pub use storage::with_storage;
 
 pub const WIDTH: u32 = profile::ACTIVE.screen_w;
@@ -32,6 +36,21 @@ pub enum Change {
 pub trait App {
     fn draw(&self, canvas: &mut Canvas);
     fn input(&mut self, input: Input) -> Change;
+
+    /// A swipe with its horizontal start in screen coordinates.
+    fn swipe(&mut self, input: Input, _start_x: f32) -> Change {
+        self.input(input)
+    }
+
+    /// Temporarily override the native portrait turn. `None` follows Launcher settings.
+    fn preferred_rotation(&self) -> Option<Rotation> {
+        None
+    }
+
+    /// Override the inherited colors. `Some(true)` inverts the whole app, including pictures.
+    fn preferred_dark_mode(&self) -> Option<bool> {
+        None
+    }
 
     fn press_point(&self, input: Input) -> Option<(f32, f32)> {
         match input {
@@ -117,6 +136,27 @@ impl Lifecycle {
         input: Input,
         on_save_error: impl FnOnce(io::Error),
     ) -> Change {
+        self.dispatch_input(app, input, None, on_save_error)
+    }
+
+    /// Route a swipe through the same sleep, storage, and exit rules as ordinary input.
+    pub fn swipe(
+        &mut self,
+        app: &mut impl App,
+        input: Input,
+        start_x: f32,
+        on_save_error: impl FnOnce(io::Error),
+    ) -> Change {
+        self.dispatch_input(app, input, Some(start_x), on_save_error)
+    }
+
+    fn dispatch_input(
+        &mut self,
+        app: &mut impl App,
+        input: Input,
+        start_x: Option<f32>,
+        on_save_error: impl FnOnce(io::Error),
+    ) -> Change {
         if self.usb_drive && !matches!(input, Input::Sleep | Input::Wake) {
             return Change::None;
         }
@@ -134,7 +174,10 @@ impl Lifecycle {
             }
             (State::Awake, Input::Wake) | (State::Asleep | State::Closed, _) => Change::None,
             (State::Awake, input) => {
-                let change = app.input(input);
+                let change = match (input, start_x) {
+                    (Input::Swipe { .. }, Some(start_x)) => app.swipe(input, start_x),
+                    _ => app.input(input),
+                };
                 if change == Change::Exit && !self.finish(app, on_save_error) {
                     return Change::None;
                 }
@@ -174,7 +217,14 @@ fn persist(app: &mut impl App, on_save_error: impl FnOnce(io::Error)) {
 pub fn frame(app: &impl App, canvas: &mut Canvas, dark: bool) -> Vec<u8> {
     canvas.begin();
     app.draw(canvas);
-    canvas.finish(dark)
+    let override_dark = app.preferred_dark_mode();
+    let mut image = canvas.finish(override_dark.is_none() && dark);
+    if override_dark == Some(true) {
+        for shade in &mut image {
+            *shade = 255 - *shade;
+        }
+    }
+    image
 }
 
 pub fn font_paths(directory: &Path) -> Vec<String> {
@@ -231,6 +281,19 @@ fn display_settings(launcher: &str, app: &str) -> Settings {
     settings
 }
 
+enum Event {
+    Input(Input, Option<f32>),
+    Turn(Rotation),
+    StorageChanged,
+    UsbRedraw,
+}
+
+fn publish_rotation(run: &Path, rotation: Rotation) {
+    input::TURN.store(rotation.turn(), Ordering::Relaxed);
+    // The supervisor's orientation file is in RAM and needs no flash lease.
+    let _ = write_atomic(&run.join("orientation"), rotation.letter().as_bytes());
+}
+
 /// Use the shared launcher settings and device driver while foregrounded by the launcher.
 pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
     if !cfg!(target_os = "linux") || !Path::new("/dev/fb0").exists() {
@@ -268,24 +331,44 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
     if settings.auto_rotation {
         settings.rotation = device::accelerometer_turn().unwrap_or(settings.rotation);
     }
-    input::TURN.store(settings.rotation.turn(), Ordering::Relaxed);
+    let mut inherited_rotation = settings.rotation;
+    settings.rotation = app.preferred_rotation().unwrap_or(inherited_rotation);
+    let mut dark_override = app.preferred_dark_mode();
+    publish_rotation(&run, settings.rotation);
     let (tx, rx) = mpsc::channel();
     if let Some(path) = input::find(profile::ACTIVE.touch_name) {
         let events = tx.clone();
-        thread::spawn(move || input::touch_loop(path, events));
+        thread::spawn(move || {
+            input::touch_loop_with_origin(path, |input, start_x| {
+                let origin = matches!(input, Input::Swipe { .. }).then_some(start_x);
+                let _ = events.send(Event::Input(input, origin));
+            });
+        });
     }
     if let Some(path) = input::find("gpio-keys") {
         let events = tx.clone();
-        thread::spawn(move || input::button_loop(path, events));
+        thread::spawn(move || {
+            input::button_loop(path, |input| {
+                let _ = events.send(Event::Input(input, None));
+            });
+        });
     }
     {
         let events = tx.clone();
-        thread::spawn(move || device::power_loop(events));
+        thread::spawn(move || {
+            primitive_device::power_loop(|input| {
+                let _ = events.send(Event::Input(input, None));
+            });
+        });
     }
     if settings.auto_rotation {
-        let orientation = settings.rotation;
+        let orientation = inherited_rotation;
         let events = tx.clone();
-        thread::spawn(move || device::orientation_loop(events, orientation));
+        thread::spawn(move || {
+            primitive_device::orientation_loop(orientation, |turn| {
+                events.send(Event::Turn(turn)).is_ok()
+            });
+        });
     }
     log("Opened");
     display.show(
@@ -315,12 +398,12 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         };
         let usb_drive = managed_storage && !user_storage_is_mounted();
         let usb_changed = lifecycle.set_usb_drive(usb_drive);
-        let usb_redraw = matches!(event, Ok(Ev::UsbRedraw));
+        let usb_redraw = matches!(event, Ok(Event::UsbRedraw));
         let mut pressed = false;
-        let change = match event {
+        let mut change = match event {
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if !usb_drive => app.tick(Instant::now()),
-            Ok(Ev::Input(input)) => {
+            Ok(Event::Input(input, start_x)) => {
                 if !usb_changed {
                     if let Some(image) =
                         lifecycle.press_feedback(&app, &mut canvas, input, settings.dark_mode)
@@ -329,18 +412,11 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                         pressed = true;
                     }
                 }
-                lifecycle.input(&mut app, input, on_save_error)
+                lifecycle.dispatch_input(&mut app, input, start_x, on_save_error)
             }
-            Ok(Ev::Turn(rotation)) if settings.auto_rotation && rotation != settings.rotation => {
-                settings.rotation = rotation;
-                input::TURN.store(rotation.turn(), Ordering::Relaxed);
-                // The supervisor's orientation file is in RAM and needs no flash lease.
-                let _ = write_atomic(&run.join("orientation"), rotation.letter().as_bytes());
-                if lifecycle.is_awake() {
-                    Change::Full
-                } else {
-                    Change::None
-                }
+            Ok(Event::Turn(rotation)) => {
+                inherited_rotation = rotation;
+                Change::None
             }
             _ => Change::None,
         };
@@ -350,6 +426,20 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                 Ok(()) => {}
                 Err(error) => kl_kindle::log(&format!("Could not reload Kindle storage: {error}")),
             }
+        }
+        if change != Change::Exit {
+            let rotation = app.preferred_rotation().unwrap_or(inherited_rotation);
+            let old_rotation = settings.rotation;
+            if rotation != settings.rotation {
+                settings.rotation = rotation;
+                publish_rotation(&run, rotation);
+            }
+            let preferred_dark = app.preferred_dark_mode();
+            if lifecycle.is_awake() && (rotation != old_rotation || preferred_dark != dark_override)
+            {
+                change = Change::Full;
+            }
+            dark_override = preferred_dark;
         }
         if usb_drive {
             if lifecycle.is_awake() && (usb_changed || usb_redraw || change == Change::Full) {
@@ -385,7 +475,7 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn watch_usb(events: mpsc::Sender<Ev>) {
+fn watch_usb(events: mpsc::Sender<Event>) {
     let mut attached = false;
     let mut redraw = false;
     loop {
@@ -393,11 +483,11 @@ fn watch_usb(events: mpsc::Sender<Ev>) {
         let event = if current != attached {
             attached = current;
             redraw = current;
-            Some(Ev::Usb(if current { Usb::Drive } else { Usb::Unplugged }))
+            Some(Event::StorageChanged)
         } else if redraw {
             // The stock USB screen can appear just after the first redraw.
             redraw = false;
-            Some(Ev::UsbRedraw)
+            Some(Event::UsbRedraw)
         } else {
             None
         };
@@ -531,6 +621,80 @@ mod tests {
         assert_eq!(demo.inputs, [Input::Sleep, Input::Wake]);
         assert!(lifecycle.set_usb_drive(false));
         assert!(lifecycle.deadline(&demo).is_some());
+    }
+
+    #[test]
+    fn swipes_reach_opted_in_apps_only_while_awake_and_storage_is_available() {
+        #[derive(Default)]
+        struct SwipeDemo {
+            demo: Demo,
+            received: Vec<(Input, f32)>,
+        }
+
+        impl App for SwipeDemo {
+            fn draw(&self, _canvas: &mut Canvas) {}
+
+            fn input(&mut self, input: Input) -> Change {
+                self.demo.input(input)
+            }
+
+            fn swipe(&mut self, input: Input, start_x: f32) -> Change {
+                self.received.push((input, start_x));
+                Change::Exit
+            }
+
+            fn save(&mut self) -> io::Result<()> {
+                self.demo.save()
+            }
+        }
+
+        let gesture = Input::Swipe {
+            dx: 20.0,
+            dy: 250.0,
+            start_y: 34.0,
+        };
+        let on_error = |error| panic!("unexpected save failure: {error}");
+        let mut lifecycle = Lifecycle::default();
+        let mut normal = Demo::default();
+        assert_eq!(
+            lifecycle.swipe(&mut normal, gesture, 54.0, on_error),
+            Change::Partial
+        );
+        assert_eq!(normal.inputs, [gesture]);
+
+        let mut app = SwipeDemo::default();
+        assert_eq!(
+            lifecycle.input(&mut app, Input::Sleep, on_error),
+            Change::None
+        );
+        assert_eq!(
+            lifecycle.swipe(&mut app, gesture, 100.0, on_error),
+            Change::None
+        );
+        assert_eq!(
+            lifecycle.input(&mut app, Input::Wake, on_error),
+            Change::Full
+        );
+        lifecycle.set_usb_drive(true);
+        assert_eq!(
+            lifecycle.swipe(&mut app, gesture, 200.0, on_error),
+            Change::None
+        );
+        assert!(app.received.is_empty());
+
+        lifecycle.set_usb_drive(false);
+        assert_eq!(
+            lifecycle.swipe(&mut app, gesture, 320.0, on_error),
+            Change::Exit
+        );
+        assert_eq!(app.received, [(gesture, 320.0)]);
+        assert_eq!(app.demo.inputs, [Input::Sleep, Input::Wake]);
+        assert_eq!(app.demo.saves, 2);
+        assert_eq!(
+            lifecycle.swipe(&mut app, gesture, 430.0, on_error),
+            Change::None
+        );
+        assert_eq!(app.received.len(), 1);
     }
 
     #[test]

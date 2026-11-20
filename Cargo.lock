@@ -738,6 +738,8 @@ dependencies = [
  "kl-core",
  "kl-kindle",
  "png",
+ "primitive-device",
+ "primitive-input",
  "primitive-ui",
 ]
 

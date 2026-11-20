@@ -8,5 +8,7 @@ description = "Foreground app lifecycle shared by native PrimitiveOS apps."
 [dependencies]
 kl-core = { path = "../kl-core" }
 kl-kindle = { path = "../kl-kindle" }
+primitive-device = { path = "../primitive-device" }
+primitive-input = { path = "../primitive-input" }
 primitive-ui = { path = "../primitive-ui" }
 png.workspace = true

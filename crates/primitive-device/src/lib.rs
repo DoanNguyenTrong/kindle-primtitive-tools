@@ -239,7 +239,7 @@ pub fn status(settings: &Settings) -> Status {
     let (wifi_on, wifi_state) = wifi_status();
     let power = battery_reading();
     let light = light_level();
-    let warmth = get_int(POWERD, "currentAmberLevel").filter(|level| *level <= LEVEL_MAX);
+    let warmth = warmth_level();
     let display_support = kl_core::ui::DisplaySupport {
         front_light: light.is_some(),
         warmth: warmth.is_some(),
@@ -513,7 +513,15 @@ pub fn try_set_light(level: u32) -> bool {
 }
 
 pub fn set_warmth(level: u32) {
-    set_int(POWERD, "currentAmberLevel", level.min(LEVEL_MAX));
+    let _ = try_set_warmth(level);
+}
+
+pub fn warmth_level() -> Option<u32> {
+    get_int(POWERD, "currentAmberLevel").filter(|level| *level <= LEVEL_MAX)
+}
+
+pub fn try_set_warmth(level: u32) -> bool {
+    set_int(POWERD, "currentAmberLevel", level.min(LEVEL_MAX))
 }
 
 pub fn set_wifi(on: bool) {
