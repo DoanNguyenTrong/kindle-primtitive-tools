@@ -10,6 +10,7 @@ use crate::{
     battery::{self, Warning},
     layout::{Button, Layout, Page, QuickTile, Rect},
     settings::Rotation,
+    store::StoreTab,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,9 +336,9 @@ pub struct Ui {
     extensions: Vec<MenuItem>,
     ext_path: Vec<usize>,
     pub ext_page: usize,
-    /// Primitive Store: the catalog's entries, the list page, and the entry open on its page.
+    /// Store catalog, list position, and the app open on its product page.
     pub store: Vec<crate::store::StoreEntry>,
-    pub store_page: usize,
+    pub store_list_scroll: i32,
     pub store_open: Option<usize>,
     /// The tab shown, and how far the product page is scrolled.
     pub store_tab: crate::store::StoreTab,
@@ -420,7 +421,7 @@ impl Ui {
             ext_path: Vec::new(),
             ext_page: 0,
             store: Vec::new(),
-            store_page: 0,
+            store_list_scroll: 0,
             store_open: None,
             store_tab: crate::store::StoreTab::Today,
             store_scroll: 0,
@@ -550,7 +551,7 @@ impl Ui {
     /// Replaces the store's entries (from the catalog cache and the installed record).
     pub fn set_store(&mut self, entries: Vec<crate::store::StoreEntry>) {
         self.store = entries;
-        self.store_page = 0;
+        self.store_list_scroll = 0;
         self.store_open = None;
         self.store_scroll = 0;
         self.store_shot_index = 0;
@@ -581,7 +582,7 @@ impl Ui {
             self.store_shot_index = self.store_shot_index.min(entry.screenshots.saturating_sub(1));
         }
         self.store_scroll = self.store_scroll.min(self.store_scroll_max());
-        self.store_page = self.store_page.min(self.store_pages() - 1);
+        self.clamp_store_list_scroll();
     }
 
     /// Today's featured app: the first entry.
@@ -599,10 +600,6 @@ impl Ui {
             .iter()
             .filter(|collection| collection.apps.iter().any(|id| self.store.iter().any(|app| &app.id == id)))
             .collect()
-    }
-
-    pub fn store_today_collection_page(&self) -> Vec<&kl_store::catalog::Collection> {
-        self.store_today_collections().into_iter().skip(self.store_page * 4).take(4).collect()
     }
 
     pub fn store_categories(&self) -> Vec<&str> {
@@ -633,6 +630,9 @@ impl Ui {
     /// Search by app title, summary, developer or category. An empty query shows the whole catalog.
     pub fn store_search(&self, query: &str) -> Vec<usize> {
         let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..self.store.len()).collect();
+        }
         self.store
             .iter()
             .enumerate()
@@ -665,7 +665,7 @@ impl Ui {
     pub fn store_has_toolbar(&self) -> bool {
         use crate::store::StoreTab;
         match self.store_tab {
-            StoreTab::Apps => self.store_selected_collection().is_some() || !self.store_categories().is_empty(),
+            StoreTab::Apps => self.store_selected_collection().is_some() || self.store.iter().any(|entry| !entry.categories.is_empty()),
             StoreTab::Updates => self.store_pending_updates().next().is_some(),
             _ => false,
         }
@@ -675,7 +675,7 @@ impl Ui {
         self.store_installing.is_some() || self.store_batch_running
     }
 
-    /// The paged list of the current tab.
+    /// The entries in the current tab, in display order.
     pub fn store_list_indices(&self) -> Vec<usize> {
         match self.store_tab {
             crate::store::StoreTab::Updates => self.store_updates(),
@@ -684,18 +684,8 @@ impl Ui {
         }
     }
 
-    pub fn store_rows_per_page(&self) -> usize {
-        if self.store_tab == crate::store::StoreTab::Search {
-            self.layout.store_search_rows(self.store_search_keyboard)
-        } else if self.store_has_toolbar() {
-            self.layout.store_toolbar_rows()
-        } else {
-            self.layout.store_rows_per_page()
-        }
-    }
-
-    pub fn store_list_row(&self, i: usize) -> Rect {
-        if self.store_tab == crate::store::StoreTab::Search {
+    fn store_unscrolled_row(&self, i: usize) -> Rect {
+        if self.store_tab == StoreTab::Search {
             self.layout.store_search_row(i)
         } else if self.store_has_toolbar() {
             self.layout.store_toolbar_row(i)
@@ -704,21 +694,123 @@ impl Ui {
         }
     }
 
-    pub fn store_page_label(&self) -> Rect {
-        if self.store_tab == crate::store::StoreTab::Search {
-            self.layout.store_search_page_label(self.store_search_keyboard)
+    fn store_scroll_rect(&self, rect: Rect) -> Rect {
+        Rect { y: rect.y - self.store_list_scroll, ..rect }
+    }
+
+    pub fn store_list_row(&self, i: usize) -> Rect {
+        self.store_scroll_rect(self.store_unscrolled_row(i))
+    }
+
+    pub fn store_today_feature(&self) -> Rect {
+        self.store_scroll_rect(self.layout.store_feature())
+    }
+
+    pub fn store_today_see_all(&self) -> Rect {
+        self.store_scroll_rect(self.layout.store_see_all())
+    }
+
+    pub fn store_today_row(&self, i: usize) -> Rect {
+        self.store_scroll_rect(self.layout.store_today_row(i))
+    }
+
+    pub fn store_today_collection_card(&self, i: usize) -> Rect {
+        self.store_scroll_rect(self.layout.store_collection_card(i))
+    }
+
+    pub fn store_list_notice(&self) -> Option<&str> {
+        self.notice.as_deref().or(self.store_progress.as_deref().filter(|_| self.store_busy))
+    }
+
+    /// The portion of the screen that scrolls. The title, toolbar, tabs and keyboard stay outside it.
+    pub fn store_list_viewport(&self) -> Rect {
+        let top = if self.store_tab == StoreTab::Search {
+            self.layout.store_search_field().bottom() + 8
+        } else if self.store_has_toolbar() {
+            self.layout.store_toolbar_button().bottom() + 8
         } else {
-            self.layout.store_page_label()
+            self.layout.store_title().bottom() + 20
+        };
+        let mut bottom = if self.store_search_keyboard {
+            self.layout.keyboard_area().y - 12
+        } else {
+            self.layout.store_body_bottom()
+        };
+        if self.store_list_notice().is_some() {
+            bottom -= 68;
+        }
+        Rect::new(0, top, self.layout.width, (bottom - top).max(0))
+    }
+
+    pub fn store_list_scroll_max(&self) -> i32 {
+        let bottom = if self.store_tab == StoreTab::Today {
+            let collections = self.store_today_collections().len();
+            if collections != 0 {
+                self.layout.store_collection_card(collections - 1).bottom()
+            } else if let Some(last) = self.store_today_rows().len().checked_sub(1) {
+                self.layout.store_today_row(last).bottom()
+            } else {
+                self.store_featured().map_or(0, |_| self.layout.store_see_all().bottom())
+            }
+        } else {
+            self.store_list_indices().len().checked_sub(1).map_or(0, |last| self.store_unscrolled_row(last).bottom())
+        };
+        (bottom - self.store_list_viewport().bottom()).max(0)
+    }
+
+    pub fn clamp_store_list_scroll(&mut self) {
+        if self.store_list_scroll > 0 {
+            self.store_list_scroll = self.store_list_scroll.min(self.store_list_scroll_max());
         }
     }
 
-    /// The pages of the current tab's list.
-    pub fn store_pages(&self) -> usize {
-        if self.store_tab == crate::store::StoreTab::Today {
-            self.store_today_collections().len().div_ceil(4).max(1)
-        } else {
-            self.store_list_indices().len().div_ceil(self.store_rows_per_page()).max(1)
+    fn store_entries_in(&self, viewport: Rect) -> Vec<(Rect, usize)> {
+        let intersects = |r: Rect| r.y < viewport.bottom() && r.bottom() > viewport.y;
+        if viewport.h <= 0 {
+            return Vec::new();
         }
+        if self.store_tab == StoreTab::Today {
+            let first = self.store_featured().map(|i| (self.store_today_feature(), i));
+            let rows = if self.store_today_collections().is_empty() { self.store_today_rows() } else { Vec::new() };
+            return first.into_iter().chain(rows.into_iter().enumerate().map(|(i, index)| {
+                (self.store_today_row(i), index)
+            })).filter(|(rect, _)| intersects(*rect)).collect();
+        }
+        let indices = self.store_list_indices();
+        let row = self.store_list_row(0);
+        let start = (viewport.y - row.y).div_euclid(row.h).max(0) as usize;
+        let end = ((viewport.bottom() - 1 - row.y).div_euclid(row.h) + 1).max(0) as usize;
+        (start..end.min(indices.len()))
+            .map(|i| (Rect { y: row.y + i as i32 * row.h, ..row }, indices[i]))
+            .collect()
+    }
+
+    pub fn store_visible_entries(&self) -> Vec<(Rect, usize)> {
+        self.store_entries_in(self.store_list_viewport())
+    }
+
+    /// Preload at most one viewport in each direction, in order of distance from the visible rows.
+    pub fn store_nearby_entries(&self) -> Vec<usize> {
+        let viewport = self.store_list_viewport();
+        let range = Rect { y: viewport.y - viewport.h, h: viewport.h * 3, ..viewport };
+        let mut nearby = self.store_entries_in(range);
+        nearby.retain(|(r, _)| r.bottom() <= viewport.y || r.y >= viewport.bottom());
+        nearby.sort_by_key(|(r, _)| {
+            if r.y >= viewport.bottom() { (r.y - viewport.bottom(), false) }
+            else { (viewport.y - r.bottom(), true) }
+        });
+        let mut indices: Vec<_> = nearby.into_iter().map(|(_, i)| i).collect();
+        if self.store_tab == StoreTab::Today {
+            let row = self.layout.store_toolbar_row(0);
+            let apps = ((self.layout.store_body_bottom() - row.y) / row.h).max(0) as usize;
+            let visible = self.store_visible_entries();
+            for i in 0..self.store.len().min(apps) {
+                if !indices.contains(&i) && !visible.iter().any(|(_, index)| *index == i) {
+                    indices.push(i);
+                }
+            }
+        }
+        indices
     }
 
     /// The sections of a product page that determine its scroll limit.
@@ -727,27 +819,29 @@ impl Ui {
     }
 
     pub fn open_store(&mut self) -> Action {
-        self.store_tab = crate::store::StoreTab::Today;
-        self.store_page = 0;
+        self.set_store_tab(StoreTab::Today);
         self.go(Screen::Store)
     }
 
-    /// Turns the page of the Apps or Updates list by one, if there is one.
-    fn store_turn(&mut self, step: i32) -> Action {
-        let next = self.store_page as i32 + step;
-        if next < 0 || next >= self.store_pages() as i32 {
+    fn scroll_store_list(&mut self, distance: i32, max: i32) -> Action {
+        let next = self.store_list_scroll.saturating_add(distance).clamp(0, max);
+        if next == self.store_list_scroll {
             return Action::None;
         }
-        self.store_page = next as usize;
+        self.store_list_scroll = next;
         Action::Redraw { full: false }
     }
 
-    /// The page buttons on the store's tabs: page through a list that has more than one page; otherwise (and on Today)
-    /// move to the next or previous tab.
-    fn store_page_key(&mut self, step: i32) -> Action {
-        use crate::store::StoreTab;
-        if self.store_pages() > 1 {
-            return self.store_turn(step);
+    /// Move through long lists, keeping some overlap, or switch tabs when everything fits.
+    fn store_page_key(&mut self, step: i32, viewport: Rect) -> Action {
+        let max = self.store_list_scroll_max();
+        if max > 0 {
+            let row = self.layout.store_list_row(0).h;
+            let distance = (viewport.h / row - 1).max(1) * row;
+            return self.scroll_store_list(step * distance, max);
+        }
+        if self.store_search_keyboard {
+            return Action::None;
         }
         let tabs = StoreTab::ALL;
         let current = tabs.iter().position(|t| *t == self.store_tab).unwrap_or(0) as i32;
@@ -760,9 +854,9 @@ impl Ui {
 
     fn store_open_entry(&mut self, index: usize) -> Action {
         if self.store_search_keyboard {
-            self.store_page = 0;
+            self.store_search_keyboard = false;
+            self.clamp_store_list_scroll();
         }
-        self.store_search_keyboard = false;
         self.store_open = Some(index);
         self.store_requirements = None;
         self.store_scroll = 0;
@@ -809,7 +903,7 @@ impl Ui {
 
     fn set_store_tab(&mut self, tab: crate::store::StoreTab) -> Action {
         self.store_tab = tab;
-        self.store_page = 0;
+        self.store_list_scroll = 0;
         self.store_search_keyboard = false;
         self.store_collection = None;
         self.store_category = None;
@@ -897,7 +991,7 @@ impl Ui {
                 let categories = self.store_categories();
                 if let Some(i) = (0..=categories.len()).find(|&i| l.store_category_cell(i).contains(x, y)) {
                     self.store_category = i.checked_sub(1).map(|i| categories[i].to_string());
-                    self.store_page = 0;
+                    self.store_list_scroll = 0;
                     self.store_category_picker = false;
                     return Some(Action::Redraw { full: true });
                 }
@@ -931,7 +1025,7 @@ impl Ui {
                         Action::Redraw { full: true }
                     }
                     primitive_keyboard::Press::Edited => {
-                        self.store_page = 0;
+                        self.store_list_scroll = 0;
                         Action::Redraw { full: false }
                     }
                     _ => Action::Redraw { full: false },
@@ -941,15 +1035,13 @@ impl Ui {
         };
         if open != self.store_search_keyboard {
             self.store_search_keyboard = open;
-            self.store_page = 0;
+            self.clamp_store_list_scroll();
         }
         Some(action)
     }
 
-    /// The store's tabs: a tap on the tab bar changes the tab; Today opens its featured app and rows; Apps and Updates
-    /// page through their lists and open an app.
-    fn store_list(&mut self, input: Input) -> Action {
-        use crate::store::StoreTab;
+    /// A swipe moves the list within its viewport. The tab bar, title controls and keyboard keep their own targets.
+    fn store_list(&mut self, input: Input, viewport: Rect) -> Action {
         let l = self.layout;
         if let Some(action) = self.store_list_popup(input) {
             return action;
@@ -960,9 +1052,13 @@ impl Ui {
             }
         }
         match input {
-            Input::PageForward => self.store_page_key(1),
-            Input::PageBack => self.store_page_key(-1),
-            Input::Swipe { dx, dy, .. } if dx.abs() > SWIPE_MIN && dx.abs() > dy.abs() * 1.5 => self.store_turn(if dx < 0.0 { 1 } else { -1 }),
+            Input::PageForward => self.store_page_key(1, viewport),
+            Input::PageBack => self.store_page_key(-1, viewport),
+            Input::Swipe { dx, dy, start_y } if dy.abs() >= 40.0 && dy.abs() > dx.abs()
+                && (viewport.y as f32..viewport.bottom() as f32).contains(&start_y) =>
+            {
+                self.scroll_store_list((-dy).round() as i32, self.store_list_scroll_max())
+            }
             Input::Tap(x, y) => {
                 if l.store_done().inset(-16).contains(x, y) {
                     if self.store_operation_running() {
@@ -979,6 +1075,7 @@ impl Ui {
                 }
                 if l.store_settings_button().contains(x, y) {
                     self.store_search_keyboard = false;
+                    self.clamp_store_list_scroll();
                     self.store_settings_open = true;
                     return Action::Redraw { full: false };
                 }
@@ -989,37 +1086,11 @@ impl Ui {
                     }
                     return self.set_store_tab(tab);
                 }
-                if self.store_tab == StoreTab::Today {
-                    if let Some(featured) = self.store_featured() {
-                        if l.store_feature().contains(x, y) {
-                            return self.store_open_entry(featured);
-                        }
-                    }
-                    if l.store_see_all().inset(-20).contains(x, y) {
-                        return self.set_store_tab(StoreTab::Apps);
-                    }
-                    if l.store_page_label().contains(x, y) {
-                        return self.store_turn(if x < (l.width / 2) as f32 { -1 } else { 1 });
-                    }
-                    let collections = self.store_today_collection_page();
-                    if !collections.is_empty() {
-                        if let Some(i) = (0..collections.len()).find(|&i| l.store_collection_card(i).contains(x, y)) {
-                            let id = collections[i].id.clone();
-                            let action = self.set_store_tab(StoreTab::Apps);
-                            self.store_collection = Some(id);
-                            return action;
-                        }
-                        return Action::None;
-                    }
-                    let rows = self.store_today_rows();
-                    let Some(row) = (0..rows.len()).find(|&i| l.store_today_row(i).contains(x, y)) else { return Action::None };
-                    return self.store_tap_entry(rows[row], l.store_today_row(row), x, y);
-                }
                 if self.store_has_toolbar() && l.store_toolbar_button().contains(x, y) {
                     match self.store_tab {
                         StoreTab::Apps if self.store_collection.is_some() => {
                             self.store_collection = None;
-                            self.store_page = 0;
+                            self.store_list_scroll = 0;
                         }
                         StoreTab::Apps => self.store_category_picker = true,
                         StoreTab::Updates => self.store_batch_confirm = true,
@@ -1027,17 +1098,30 @@ impl Ui {
                     }
                     return Action::Redraw { full: false };
                 }
-                if self.store_page_label().contains(x, y) {
-                    return self.store_turn(if x < (l.width / 2) as f32 { -1 } else { 1 });
+                if !viewport.contains(x, y) {
+                    return Action::None;
                 }
-                let list = self.store_list_indices();
-                let per = self.store_rows_per_page();
-                let on_page = list.len().saturating_sub(self.store_page * per).min(per);
-                let Some(row) = (0..on_page).find(|&i| self.store_list_row(i).contains(x, y)) else { return Action::None };
-                match list.get(self.store_page * per + row) {
-                    Some(&index) => self.store_tap_entry(index, self.store_list_row(row), x, y),
-                    None => Action::None,
+                if self.store_tab == StoreTab::Today {
+                    if let Some(index) = self.store_featured() {
+                        if self.store_today_feature().contains(x, y) {
+                            return self.store_open_entry(index);
+                        }
+                        if self.store_today_see_all().inset(-20).contains(x, y) {
+                            return self.set_store_tab(StoreTab::Apps);
+                        }
+                    }
+                    if let Some(id) = self.store_today_collections().into_iter().enumerate()
+                        .find(|(i, _)| self.store_today_collection_card(*i).contains(x, y))
+                        .map(|(_, collection)| collection.id.clone())
+                    {
+                        let action = self.set_store_tab(StoreTab::Apps);
+                        self.store_collection = Some(id);
+                        return action;
+                    }
                 }
+                let Some((row, index)) = self.store_entries_in(viewport).into_iter()
+                    .find(|(row, _)| row.contains(x, y)) else { return Action::None };
+                self.store_tap_entry(index, row, x, y)
             }
             _ => Action::None,
         }
@@ -1508,6 +1592,8 @@ impl Ui {
             _ if self.screen == Screen::Sleep => return Action::None,
             _ => {}
         }
+        // Hit-test against the frame the user saw if this input also dismisses a notice.
+        let store_viewport = if self.screen == Screen::Store { self.store_list_viewport() } else { Rect::default() };
         let had_notice = self.notice.take().is_some();
         let action = match self.screen {
             Screen::Home => self.home(input),
@@ -1521,11 +1607,14 @@ impl Ui {
             Screen::PowerMenu => self.power_menu(input),
             Screen::AppMenu => self.app_menu(input),
             Screen::Extensions => self.extensions_list(input),
-            Screen::Store => self.store_list(input),
+            Screen::Store => self.store_list(input, store_viewport),
             Screen::StoreApp => self.store_app(input),
             Screen::QuickSettings => self.quick(input),
             Screen::Sleep => Action::None,
         };
+        if had_notice && self.screen == Screen::Store {
+            self.clamp_store_list_scroll();
+        }
         if had_notice && action == Action::None {
             Action::Redraw { full: false }
         } else {
@@ -2169,14 +2258,14 @@ mod tests {
         let entries: Vec<_> = (0..30).map(|i| test_entry(&format!("a{i}"), &format!("App {i}"), Status::NotInstalled)).collect();
         u.set_store(entries);
         u.open_store();
-        // Today has no pages: a page button moves to the next tab.
+        // Everything on Today fits, so a page button moves to the next tab.
         u.handle(Input::PageForward);
         assert_eq!(u.store_tab, StoreTab::Apps);
-        // The Apps list has pages: a page button turns the page.
+        // The Apps list is longer than its viewport, so the button scrolls it.
         u.handle(Input::PageForward);
-        assert_eq!(u.store_page, 1);
+        assert!(u.store_list_scroll > 0);
         // Back on the first tab, Today: the previous tab is not there.
-        u.store_tab = StoreTab::Today;
+        u.set_store_tab(StoreTab::Today);
         assert_eq!(u.handle(Input::PageBack), Action::None);
         // The product page scrolls a screen, and Back at the top returns to the store.
         u.store_open = Some(0);
@@ -2372,19 +2461,73 @@ mod tests {
     }
 
     #[test]
-    fn the_apps_list_pages_and_opens_the_entry_on_the_row() {
+    fn the_apps_list_scrolls_opens_the_visible_entry_and_preserves_position_on_back() {
         use crate::store::{test_entry, Status, StoreTab};
         let mut u = ui(0);
         let entries: Vec<_> = (0..30).map(|i| test_entry(&format!("app{i}"), &format!("App {i:02}"), Status::NotInstalled)).collect();
         u.set_store(entries);
         u.open_store();
-        u.store_tab = StoreTab::Apps;
-        let per = u.store_rows_per_page();
-        assert!(u.store_pages() > 1, "thirty apps need more than one page");
-        u.handle(Input::PageForward);
-        assert_eq!(u.store_page, 1);
-        u.handle(centre(u.store_list_row(0)));
-        assert_eq!(u.store_open, Some(per), "the first row of page two is entry {per}");
+        u.handle(centre(u.layout.store_tab(1)));
+        assert_eq!(u.store_tab, StoreTab::Apps);
+        let viewport = u.store_list_viewport();
+        assert_eq!(viewport.bottom(), u.layout.store_tabs().y - 12);
+        let swipe = |dy, start_y| Input::Swipe { dx: 0.0, dy, start_y };
+        assert_eq!(u.handle(swipe(-380.0, 120.0)), Action::None);
+        assert_eq!(u.handle(swipe(-380.0, u.layout.store_tabs().y as f32 + 40.0)), Action::None);
+        assert_eq!(u.handle(swipe(-380.0, 900.0)), Action::Redraw { full: false });
+        assert_eq!(u.store_list_scroll, 380);
+        let (row, index) = u.store_visible_entries().into_iter()
+            .find(|(row, _)| row.y >= viewport.y).unwrap();
+        assert!(index > 0);
+        assert_eq!(u.handle(centre(row)), Action::Redraw { full: false });
+        assert_eq!(u.store_open, Some(index));
+        u.handle(centre(u.layout.store_back()));
+        assert_eq!(u.screen, Screen::Store);
+        assert_eq!(u.store_list_scroll, 380);
+        u.handle(swipe(-20_000.0, 900.0));
+        assert_eq!(u.store_list_scroll, u.store_list_scroll_max());
+        assert_eq!(u.store_visible_entries().last().unwrap().1, 29);
+
+        u.notice = Some("Catalog updated".into());
+        let tap = Input::Tap(80.0, (u.store_list_viewport().bottom() + 20) as f32);
+        assert_eq!(u.handle(tap), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Store);
+        assert!(u.notice.is_none());
+
+        u.handle(swipe(20_000.0, 900.0));
+        assert_eq!(u.store_list_scroll, 0);
+        u.handle(centre(u.layout.store_tab(3)));
+        assert_eq!(u.store_tab, StoreTab::Search);
+        u.handle(centre(u.layout.store_search_field()));
+        assert!(u.store_search_keyboard);
+        assert!(u.store_list_viewport().bottom() < u.layout.keyboard_area().y);
+        assert_eq!(u.handle(swipe(-400.0, (u.layout.keyboard_area().y + 60) as f32)), Action::None);
+        u.handle(swipe(-400.0, 600.0));
+        assert_eq!(u.store_list_scroll, 400);
+        u.handle(Input::PageBack);
+        assert!(!u.store_search_keyboard);
+        assert_eq!(u.store_list_scroll, 400);
+    }
+
+    #[test]
+    fn today_scrolls_to_all_collections_and_opens_the_one_tapped() {
+        use crate::store::{test_entry, Status};
+        use kl_store::catalog::Collection;
+        let mut u = ui(0);
+        u.set_store(vec![test_entry("a", "Alpha", Status::NotInstalled)]);
+        u.store_collections = (0..11).map(|i| Collection {
+            id: format!("collection-{i}"), title: format!("Collection {i}"),
+            description: String::new(), apps: vec!["a".into()],
+        }).collect();
+        u.open_store();
+        assert!(u.store_today_collection_card(10).y > u.store_list_viewport().bottom());
+        u.handle(Input::Swipe { dx: 0.0, dy: -2400.0, start_y: 900.0 });
+        let last = u.store_today_collection_card(10);
+        assert_eq!(last.bottom(), u.store_list_viewport().bottom());
+        u.handle(centre(last));
+        assert_eq!(u.store_tab, StoreTab::Apps);
+        assert_eq!(u.store_collection.as_deref(), Some("collection-10"));
+        assert_eq!(u.store_list_scroll, 0);
     }
 
     #[test]

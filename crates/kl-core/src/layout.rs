@@ -939,7 +939,7 @@ impl Layout {
 
     /// The floating tab bar, with its four tabs.
     pub fn store_tabs(&self) -> Rect {
-        Rect::new(40, self.height - 40 - STORE_TAB_BAR_H, self.width - 80, STORE_TAB_BAR_H)
+        Rect::new(40, self.height - 24 - STORE_TAB_BAR_H, self.width - 80, STORE_TAB_BAR_H)
     }
 
     /// Tab `i`: an equal part of the bar, inset a little.
@@ -1009,13 +1009,9 @@ impl Layout {
         Rect::new(row.x, row.y + 120, row.w, row.h)
     }
 
-    pub fn store_toolbar_rows(&self) -> usize {
-        ((self.store_body_bottom() - self.store_toolbar_row(0).y - 170) / STORE_ROW_H).max(1) as usize
-    }
-
     /// Where a tab's content ends: above the tab bar.
     pub fn store_body_bottom(&self) -> i32 {
-        self.store_tabs().y - 30
+        self.store_tabs().y - 12
     }
 
     /// Today's featured card: the first app, large, in black.
@@ -1035,7 +1031,7 @@ impl Layout {
         Rect::new(40, top + i as i32 * STORE_ROW_H, self.width - 80, STORE_ROW_H)
     }
 
-    /// Row `i` of the Apps or Updates list, on the current page.
+    /// Unscrolled row `i` of the Apps or Updates list.
     pub fn store_list_row(&self, i: usize) -> Rect {
         Rect::new(40, 200 + i as i32 * STORE_ROW_H, self.width - 80, STORE_ROW_H)
     }
@@ -1048,39 +1044,8 @@ impl Layout {
         Rect::new(40, self.store_search_field().bottom() + 16 + i as i32 * STORE_ROW_H, self.width - 80, STORE_ROW_H)
     }
 
-    pub fn store_search_rows(&self, keyboard: bool) -> usize {
-        ((self.store_search_page_label(keyboard).y - self.store_search_row(0).y) / STORE_ROW_H).max(1) as usize
-    }
-
-    pub fn store_search_page_label(&self, keyboard: bool) -> Rect {
-        if keyboard {
-            Rect::new(0, self.keyboard_area().y - 72, self.width, 60)
-        } else {
-            self.store_page_label()
-        }
-    }
-
-    /// Rows that fit above the tab bar, with room for the page label.
-    pub fn store_rows_per_page(&self) -> usize {
-        ((self.store_body_bottom() - 200 - 200) / STORE_ROW_H).max(1) as usize
-    }
-
     pub fn store_row_action(row: Rect) -> Rect {
         Rect::new(row.right() - 190, row.y + (row.h - 76) / 2, 190, 76)
-    }
-
-    pub fn store_pages(&self, n: usize) -> usize {
-        n.div_ceil(self.store_rows_per_page()).max(1)
-    }
-
-    /// The page label under the rows: its left half turns back, its right half turns forward.
-    pub fn store_page_label(&self) -> Rect {
-        Rect::new(0, self.store_tabs().y - 200, self.width, 76)
-    }
-
-    /// The index of the row under a point, among `rows` rows of a list or of Today.
-    pub fn store_row_at(&self, x: f32, y: f32, rows: usize, today: bool) -> Option<usize> {
-        (0..rows).find(|&i| if today { self.store_today_row(i) } else { self.store_list_row(i) }.contains(x, y))
     }
 
     // Product page. The header (back) stays; everything below it scrolls by `scroll` pixels.
