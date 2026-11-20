@@ -18,6 +18,8 @@ pub struct Display {
     panel: Option<eink::Panel>,
     last: Vec<u8>,
     presented_frame: bool,
+    /// While an app owns the screen the launcher draws nothing: `show` and `show_region` do nothing.
+    paused: bool,
 }
 
 impl Display {
@@ -29,7 +31,41 @@ impl Display {
                 None
             }
         };
-        Display { panel, last: Vec::new(), presented_frame: false }
+        Display { panel, last: Vec::new(), presented_frame: false, paused: false }
+    }
+
+    /// Stop or resume drawing. Resuming draws the whole screen on the next `show`, as the panel was someone else's.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.last.clear();
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// What is on the panel now, in panel orientation, to put back with `restore`. `None` off the Kindle.
+    pub fn snapshot(&self) -> Option<Vec<u8>> {
+        self.panel.as_ref()?.snapshot(W, H)
+    }
+
+    /// Put a snapshot back with one full update (it draws even while paused).
+    pub fn restore(&mut self, frame: Vec<u8>) {
+        let Some(panel) = self.panel.as_mut() else { return };
+        match panel.draw(W, (0, 0, W, H), &frame, eink::WAVE_GC16, true) {
+            Ok(true) => {
+                self.last = frame;
+                log("draw: the saved screen is back");
+            }
+            Ok(false) => {
+                self.last.clear();
+                log("restore: the framebuffer is not in a drawable state");
+            }
+            Err(e) => {
+                self.last.clear();
+                log(&format!("restore: {e}"));
+            }
+        }
     }
 
     pub fn fb_turn(&self) -> u32 {
@@ -41,6 +77,9 @@ impl Display {
     }
 
     pub fn show(&mut self, upright: Vec<u8>, settings: &Settings, full: bool) {
+        if self.paused {
+            return;
+        }
         let fb_turn = self.fb_turn();
         let frame = kl_render::for_panel(upright, settings.rotation, fb_turn);
         let Some(panel) = self.panel.as_mut() else {
@@ -78,6 +117,9 @@ impl Display {
     /// Show only `area` of `upright` (a pop-up), leaving the rest of the panel as it is. The next `show` draws
     /// the whole screen, as what is on the panel is no longer known.
     pub fn show_region(&mut self, upright: Vec<u8>, area: kl_core::Rect, settings: &Settings) {
+        if self.paused {
+            return;
+        }
         let fb_turn = self.fb_turn();
         let turned = (settings.rotation.turn() + fb_turn) % 4 == 2;
         let frame = kl_render::for_panel(upright, settings.rotation, fb_turn);

@@ -35,4 +35,6 @@ pub enum Ev {
     StoreProgress { message: String, percent: Option<u8> },
     /// The launcher finished installing the standalone store.
     StoreBootstrapped(Result<(), String>),
+    /// The app the supervisor ran for the launcher has ended (or never started): the launcher takes the screen back.
+    AppEnded,
 }

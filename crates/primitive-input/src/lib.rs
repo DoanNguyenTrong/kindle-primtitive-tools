@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::Read,
     os::unix::io::AsRawFd,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicI32, AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -122,6 +122,24 @@ fn page_button(code: u16, turn: u32) -> Option<Input> {
     }
 }
 
+/// The open touch device, for `grab_touch` (-1 until the touch loop opens it).
+static TOUCH_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// `EVIOCGRAB`: `_IOW('E', 0x90, int)`.
+const EVIOCGRAB: u32 = 0x4004_4590;
+
+/// Take the touch screen for this process only (`true`), or give it back (`false`). While it is taken, no other
+/// process gets touches: the system panel over an app keeps the app from seeing the taps meant for the panel.
+/// Returns whether the device took the request.
+pub fn grab_touch(on: bool) -> bool {
+    let fd = TOUCH_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: EVIOCGRAB takes an int by value on an evdev descriptor this process opened and keeps open.
+    unsafe { libc::ioctl(fd, EVIOCGRAB as _, on as libc::c_int) == 0 }
+}
+
 /// Read touches from the device and report completed gestures.
 pub fn touch_loop(path: String, mut report: impl FnMut(Input)) {
     let mut file = match File::open(&path) {
@@ -132,6 +150,7 @@ pub fn touch_loop(path: String, mut report: impl FnMut(Input)) {
         return log("touch ranges unavailable");
     };
     log(&format!("touch {path}: x {}..{} y {}..{}", xi.minimum, xi.maximum, yi.minimum, yi.maximum));
+    TOUCH_FD.store(file.as_raw_fd(), Ordering::Relaxed);
     let (mut raw_x, mut raw_y) = (0i32, 0i32);
     let mut active = false;
     let mut start: Option<(f32, f32)> = None;
