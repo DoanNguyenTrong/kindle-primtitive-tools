@@ -1078,11 +1078,11 @@ impl Layout {
         Rect::new(40, 895 - scroll, self.width - 80, 40)
     }
 
-    /// The information strip: three cells (version, licence, firmware), split by hairlines.
-    pub fn store_info_cells(&self, scroll: i32) -> [Rect; 3] {
-        let w = (self.width - 80) / 3;
+    /// Product summary cells for version, size, firmware, and downloads.
+    pub fn store_info_cells(&self, scroll: i32) -> [Rect; 4] {
+        let w = (self.width - 80) / 4;
         let y = 980 - scroll;
-        [0, 1, 2].map(|i| Rect::new(40 + i * w, y, w, 150))
+        [0, 1, 2, 3].map(|i| Rect::new(40 + i * w, y, w, 150))
     }
 
     /// A 632 × 840 screenshot shown at 540 px high.

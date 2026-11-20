@@ -1441,12 +1441,17 @@ impl Renderer {
         });
         self.text(Text { text: &caption, x: 40.0, y: dev.y as f32, w, size: 26.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
 
-        // The information strip: version, size, firmware, split by hairlines.
+        // The information strip, split by hairlines.
         let cells = l.store_info_cells(scroll);
         let version = e.latest.clone().unwrap_or_else(|| "—".to_string());
         let size = e.size.map(kl_core::store::format_size).unwrap_or_else(|| "—".to_string());
         let firmware = if e.firmware_min.is_empty() { "—".to_string() } else { format!("{}+", e.firmware_min) };
-        let strip = [("VERSION", version), ("SIZE", size), ("FIRMWARE", firmware)];
+        let strip = [
+            ("VERSION", version),
+            ("SIZE", size),
+            ("FIRMWARE", firmware),
+            ("DOWNLOADS", download_count_label(e.downloads)),
+        ];
         self.hairline(cells[0].y, 40, l.width - 40);
         self.hairline(cells[0].bottom() - 1, 40, l.width - 40);
         for (i, (cell, (label, value))) in cells.iter().zip(strip.iter()).enumerate() {
@@ -1454,7 +1459,10 @@ impl Renderer {
                 self.fill(Rect::new(cell.x, cell.y + 28, 2, cell.h - 56), 200);
             }
             self.text(Text { text: label, x: cell.x as f32, y: (cell.y + 26) as f32, w: cell.w as f32, size: 24.0, bold: true, align: Align::Center, lines: 1, gray: 60 });
-            self.text(Text { text: value, x: cell.x as f32, y: (cell.y + 68) as f32, w: cell.w as f32, size: 36.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
+            let value_width = (cell.w - 16) as f32;
+            let text_width = self.text_width(value, 36.0, true).max(1.0);
+            let size = 36.0 * (value_width / text_width).min(1.0);
+            self.text(Text { text: value, x: (cell.x + 8) as f32, y: (cell.y + 68) as f32, w: value_width, size, bold: true, align: Align::Center, lines: 1, gray: BLACK });
         }
 
         // Screenshots, when the store has them for this app (from the cache, or the desktop preview).
@@ -2172,6 +2180,19 @@ fn capitalise(s: &str) -> String {
     }
 }
 
+fn download_count_label(downloads: Option<u64>) -> String {
+    let Some(count) = downloads else { return "Unavailable".into() };
+    let digits = count.to_string();
+    let mut label = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            label.push(',');
+        }
+        label.push(digit);
+    }
+    label
+}
+
 /// Copy a tile into the screen buffer at `r` (clipped to the tile and screen).
 fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, clip: Option<Rect>) {
     let height = (out.len() / width) as i32;
@@ -2334,6 +2355,14 @@ mod tests {
         // The reader's silhouette is black; the sky above it is a mid gray.
         assert!(tile.pixels.iter().filter(|&&p| p == 0).count() > 184 * 184 / 5);
         assert!(tile.pixels.iter().any(|&p| p > 60 && p < 200));
+    }
+
+    #[test]
+    fn download_counts_show_exact_totals_and_distinguish_zero_from_missing() {
+        assert_eq!(download_count_label(None), "Unavailable");
+        assert_eq!(download_count_label(Some(0)), "0");
+        assert_eq!(download_count_label(Some(1_234_567)), "1,234,567");
+        assert_eq!(download_count_label(Some(u64::MAX)), "18,446,744,073,709,551,615");
     }
 
     #[test]

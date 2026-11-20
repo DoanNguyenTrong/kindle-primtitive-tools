@@ -7,7 +7,7 @@
 use crate::catalog::{valid_app_id, Asset, Card, CollectionIndex, Index, Listing};
 use crate::signatures::{self, PackageIdentity, TrustedKey, VerifiedIndex};
 use ring::digest::{Context, SHA256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -75,11 +75,16 @@ fn verified_index(key: &TrustedKey, bytes: &[u8], sidecar: &[u8]) -> Result<(Ind
 pub struct CachedCatalog {
     directory: PathBuf,
     proof: Option<VerifiedIndex>,
+    download_counts: BTreeMap<String, u64>,
 }
 
 impl CachedCatalog {
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub fn download_count(&self, id: &str) -> Option<u64> {
+        self.download_counts.get(id).copied()
     }
 
     pub fn listing(&self, id: &str) -> Result<Listing, String> {
@@ -92,16 +97,32 @@ impl CachedCatalog {
     }
 }
 
+fn listed_download_counts(index: Index) -> BTreeMap<String, u64> {
+    let Some(mut downloads) = index.downloads else { return BTreeMap::new() };
+    index.apps.into_iter()
+        .filter(|card| card.source != crate::catalog::Source::Link && valid_app_id(&card.id))
+        .filter_map(|card| {
+            let count = downloads.by_app.remove(&card.id)?;
+            Some((card.id, count))
+        })
+        .collect()
+}
+
 pub fn cached_catalog(cache: &Path, key: Option<&TrustedKey>) -> Result<CachedCatalog, String> {
     let Some(key) = key else {
-        return Ok(CachedCatalog { directory: cache.to_path_buf(), proof: None });
+        // Older unsigned caches may contain usable listings without an index.
+        let download_counts = read_limited(&cache.join("index.json"), MAX_INDEX).ok()
+            .and_then(|bytes| index_from_bytes(&bytes).ok())
+            .map(listed_download_counts)
+            .unwrap_or_default();
+        return Ok(CachedCatalog { directory: cache.to_path_buf(), proof: None, download_counts });
     };
     let directory = read_current_snapshot(cache)?.ok_or("refresh the signed catalog first")?;
     let index = read_limited(&directory.join("index.json"), MAX_INDEX).map_err(|error| error.to_string())?;
     let sidecar = read_limited(&directory.join(signatures::INDEX_SIGNATURE_FILENAME), signatures::MAX_INDEX_SIDECAR_BYTES)
         .map_err(|error| error.to_string())?;
-    let (_, proof) = verified_index(key, &index, &sidecar)?;
-    Ok(CachedCatalog { directory, proof: Some(proof) })
+    let (index, proof) = verified_index(key, &index, &sidecar)?;
+    Ok(CachedCatalog { directory, proof: Some(proof), download_counts: listed_download_counts(index) })
 }
 
 fn snapshot_name(name: &str) -> bool {
@@ -602,6 +623,21 @@ mod tests {
         site.docs.insert(format!("{BASE}/index.json"), serde_json::to_vec(&index).unwrap());
     }
 
+    fn with_hosted_downloads(site: &mut Fake, id: &str, count: u64) {
+        let mut index = index_from_bytes(&site.docs[&format!("{BASE}/index.json")]).unwrap();
+        let card = index.apps.iter_mut().find(|card| card.id == id).unwrap();
+        card.source = crate::catalog::Source::Hosted;
+        index.downloads = Some(crate::catalog::DownloadCounts {
+            as_of: "2026-11-20T10:00:00Z".into(),
+            by_app: BTreeMap::from([(id.into(), count)]),
+        });
+        site.docs.insert(format!("{BASE}/index.json"), serde_json::to_vec(&index).unwrap());
+        let path = format!("{BASE}/apps/{id}.json");
+        let mut listing = parse_listing(id, &site.docs[&path], None).unwrap();
+        listing.source = crate::catalog::Source::Hosted;
+        site.docs.insert(path, serde_json::to_vec(&listing).unwrap());
+    }
+
     fn cache(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kl-refresh-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -624,6 +660,7 @@ mod tests {
     fn a_signed_refresh_publishes_only_a_complete_snapshot() {
         let dir = cache("signed-snapshot");
         let mut first = site(&["notes"], 0);
+        with_hosted_downloads(&mut first, "notes", 21);
         refresh(BASE, &dir, &first).unwrap();
         let key = sign_site(&mut first, &["notes"]);
         assert!(cached_catalog(&dir, Some(&key)).is_err(), "unsigned cache cannot satisfy the policy");
@@ -631,11 +668,20 @@ mod tests {
         refresh_with_key(BASE, &dir, &first, Some(&key)).unwrap();
         let accepted = cached_catalog(&dir, Some(&key)).unwrap();
         assert_eq!(accepted.listing("notes").unwrap().id, "notes");
+        assert_eq!(accepted.download_count("notes"), Some(21));
         let mut next = site(&["notes", "words"], 0);
+        with_hosted_downloads(&mut next, "notes", 22);
         sign_site(&mut next, &["notes", "words"]);
         next.docs.get_mut(&format!("{BASE}/apps/words.json")).unwrap().push(b' ');
         assert!(refresh_with_key(BASE, &dir, &next, Some(&key)).is_err());
-        assert_eq!(cached_catalog(&dir, Some(&key)).unwrap().directory(), accepted.directory());
+        let current = cached_catalog(&dir, Some(&key)).unwrap();
+        assert_eq!(current.directory(), accepted.directory());
+        assert_eq!(current.download_count("notes"), Some(21));
+
+        let path = accepted.directory().join("index.json");
+        let tampered = fs::read_to_string(&path).unwrap().replace("\"notes\":21", "\"notes\":99");
+        fs::write(path, tampered).unwrap();
+        assert!(cached_catalog(&dir, Some(&key)).is_err(), "the signature covers the count");
 
         let offline = accepted.directory().join("apps/notes.json");
         let mut tampered = fs::read(&offline).unwrap();
@@ -826,6 +872,35 @@ mod tests {
         with_revisions(&mut full);
         assert_eq!(refresh(BASE, &dir, &full).unwrap(), Report { refreshed: 1, reused: 1, ..Report::default() });
         assert_eq!(fs::read(dir.join("icons/words.png")).unwrap(), expected_art);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refreshes_download_totals_without_refetching_unchanged_listings() {
+        let dir = cache("downloads");
+        let mut full = site(&["notes", "words"], 0);
+        with_hosted_downloads(&mut full, "notes", 0);
+        with_revisions(&mut full);
+        refresh(BASE, &dir, &full).unwrap();
+        assert_eq!(cached_catalog(&dir, None).unwrap().download_count("notes"), Some(0));
+
+        let mut index = index_from_bytes(&full.docs[&format!("{BASE}/index.json")]).unwrap();
+        let totals = &mut index.downloads.as_mut().unwrap().by_app;
+        totals.insert("notes".into(), 37);
+        totals.insert("words".into(), 9);
+        totals.insert("unlisted-app".into(), 19);
+        let mut index_only = Fake::default();
+        index_only.docs.insert(format!("{BASE}/index.json"), serde_json::to_vec(&index).unwrap());
+        assert_eq!(refresh(BASE, &dir, &index_only).unwrap(), Report { reused: 2, ..Report::default() });
+        let offline = cached_catalog(&dir, None).unwrap();
+        assert_eq!(offline.download_count("notes"), Some(37));
+        assert_eq!(offline.download_count("words"), None, "link listings have no package downloads");
+        assert_eq!(offline.download_count("unlisted-app"), None);
+
+        index.downloads = None;
+        index_only.docs.insert(format!("{BASE}/index.json"), serde_json::to_vec(&index).unwrap());
+        refresh(BASE, &dir, &index_only).unwrap();
+        assert_eq!(cached_catalog(&dir, None).unwrap().download_count("notes"), None, "older indexes omit totals");
         fs::remove_dir_all(dir).unwrap();
     }
 

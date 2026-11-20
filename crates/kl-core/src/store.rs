@@ -63,6 +63,8 @@ pub struct StoreEntry {
     pub system_changes: bool,
     /// The download's size for the latest version (its armhf asset), when the listing has one.
     pub size: Option<u64>,
+    /// The catalog's last published total of package ZIP downloads, when available.
+    pub downloads: Option<u64>,
     /// The lowest Kindle firmware the latest version runs on.
     pub firmware_min: String,
     /// The Kindles the latest version was tested on.
@@ -201,6 +203,7 @@ impl StoreEntry {
                 Some(arch) => v.assets.get(arch),
                 None => v.assets.get("armhf").or_else(|| v.assets.values().next()),
             }).map(|a| a.size),
+            downloads: None,
             firmware_min: newest.map(|v| v.firmware.min.clone()).unwrap_or_default(),
             tested_on: newest.map(|v| v.tested_on.clone()).unwrap_or_default(),
             screenshots: listing.screenshots.len().min(2),
@@ -227,6 +230,7 @@ impl StoreEntry {
             changes: if app.hooks.is_empty() { Vec::new() } else { vec!["Runs reviewed removal steps with system access.".into()] },
             system_changes: !app.hooks.is_empty(),
             size: None,
+            downloads: None,
             firmware_min: String::new(),
             tested_on: Vec::new(),
             screenshots: 0,
@@ -324,6 +328,7 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
         changes: vec!["Changes nothing outside its own folder.".into()],
         system_changes: false,
         size: Some(1_000_000),
+        downloads: None,
         firmware_min: "5.16.3".into(),
         tested_on: vec!["KindleOasis3".into()],
         screenshots: 0,
