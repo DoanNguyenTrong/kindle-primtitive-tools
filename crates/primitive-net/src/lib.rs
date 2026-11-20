@@ -34,6 +34,7 @@ impl Policy {
                 // GitHub sends a release download here, on a signed link, after the github.com redirect.
                 "release-assets.githubusercontent.com".into(),
                 "raw.githubusercontent.com".into(),
+                "primitiveos.github.io".into(),
                 "doannguyentrong.github.io".into(),
             ],
             max_bytes,
@@ -367,6 +368,8 @@ mod tests {
         assert!(allowed("https://github.com/x/releases/download/v1/a.zip", &p));
         assert!(allowed("https://objects.githubusercontent.com/a", &p));
         assert!(allowed("https://release-assets.githubusercontent.com/github-production-release-asset/1/x?sig=y", &p));
+        assert!(allowed("https://primitiveos.github.io/kindle-primitive-catalog/v1/index.json", &p));
+        assert!(!allowed("https://primitiveos.github.io.evil.example/index.json", &p));
         assert!(!allowed("https://github.com.evil.example/a", &p), "a look-alike host is refused");
         assert!(!allowed("https://evil.example/github.com", &p));
         assert!(!allowed("https://sub.github.com/a", &p), "a subdomain is not on the list");
