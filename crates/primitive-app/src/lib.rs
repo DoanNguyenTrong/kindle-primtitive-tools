@@ -283,13 +283,26 @@ extern "C" fn on_redraw(_: libc::c_int) {
 
 /// Under Primitive Launcher the app answers the redraw signal: SIGUSR1 is turned into `Event::Redraw`. Without the
 /// launcher the signal is left alone.
+/// The swipe that opens quick settings under the launcher: down from the top edge, the launcher's own rule
+/// (`opens_quick_settings` in kl-launcher; the status bar is 120 px, plus 40 px of slack).
+fn is_system_swipe(input: Input) -> bool {
+    matches!(input, Input::Swipe { dx, dy, start_y } if dy > 150.0 && dy.abs() > dx.abs() * 1.5 && start_y <= 160.0)
+}
+
 fn follow_redraw_signal(events: mpsc::Sender<Event>) {
     // SAFETY: the handler only stores to an atomic, which is safe in a signal handler.
     unsafe { libc::signal(libc::SIGUSR1, on_redraw as *const () as libc::sighandler_t) };
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(150));
-        if REDRAW.swap(false, Ordering::Relaxed) && events.send(Event::Redraw).is_err() {
-            break;
+    // This thread only wakes the loop; the loop takes the request itself, before the event that woke it, so nothing
+    // queued behind the freeze is drawn in the old theme first.
+    thread::spawn(move || {
+        let mut woken = false;
+        loop {
+            thread::sleep(Duration::from_millis(150));
+            let pending = REDRAW.load(Ordering::Relaxed);
+            if pending && !woken && events.send(Event::Redraw).is_err() {
+                break;
+            }
+            woken = pending;
         }
     });
 }
@@ -417,6 +430,21 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             Some(deadline) => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
+        // The launcher's redraw request (SIGUSR1, sent while the app was frozen) comes first: read the theme again
+        // before handling what woke the loop, and draw the whole screen once.
+        let mut redraw_now = false;
+        if under_launcher && REDRAW.swap(false, Ordering::Relaxed) {
+            let fresh = display_settings(
+                &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
+                &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
+            );
+            settings.dark_mode = fresh.dark_mode;
+            if lifecycle.is_awake() {
+                redraw_now = true;
+            } else {
+                redraw_on_wake = true;
+            }
+        }
         let usb_drive = managed_storage && !user_storage_is_mounted();
         let usb_changed = lifecycle.set_usb_drive(usb_drive);
         let usb_redraw = matches!(event, Ok(Event::UsbRedraw));
@@ -424,6 +452,8 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         let mut change = match event {
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if !usb_drive => app.tick(Instant::now()),
+            // The swipe down from the top edge is the system's (quick settings) under the launcher, not the app's.
+            Ok(Event::Input(input, _)) if under_launcher && is_system_swipe(input) => Change::None,
             Ok(Event::Input(input, start_x)) => {
                 if !usb_changed {
                     if let Some(image) =
@@ -442,26 +472,17 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                     change
                 }
             }
-            Ok(Event::Redraw) => {
-                // The theme may have changed: read it again from the launcher's settings (and the app's own).
-                let fresh = display_settings(
-                    &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
-                    &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
-                );
-                settings.dark_mode = fresh.dark_mode;
-                if lifecycle.is_awake() {
-                    Change::Full
-                } else {
-                    redraw_on_wake = true;
-                    Change::None
-                }
-            }
+            // Only a wake-up: the request was taken above.
+            Ok(Event::Redraw) => Change::None,
             Ok(Event::Turn(rotation)) => {
                 inherited_rotation = rotation;
                 Change::None
             }
             _ => Change::None,
         };
+        if redraw_now && change != Change::Exit {
+            change = Change::Full;
+        }
         if usb_changed && !usb_drive {
             match app.storage_returned() {
                 Ok(()) if storage::pending_save() => persist(&mut app, on_save_error),
@@ -543,6 +564,14 @@ fn watch_usb(events: mpsc::Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_swipe_is_down_from_the_top_edge_only() {
+        assert!(is_system_swipe(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 30.0 }));
+        assert!(!is_system_swipe(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 700.0 }), "a move in the app");
+        assert!(!is_system_swipe(Input::Swipe { dx: 0.0, dy: -400.0, start_y: 30.0 }), "up is the app's");
+        assert!(!is_system_swipe(Input::Swipe { dx: 400.0, dy: 20.0, start_y: 30.0 }), "sideways is the app's");
+    }
 
     #[derive(Default)]
     struct Demo {
