@@ -5,6 +5,7 @@
 
 use std::{
     io::{BufRead, BufReader},
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -24,6 +25,7 @@ const POWERD: &str = "com.lab126.powerd";
 const WIFID: &str = "com.lab126.wifid";
 const CMD: &str = "com.lab126.cmd";
 pub const LEVEL_MAX: u32 = 24;
+pub const NTPDATE: &str = "/usr/bin/ntpdate";
 
 fn get_int(service: &str, prop: &str) -> Option<u32> {
     let out = Command::new("lipc-get-prop").args(["-i", service, prop]).stderr(Stdio::null()).output().ok()?;
@@ -89,6 +91,19 @@ pub fn usb_state() -> kl_core::Usb {
 
 /// The local time and date, e.g. "10:38" and "Mon 16 Nov".
 pub fn local_time() -> (String, String, i32) {
+    let reading = read_clock();
+    (reading.time, reading.date, reading.minute)
+}
+
+struct ClockReading {
+    time: String,
+    date: String,
+    minute: i32,
+    year: Option<i32>,
+    utc_offset: Option<i32>,
+}
+
+fn read_clock() -> ClockReading {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     // SAFETY: `time`, `gmtime_r` and `localtime_r` only write into the values passed here.
@@ -106,13 +121,28 @@ pub fn local_time() -> (String, String, i32) {
             None => !libc::localtime_r(&now, &mut tm).is_null(),
         };
         if !done {
-            return ("--:--".into(), String::new(), -1);
+            return ClockReading { time: "--:--".into(), date: String::new(), minute: -1, year: None, utc_offset: None };
         }
         let clock = format!("{:02}:{:02}", tm.tm_hour, tm.tm_min);
         let day = DAYS.get(tm.tm_wday as usize).copied().unwrap_or("");
         let month = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("");
-        (clock, format!("{day} {} {month}", tm.tm_mday), tm.tm_hour * 60 + tm.tm_min)
+        ClockReading {
+            time: clock,
+            date: format!("{day} {} {month}", tm.tm_mday),
+            minute: tm.tm_hour * 60 + tm.tm_min,
+            year: tm.tm_year.checked_add(1900),
+            utc_offset: offset,
+        }
     }
+}
+
+/// Refresh only the time settings, without waiting for device property calls.
+pub fn refresh_clock(status: &mut Status) {
+    let reading = read_clock();
+    status.clock = reading.time;
+    status.date = reading.date;
+    status.clock_year = reading.year;
+    status.utc_offset = reading.utc_offset;
 }
 
 /// The battery level as a percentage, if it can be read.
@@ -205,7 +235,7 @@ pub fn status(settings: &Settings) -> Status {
     };
     let rotation = settings.rotation;
     let sleep_launcher = settings.sleep_screen_launcher;
-    let (clock, date, _) = local_time();
+    let clock = read_clock();
     let (wifi_on, wifi_state) = wifi_status();
     let power = battery_reading();
     let light = light_level();
@@ -216,8 +246,12 @@ pub fn status(settings: &Settings) -> Status {
         auto_rotation: auto_rotation_supported(),
     };
     Status {
-        clock,
-        date,
+        clock: clock.time,
+        date: clock.date,
+        clock_year: clock.year,
+        utc_offset: clock.utc_offset,
+        clock_sync_available: std::fs::metadata(NTPDATE)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0),
         battery: power.percent,
         charging: power.source == Source::Charging,
         power,

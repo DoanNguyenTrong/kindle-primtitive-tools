@@ -42,6 +42,18 @@ pub fn offset_at(data: &[u8], now: i64) -> Option<i32> {
     i32_at(data, types_at + 6 * kind)
 }
 
+/// The offset displayed in device settings, including fractional-hour zones.
+pub fn format_offset(offset: i32) -> String {
+    let sign = if offset < 0 { '-' } else { '+' };
+    let seconds = offset.unsigned_abs();
+    let (hours, minutes, remainder) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
+    if remainder == 0 {
+        format!("UTC{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("UTC{sign}{hours:02}:{minutes:02}:{remainder:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +98,13 @@ mod tests {
         assert_eq!(offset_at(b"GMT+7", 0), None);
         assert_eq!(offset_at(b"TZif2", 0), None);
         assert_eq!(offset_at(&tzif(&[(0, 5)], &[0]), 10), None);
+    }
+
+    #[test]
+    fn settings_format_positive_negative_and_fractional_offsets() {
+        assert_eq!(format_offset(0), "UTC+00:00");
+        assert_eq!(format_offset(7 * 3600), "UTC+07:00");
+        assert_eq!(format_offset(-3 * 3600 - 30 * 60), "UTC-03:30");
+        assert_eq!(format_offset(5 * 3600 + 45 * 60), "UTC+05:45");
     }
 }

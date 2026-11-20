@@ -61,6 +61,7 @@ pub enum Page {
     Store,
     Storage,
     Device,
+    DateTime,
     About,
 }
 
@@ -72,10 +73,10 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 13] = [
+    pub const ALL: [Page; 14] = [
         Page::Battery, Page::Display, Page::Accessibility, Page::Sleep, Page::Wifi,
         Page::Connection, Page::FileTransfer, Page::Apps, Page::AppVisibility, Page::Store,
-        Page::Storage, Page::Device, Page::About,
+        Page::Storage, Page::Device, Page::DateTime, Page::About,
     ];
 
     pub fn title(self) -> &'static str {
@@ -92,6 +93,7 @@ impl Page {
             Page::Store => "Store",
             Page::Storage => "Storage",
             Page::Device => "Device",
+            Page::DateTime => "Date and time",
             Page::About => "About",
         }
     }
@@ -157,6 +159,10 @@ impl Page {
                 Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
                 Group { header: "Kindle", rows: &[Row::DeviceAbout, Row::KindleUi], footer: "Opening the Kindle UI takes about a minute." },
             ],
+            Page::DateTime => &[
+                Group { header: "Kindle clock", rows: &[Row::LocalTime, Row::LocalDate, Row::SyncClock], footer: "Sync uses Cloudflare’s time service over Wi-Fi." },
+                Group { header: "Time zone", rows: &[Row::TimeZone], footer: "Launcher follows the Kindle’s time zone." },
+            ],
             Page::About | Page::FileTransfer | Page::AppVisibility => &[],
         }
     }
@@ -170,7 +176,7 @@ const HOME_PAGES: &[&[(&str, &[Page])]] = &[
     ],
     &[
         ("Applications", &[Page::Apps, Page::Store]),
-        ("System", &[Page::Storage, Page::Device, Page::About]),
+        ("System", &[Page::Storage, Page::Device, Page::DateTime, Page::About]),
     ],
 ];
 
@@ -211,6 +217,8 @@ pub enum Button {
     LowPower,
     StoreDailyCheck,
     StoreClearCache,
+    SyncClock,
+    RefreshTimeZone,
     SleepScreen,
     KindleUi,
     /// Settings > Device > Launcher: restart the launcher.
@@ -283,10 +291,14 @@ pub enum Row {
     LargeText,
     HighContrast,
     TextPreview,
+    LocalTime,
+    LocalDate,
+    TimeZone,
+    SyncClock,
 }
 
 impl Row {
-    pub const ALL: [Row; 32] = [
+    pub const ALL: [Row; 36] = [
         Row::Frontlight,
         Row::Warmth,
         Row::DarkMode,
@@ -311,6 +323,7 @@ impl Row {
         Row::LargeText,
         Row::HighContrast,
         Row::TextPreview,
+        Row::LocalTime, Row::LocalDate, Row::TimeZone, Row::SyncClock,
     ];
 
     pub fn label(self) -> &'static str {
@@ -347,6 +360,10 @@ impl Row {
             Row::LargeText => "Larger text",
             Row::HighContrast => "Higher contrast",
             Row::TextPreview => "Preview",
+            Row::LocalTime => "Local time",
+            Row::LocalDate => "Date",
+            Row::TimeZone => "Current time zone",
+            Row::SyncClock => "Internet time",
         }
     }
 }
@@ -504,6 +521,9 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
         Row::LargeText => vec![(Button::LargeText, r)],
         Row::HighContrast => vec![(Button::HighContrast, r)],
         Row::TextPreview => vec![],
+        Row::LocalTime | Row::LocalDate => vec![],
+        Row::SyncClock => vec![(Button::SyncClock, r)],
+        Row::TimeZone => vec![(Button::RefreshTimeZone, r)],
     }
 }
 const BUTTON_H: i32 = 100;

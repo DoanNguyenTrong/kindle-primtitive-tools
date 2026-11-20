@@ -1819,6 +1819,10 @@ impl Renderer {
                 Button::LightUp | Button::WarmUp if level.is_some() => self.round_button(rect, true),
                 Button::RotationAuto if s.display_support.auto_rotation => self.switch(rect, s.auto_rotation),
                 Button::ShowHidden => self.button(rect, "Show all", false),
+                Button::SyncClock if s.clock_sync_available && s.wifi_on && s.wifi_state == "connected" && !ui.clock_syncing => {
+                    self.button(Rect::new(r.right() - 240, r.y + 28, 200, 64), "Sync", false);
+                }
+                Button::RefreshTimeZone => self.button(Rect::new(r.right() - 240, r.y + 28, 200, 64), "Refresh", false),
                 Button::OpenPage(_) | Button::ManageInstalled | Button::GridColumns | Button::GridRows => self.chevron(r),
                 Button::LowPower => self.switch(switch_rect(r), s.low_power),
                 Button::KindleUi => self.chevron(r),
@@ -2079,6 +2083,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
         Page::Connection => format!("SSH {} · Public DNS {}", onoff(s.ssh), onoff(s.public_dns)),
         Page::FileTransfer => "Send documents from another device".into(),
         Page::Device => format!("Start with the Kindle {}", onoff(s.autostart)),
+        Page::DateTime => "Clock and time zone".into(),
         Page::About => format!("{SYSTEM_NAME} · Launcher {}", ui.version),
     }
 }
@@ -2117,6 +2122,13 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
         Row::SshPassword => if s.ssh_password_set { "Set".into() } else { "Not set".into() },
         Row::SshAddress => if s.ssh && !s.ssh_address.is_empty() { s.ssh_address.clone() } else { "Off".into() },
         Row::SshCheck => "Tap to check".into(),
+        Row::LocalTime => if s.clock.is_empty() || s.clock == "--:--" { "Unavailable".into() } else { s.clock.clone() },
+        Row::LocalDate => s.clock_year.map_or_else(|| "Unavailable".into(), |year| format!("{} {year}", s.date)),
+        Row::TimeZone => s.utc_offset.map_or_else(|| "Unavailable".into(), kl_core::tz::format_offset),
+        Row::SyncClock if ui.clock_syncing => "Syncing over Wi-Fi…".into(),
+        Row::SyncClock if !s.clock_sync_available => "Unavailable on this firmware".into(),
+        Row::SyncClock if !s.wifi_on || s.wifi_state != "connected" => "Connect to Wi-Fi first".into(),
+        Row::SyncClock => "Ready to sync".into(),
         Row::PublicDns => if s.public_dns { "On: Cloudflare and Google".into() } else { "Off".into() },
         Row::Autostart => if s.autostart { "On".into() } else { "Off".into() },
         Row::SleepScreen => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },

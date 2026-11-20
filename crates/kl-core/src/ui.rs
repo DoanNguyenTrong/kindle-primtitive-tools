@@ -91,6 +91,8 @@ pub enum DeviceCmd {
     ToggleAnimation,
     ToggleLargeText,
     ToggleHighContrast,
+    SyncClock,
+    RefreshTimeZone,
     /// Quick settings' sliders: a level from 0 to 24.
     SetLight(u32),
     SetWarmth(u32),
@@ -172,6 +174,9 @@ impl Default for DisplaySupport {
 pub struct Status {
     pub clock: String,
     pub date: String,
+    pub clock_year: Option<i32>,
+    pub utc_offset: Option<i32>,
+    pub clock_sync_available: bool,
     pub battery: Option<u32>,
     pub charging: bool,
     pub power: battery::Reading,
@@ -246,6 +251,7 @@ impl Status {
     /// Wi-Fi and its signal, SSH). The bar is redrawn only then.
     pub fn bar_differs(&self, other: &Status) -> bool {
         self.clock != other.clock
+            || self.date != other.date
             || self.battery != other.battery
             || self.charging != other.charging
             || self.wifi_on != other.wifi_on
@@ -299,6 +305,7 @@ pub struct Ui {
     pub display_support: DisplaySupport,
     pub page: usize,
     pub settings_index: usize,
+    pub clock_syncing: bool,
     settings_parent: Option<Page>,
     pub visibility_index: usize,
     pub managed_count: Option<usize>,
@@ -397,6 +404,7 @@ impl Ui {
             display_support: DisplaySupport::default(),
             page: 0,
             settings_index: 0,
+            clock_syncing: false,
             settings_parent: None,
             visibility_index: 0,
             managed_count: None,
@@ -1920,6 +1928,8 @@ impl Ui {
                     self.store_clear_confirm = true;
                     Action::Redraw { full: false }
                 }
+                Some(Button::SyncClock) if !self.clock_syncing => Action::Device(DeviceCmd::SyncClock),
+                Some(Button::RefreshTimeZone) => Action::Device(DeviceCmd::RefreshTimeZone),
                 Some(Button::SleepScreen) => Action::Device(DeviceCmd::ToggleSleepScreen),
                 Some(Button::RotationAuto) if self.display_support.auto_rotation => Action::Device(DeviceCmd::ToggleAutoRotation),
                 Some(Button::DarkMode) => Action::Device(DeviceCmd::ToggleDarkMode),
@@ -1970,6 +1980,27 @@ fn is_builtin(app: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_and_time_actions_are_reachable_and_sync_cannot_overlap_or_run_in_usb_mode() {
+        use crate::layout::Row;
+        let mut u = ui(22);
+        u.open_settings();
+        u.handle(centre(u.layout.settings_nav()[1]));
+        let page = u.layout.settings_home_rows(u.settings_index).into_iter()
+            .find(|(page, _)| *page == Page::DateTime).unwrap().1;
+        u.handle(centre(page));
+        assert_eq!(u.screen, Screen::Page(Page::DateTime));
+        let row = |row| u.layout.page_sections(Page::DateTime).into_iter()
+            .flat_map(|section| section.rows).find(|item| item.row == row).unwrap().rect;
+        let (sync, refresh) = (row(Row::SyncClock), row(Row::TimeZone));
+        assert_eq!(u.handle(centre(sync)), Action::Device(DeviceCmd::SyncClock));
+        u.clock_syncing = true;
+        assert_eq!(u.handle(centre(sync)), Action::None);
+        assert_eq!(u.handle(centre(refresh)), Action::Device(DeviceCmd::RefreshTimeZone));
+        u.usb = Usb::Drive;
+        assert_eq!(u.handle(centre(refresh)), Action::None);
+    }
 
     #[test]
     fn settings_app_management_and_battery_shortcuts_follow_navigation() {
