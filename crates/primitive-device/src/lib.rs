@@ -713,11 +713,25 @@ pub fn power_event(line: &str) -> Option<Input> {
 pub fn power_loop(mut report: impl FnMut(Input)) {
     let mut failures = 0;
     loop {
-        let child = Command::new("lipc-wait-event")
+        let mut command = Command::new("lipc-wait-event");
+        command
             .args(["-m", POWERD, "goingToScreenSaver,outOfScreenSaver,exitingScreenSaver"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        // The listener ends with the program that started it: without this, every launcher or app that exits
+        // leaves one behind (seen on the Kindle: ten left over after a day of testing).
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: prctl is async-signal-safe and only sets this child's parent-death signal.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+        }
+        let child = command.spawn();
         match child {
             Ok(mut child) => {
                 if let Some(out) = child.stdout.take() {
