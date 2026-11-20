@@ -35,4 +35,10 @@ pub enum Ev {
     StoreProgress { message: String, percent: Option<u8> },
     /// The launcher finished installing the standalone store.
     StoreBootstrapped(Result<(), String>),
+    /// Settings finished its leased package change and can refresh the app list.
+    ManagedAppsChanged {
+        lease: kl_core::storage_lease::StorageLease,
+        storage_held: bool,
+        message: Option<String>,
+    },
 }
