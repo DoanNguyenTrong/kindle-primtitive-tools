@@ -1050,7 +1050,7 @@ impl Renderer {
         self.text(Text { text: title, x: 40.0, y: 50.0, w: (l.width - 80) as f32, size: 84.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         let refresh = if ui.store_busy { "Refreshing" } else { "Refresh" };
         self.store_capsule(l.store_refresh(), refresh, false, BLACK);
-        self.store_capsule(l.store_done(), "Done", true, BLACK);
+        self.store_capsule(l.store_done(), "Exit", true, BLACK);
         let settings = l.store_settings_button();
         self.rounded_frame(settings, 50.0, 3, BLACK, WHITE);
         self.draw_icon(primitive_quick::icons::SETTINGS, (settings.x + 25) as f64, (settings.y + 25) as f64, 50.0, BLACK);
@@ -1596,7 +1596,7 @@ impl Renderer {
         let heading = ui.ext_title();
         let name_w = (l.done_button().x - 80) as f32;
         self.text(Text { text: &heading, x: 40.0, y: 38.0, w: name_w, size: 48.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), if ui.ext_depth() == 0 { "Done" } else { "Back" }, true);
+        self.button(l.done_button(), if ui.ext_depth() == 0 { "Exit" } else { "Back" }, true);
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         let per = l.list_rows_per_page();
         let items: Vec<_> = ui.ext_items().iter().skip(ui.ext_page * per).take(per).cloned().collect();
@@ -1792,7 +1792,7 @@ impl Renderer {
     fn settings_home(&mut self, ui: &Ui, s: &Status) {
         let l = ui.layout;
         self.text(Text { text: "Settings", x: 40.0, y: 36.0, w: 700.0, size: 64.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), "Done", true);
+        self.button(l.done_button(), "Exit", true);
         let viewport = l.settings_viewport();
         self.ctx.set_transform(Affine::IDENTITY);
         self.ctx.push_clip_rect(&krect(viewport));
