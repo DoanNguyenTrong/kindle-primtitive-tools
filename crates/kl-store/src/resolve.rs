@@ -1,5 +1,5 @@
-//! Choosing what to install for a device: the newest version that has the device's architecture, runs on its firmware,
-//! is not withdrawn, and whose requirements are installed.
+//! Choosing what to install for a device: the newest version that has the device's architecture and is not withdrawn,
+//! and whose requirements are installed. The firmware range is information for the owner, not a gate.
 
 use crate::catalog::{Listing, Source, VersionEntry};
 use crate::version::Version;
@@ -20,8 +20,6 @@ pub enum ResolveError {
     NotInstallable,
     /// No version has this device's architecture.
     NoArch(String),
-    /// Versions exist for the architecture, but none runs on this firmware; the lowest minimum is given.
-    NoFirmware { need: String },
     /// Every version with this architecture is withdrawn.
     AllWithdrawn,
 }
@@ -31,10 +29,6 @@ impl fmt::Display for ResolveError {
         match self {
             ResolveError::NotInstallable => write!(f, "this app is listed by link and is not installed by the store"),
             ResolveError::NoArch(arch) => write!(f, "no version is built for this Kindle ({arch})"),
-            ResolveError::NoFirmware { need } if need.is_empty() => {
-                write!(f, "no version supports this Kindle firmware")
-            }
-            ResolveError::NoFirmware { need } => write!(f, "needs Kindle firmware {need} or later"),
             ResolveError::AllWithdrawn => write!(f, "every version for this Kindle has been withdrawn"),
         }
     }
@@ -57,25 +51,11 @@ pub fn pick_version<'a>(listing: &'a Listing, device: &Device) -> Result<&'a Ver
     if with_arch.is_empty() {
         return Err(ResolveError::NoArch(device.arch.clone()));
     }
-    let live: Vec<&(Version, &VersionEntry)> = with_arch.iter().copied().filter(|(_, v)| v.withdrawn.is_none()).collect();
-    if live.is_empty() {
-        return Err(ResolveError::AllWithdrawn);
-    }
-    let mut lowest_need: Option<String> = None;
-    for (_, v) in &live {
-        let min = Version::parse(&v.firmware.min);
-        let fits_min = min.as_ref().is_some_and(|m| device.firmware >= *m);
-        let fits_max = v.firmware.max.as_deref().is_none_or(|max| {
-            Version::parse(max).is_some_and(|max| device.firmware <= max)
-        });
-        if fits_min && fits_max {
-            return Ok(v);
-        }
-        if fits_max && min.is_some() && !fits_min && lowest_need.as_ref().is_none_or(|n| min.as_ref() < Version::parse(n).as_ref()) {
-            lowest_need = Some(v.firmware.min.clone());
-        }
-    }
-    Err(ResolveError::NoFirmware { need: lowest_need.unwrap_or_default() })
+    with_arch
+        .into_iter()
+        .map(|(_, v)| *v)
+        .find(|v| v.withdrawn.is_none())
+        .ok_or(ResolveError::AllWithdrawn)
 }
 
 /// The requirements that are not met, as `(app id, needed range, installed version or none)`.
@@ -129,19 +109,14 @@ mod tests {
     }
 
     #[test]
-    fn respects_the_firmware_range_on_both_ends() {
+    fn ignores_the_firmware_range() {
+        // The firmware range is information, not a gate: every device on the architecture gets the newest version.
         let mut l = sample_listing();
         l.versions[0].firmware = Firmware { min: "5.19.0".into(), max: None };
         l.versions[1].firmware = Firmware { min: "5.16.3".into(), max: Some("5.18.9".into()) };
-        // 5.18.2 is below the newest version's minimum, so the older one that fits its range is chosen.
-        assert_eq!(pick_version(&l, &dev("armhf", "5.18.2")).unwrap().version, "0.2.17");
-        // 5.20.0 is above the newest version's minimum and below no maximum: the newest version.
+        assert_eq!(pick_version(&l, &dev("armhf", "5.15.0")).unwrap().version, "0.2.18");
+        assert_eq!(pick_version(&l, &dev("armhf", "5.18.2")).unwrap().version, "0.2.18");
         assert_eq!(pick_version(&l, &dev("armhf", "5.20.0")).unwrap().version, "0.2.18");
-        // Below every minimum: the lowest minimum is reported.
-        assert_eq!(pick_version(&l, &dev("armhf", "5.15.0")), Err(ResolveError::NoFirmware { need: "5.16.3".into() }));
-        // Above the older version's maximum and below the newest's minimum: nothing fits.
-        assert_eq!(pick_version(&l, &dev("armhf", "5.19.0")).unwrap().version, "0.2.18");
-        assert_eq!(pick_version(&l, &dev("armhf", "5.16.3")).unwrap().version, "0.2.17");
     }
 
     #[test]
