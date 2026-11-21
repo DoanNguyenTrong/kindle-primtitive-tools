@@ -31,9 +31,9 @@
 //! (`[ "${PRIMITIVE_LAUNCHER:-0}" = 1 ] && trap '' USR1`), as the app template's `deploy/Hello.sh` does.
 //!
 //! What an app on this kit must not do: put the Kindle to sleep, draw a lock screen or its own quick settings, load or
-//! unload the stock screensaver, or offer its own light or dark switch. Under the launcher keep
-//! `App::preferred_dark_mode` at `None` and leave `dark_mode` out of the app's own `settings.txt`: both still override
-//! the system theme in this kit.
+//! unload the stock screensaver, or offer its own light or dark switch. Under the launcher the kit ignores
+//! `App::preferred_dark_mode` and `dark_mode` in the app's own `settings.txt`: the system theme always wins. On its own
+//! (opened from the Kindle library) an app's preference still counts.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -253,7 +253,15 @@ fn persist(app: &mut impl App, on_save_error: impl FnOnce(io::Error)) {
 pub fn frame(app: &impl App, canvas: &mut Canvas, dark: bool) -> Vec<u8> {
     canvas.begin();
     app.draw(canvas);
-    canvas.finish(app.preferred_dark_mode().unwrap_or(dark))
+    canvas.finish(effective_dark(app.preferred_dark_mode(), dark, UNDER_LAUNCHER.load(Ordering::Relaxed)))
+}
+
+/// Under Primitive Launcher the theme is the system's (`docs/system-architecture.md` §4.2 in the umbrella repo): an
+/// app's own preference counts only when it runs on its own.
+static UNDER_LAUNCHER: AtomicBool = AtomicBool::new(false);
+
+fn effective_dark(preferred: Option<bool>, system: bool, under_launcher: bool) -> bool {
+    if under_launcher { system } else { preferred.unwrap_or(system) }
 }
 
 pub fn font_paths(directory: &Path) -> Vec<String> {
@@ -295,9 +303,15 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn display_settings(launcher: &str, app: &str) -> Settings {
+    display_settings_for(launcher, app, UNDER_LAUNCHER.load(Ordering::Relaxed))
+}
+
+fn display_settings_for(launcher: &str, app: &str, system_theme: bool) -> Settings {
     let mut settings = Settings::parse(launcher);
     for (key, value) in app.lines().filter_map(|line| line.split_once('=')) {
         match (key.trim(), value.trim()) {
+            // Under the launcher the app's own dark_mode does not override the system theme.
+            ("dark_mode", _) if system_theme => {}
             ("rotation", "upright") => settings.rotation = Rotation::Upright,
             ("rotation", "upside-down") => settings.rotation = Rotation::UpsideDown,
             ("auto_rotation", "on") => settings.auto_rotation = true,
@@ -378,6 +392,7 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             writeln!(file, "{message}")
         });
     };
+    UNDER_LAUNCHER.store(std::env::var("PRIMITIVE_LAUNCHER").as_deref() == Ok("1"), Ordering::Relaxed);
     let mut settings = display_settings(
         &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
         &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
@@ -475,6 +490,10 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                 &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
             );
             settings.dark_mode = fresh.dark_mode;
+            // A turn in launcher Settings over the app: without auto-rotation the setting is the rotation.
+            if !settings.auto_rotation {
+                inherited_rotation = fresh.rotation;
+            }
             if lifecycle.is_awake() {
                 redraw_now = true;
             } else {
@@ -830,6 +849,17 @@ mod tests {
         );
         assert!(!lifecycle.is_awake());
         assert_eq!(demo.saves, 2);
+    }
+
+    #[test]
+    fn under_the_launcher_the_system_theme_wins() {
+        let launcher = "dark_mode=on";
+        assert!(display_settings_for(launcher, "dark_mode=off", true).dark_mode, "the app's own setting is ignored");
+        assert!(!display_settings_for(launcher, "dark_mode=off", false).dark_mode, "on its own it still counts");
+        assert!(display_settings_for("dark_mode=off", "rotation=upside-down", true).rotation == Rotation::UpsideDown);
+        assert!(effective_dark(Some(false), true, true), "a preference does not override the system theme");
+        assert!(!effective_dark(Some(false), true, false));
+        assert!(effective_dark(None, true, false));
     }
 
     #[test]
