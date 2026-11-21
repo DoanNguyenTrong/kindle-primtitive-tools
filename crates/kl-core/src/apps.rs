@@ -239,7 +239,7 @@ fn builtins() -> Vec<App> {
         App {
             id: "settings".into(),
             name: "Settings".into(),
-            icon: IconSource::None,
+            icon: bundled!("settings"),
             launch: Launch::Settings,
             dir: "/".into(),
             order: Some(9_000),
