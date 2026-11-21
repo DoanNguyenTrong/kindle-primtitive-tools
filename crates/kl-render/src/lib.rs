@@ -529,6 +529,7 @@ impl Renderer {
         if let Some((picture, opacity)) = wallpaper {
             shade_home_wallpaper(&mut out, &l, picture, status.dark_mode, opacity);
         }
+        let store_clip = (ui.screen == Screen::Store).then(|| ui.store_list_viewport());
         // Pictures (icons, the sleep picture) keep their look in dark mode.
         let mut pictures = Vec::new();
         for (rect, id) in icon_blits {
@@ -543,10 +544,10 @@ impl Renderer {
                         out[destination..destination + count].copy_from_slice(&tile.pixels[source..source + count]);
                     }
                     pictures.push(((rect.x, top, rect.w, bottom - top), 0.0));
-                } else {
+                } else if ui.screen != Screen::StoreApp || rect.y >= 170 {
                     let radius = rect.w as f32 * image::ICON_RADIUS;
                     let clip_radius = if wallpaper.is_some() { radius } else { 0.0 };
-                    blit(&mut out, width, rect, tile, clip_radius);
+                    blit(&mut out, width, rect, tile, clip_radius, store_clip);
                     pictures.push(((rect.x, rect.y, rect.w, rect.h), radius));
                 }
             }
@@ -555,7 +556,7 @@ impl Renderer {
             if let Some(picture) = &self.sleep_image {
                 let s = l.screen();
                 let r = Rect::new((s.w - picture.width as i32) / 2, (s.h - picture.height as i32) / 2, picture.width as i32, picture.height as i32);
-                blit(&mut out, width, r, picture, 0.0);
+                blit(&mut out, width, r, picture, 0.0, None);
                 pictures.push(((r.x, r.y, r.w, r.h), 0.0));
             }
         }
@@ -595,7 +596,8 @@ impl Renderer {
         }
         if status.dark_mode && ui.screen != Screen::Sleep {
             let over = popup.map(|b| (b.x - halo, b.y - halo, b.w + 2 * halo, b.h + 2 * halo));
-            image::invert_except(&mut out, width, &pictures, over);
+            let clip = store_clip.map(|r| (r.x, r.y, r.w, r.h));
+            image::invert_except_clipped(&mut out, width, &pictures, over, clip);
         }
         // The pressed look: only the touched icon darkens.
         if let (Screen::Home, Some(r)) = (ui.screen, ui.pressed) {
@@ -1004,15 +1006,15 @@ impl Renderer {
         self.text(Text { text: label, x: r.x as f32, y: r.y as f32 + (r.h as f32 - size * 1.25) / 2.0, w: r.w as f32, size, bold: true, align: Align::Center, lines: 1, gray: fg });
     }
 
-    /// The Extensions list: one row per item, "›" on submenus, Back (or Done at the top), and pages.
-    /// A store tab: its large title, its content, and the floating tab bar.
+    /// Store tabs keep their controls in place while the content below them scrolls.
     fn store_list(&mut self, ui: &Ui) {
+        use kl_core::store::StoreTab;
         let l = ui.layout;
         let (title, active) = match ui.store_tab {
-            kl_core::store::StoreTab::Today => ("Today", 0),
-            kl_core::store::StoreTab::Apps => ("Apps", 1),
-            kl_core::store::StoreTab::Updates => ("Updates", 2),
-            kl_core::store::StoreTab::Search => ("Search", 3),
+            StoreTab::Today => ("Today", 0),
+            StoreTab::Apps => ("Apps", 1),
+            StoreTab::Updates => ("Updates", 2),
+            StoreTab::Search => ("Search", 3),
         };
         self.text(Text { text: title, x: 40.0, y: 50.0, w: (l.width - 80) as f32, size: 84.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         let refresh = if ui.store_busy { "Refreshing" } else { "Refresh" };
@@ -1022,7 +1024,6 @@ impl Renderer {
         self.rounded_frame(settings, 50.0, 3, BLACK, WHITE);
         self.draw_icon(primitive_quick::icons::SETTINGS, (settings.x + 25) as f64, (settings.y + 25) as f64, 50.0, BLACK);
         if ui.store_has_toolbar() {
-            use kl_core::store::StoreTab;
             let toolbar = l.store_toolbar_button();
             let (heading, action) = match ui.store_tab {
                 StoreTab::Updates => {
@@ -1038,24 +1039,36 @@ impl Renderer {
             self.text(Text { text: &heading, x: 40.0, y: (toolbar.y + 26) as f32, w: (toolbar.x - 60) as f32, size: 42.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
             self.store_capsule(toolbar, action, ui.store_tab == StoreTab::Updates, BLACK);
         }
-        match ui.store_tab {
-            kl_core::store::StoreTab::Today => self.store_today(ui),
-            kl_core::store::StoreTab::Apps => {
-                let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "There are no apps in this group." };
-                self.store_rows(ui, &ui.store_list_indices(), empty);
-            }
-            kl_core::store::StoreTab::Updates => self.store_rows(ui, &ui.store_list_indices(), "Nothing from the store yet. Apps you get here, and their updates, are listed here."),
-            kl_core::store::StoreTab::Search => self.store_search(ui),
+        if ui.store_tab == StoreTab::Search {
+            self.store_search_field(ui);
         }
-        if !ui.store_search_keyboard {
+        let viewport = ui.store_list_viewport();
+        if viewport.h > 0 {
+            self.ctx.set_transform(Affine::IDENTITY);
+            self.ctx.push_clip_rect(&krect(viewport));
+            if ui.store_tab == StoreTab::Today {
+                self.store_today(ui, viewport);
+            } else {
+                self.store_rows(ui, viewport);
+            }
+            self.ctx.pop_clip();
+            self.store_list_scrollbar(viewport, ui.store_list_scroll, ui.store_list_scroll_max());
+        }
+        if ui.store_search_keyboard {
+            self.store_search_keyboard(ui);
+        } else {
             self.store_tab_bar(&l, active);
-            self.store_notice(ui, l.store_tabs().y - 120);
+        }
+        if let Some(notice) = ui.store_list_notice() {
+            self.text(Text {
+                text: notice, x: 40.0, y: (viewport.bottom() + 6) as f32,
+                w: (l.width - 80) as f32, size: 26.0, bold: true, align: Align::Start, lines: 2, gray: BLACK,
+            });
         }
     }
 
-    fn store_search(&mut self, ui: &Ui) {
-        let l = ui.layout;
-        let field = l.store_search_field();
+    fn store_search_field(&mut self, ui: &Ui) {
+        let field = ui.layout.store_search_field();
         let query = ui.store_query.string();
         let inner = field.inset(26);
         let (shown, ink) = if query.is_empty() { ("Search apps", 85) } else { (query.as_str(), BLACK) };
@@ -1066,15 +1079,14 @@ impl Renderer {
             let x = (inner.x + self.text_width(&before, 36.0, false) as i32).min(inner.right());
             self.fill(Rect::new(x, inner.y + 2, 3, inner.h - 4), BLACK);
         }
-        let empty = if ui.store.is_empty() { "Refresh the store to find apps." } else { "No apps match your search." };
-        self.store_rows(ui, &ui.store_list_indices(), empty);
-        if ui.store_search_keyboard {
-            let area = l.keyboard_area();
-            self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
-            for (key, r) in l.keyboard_keys_with(ui.store_query.layer, "Search") {
-                self.key(&key, r, ui.pressed_key == Some(r));
-            }
-            self.store_notice(ui, 160);
+    }
+
+    fn store_search_keyboard(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let area = l.keyboard_area();
+        self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
+        for (key, r) in l.keyboard_keys_with(ui.store_query.layer, "Search") {
+            self.key(&key, r, ui.pressed_key == Some(r));
         }
     }
 
@@ -1086,15 +1098,42 @@ impl Renderer {
         }
     }
 
-    /// Today: the first app as a large black card, then the next apps.
-    fn store_today(&mut self, ui: &Ui) {
-        let l = ui.layout;
+    /// Today: a featured app, then collections or the next apps.
+    fn store_today(&mut self, ui: &Ui, viewport: Rect) {
         let Some(index) = ui.store_featured() else {
-            self.store_empty("No apps yet. The store lists the apps once its catalog has been downloaded.");
+            self.store_empty(viewport, "No apps yet. The store lists the apps once its catalog has been downloaded.");
             return;
         };
-        let e = &ui.store[index];
-        let f = l.store_feature();
+        let feature = ui.store_today_feature();
+        if feature.bottom() > viewport.y && feature.y < viewport.bottom() {
+            self.store_feature_card(&ui.store[index], feature);
+        }
+        let see = ui.store_today_see_all();
+        let collections = ui.store_today_collections();
+        if see.bottom() + 20 > viewport.y && see.y < viewport.bottom() {
+            let heading = if collections.is_empty() { "Apps" } else { "Collections" };
+            self.text(Text { text: heading, x: 40.0, y: see.y as f32, w: 400.0, size: 52.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.text(Text { text: "See all apps", x: see.x as f32, y: (see.y + 12) as f32, w: see.w as f32, size: 34.0, bold: true, align: Align::End, lines: 1, gray: BLACK });
+        }
+        if collections.is_empty() {
+            for (row, idx) in ui.store_visible_entries().into_iter().filter(|&(_, idx)| idx != index) {
+                self.store_row(&ui.store[idx], row);
+            }
+        } else {
+            for (i, collection) in collections.iter().enumerate() {
+                let card = ui.store_today_collection_card(i);
+                if card.bottom() <= viewport.y || card.y >= viewport.bottom() {
+                    continue;
+                }
+                self.card(card);
+                let r = card.inset(30);
+                self.text(Text { text: &collection.title, x: r.x as f32, y: r.y as f32, w: r.w as f32, size: 36.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+                self.text(Text { text: &collection.description, x: r.x as f32, y: (r.y + 66) as f32, w: r.w as f32, size: 28.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+            }
+        }
+    }
+
+    fn store_feature_card(&mut self, e: &kl_core::store::StoreEntry, f: Rect) {
         self.rounded(f, 48.0, BLACK);
         self.text(Text { text: "Featured", x: (f.x + 56) as f32, y: (f.y + 56) as f32, w: 600.0, size: 26.0, bold: true, align: Align::Start, lines: 1, gray: WHITE });
         self.text(Text { text: &e.name, x: (f.x + 56) as f32, y: (f.y + 100) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 68.0, bold: true, align: Align::Start, lines: 2, gray: WHITE });
@@ -1106,58 +1145,41 @@ impl Renderer {
         // White on the black card: a white pill with a black label.
         self.rounded(pill, pill.h as f64 / 2.0, WHITE);
         self.text(Text { text: e.action_label(), x: pill.x as f32, y: pill.y as f32 + (pill.h as f32 - 30.0 * 1.25) / 2.0, w: pill.w as f32, size: 30.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
+    }
 
-        let see = l.store_see_all();
-        self.text(Text { text: "See all apps", x: see.x as f32, y: (see.y + 12) as f32, w: see.w as f32, size: 34.0, bold: true, align: Align::End, lines: 1, gray: BLACK });
-        let collections = ui.store_today_collection_page();
-        let heading = if collections.is_empty() { "Apps" } else { "Collections" };
-        self.text(Text { text: heading, x: 40.0, y: (f.bottom() + 40) as f32, w: 400.0, size: 52.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        if collections.is_empty() {
-            for (i, &idx) in ui.store_today_rows().iter().enumerate() {
-                self.store_row(&ui.store[idx], l.store_today_row(i));
-            }
+    fn store_rows(&mut self, ui: &Ui, viewport: Rect) {
+        use kl_core::store::StoreTab;
+        let entries = ui.store_visible_entries();
+        if entries.is_empty() {
+            let empty = match ui.store_tab {
+                StoreTab::Updates => "Nothing from the store yet. Apps you get here, and their updates, are listed here.",
+                _ if ui.store.is_empty() => "Refresh the store to find apps.",
+                StoreTab::Search => "No apps match your search.",
+                _ => "There are no apps in this group.",
+            };
+            self.store_empty(viewport, empty);
         } else {
-            for (i, collection) in collections.iter().enumerate() {
-                let card = l.store_collection_card(i);
-                self.card(card);
-                let r = card.inset(30);
-                self.text(Text { text: &collection.title, x: r.x as f32, y: r.y as f32, w: r.w as f32, size: 36.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-                self.text(Text { text: &collection.description, x: r.x as f32, y: (r.y + 66) as f32, w: r.w as f32, size: 28.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+            for (row, index) in entries {
+                self.store_row(&ui.store[index], row);
             }
-            self.store_pager(ui);
         }
     }
 
-    /// A paged list of entries (the Apps or Updates tab), with its page label, or a message when it is empty.
-    fn store_rows(&mut self, ui: &Ui, indices: &[usize], empty: &str) {
-        if indices.is_empty() {
-            self.store_empty(empty);
+    fn store_list_scrollbar(&mut self, viewport: Rect, scroll: i32, max: i32) {
+        if max <= 0 || viewport.h <= 0 {
             return;
         }
-        let per = ui.store_rows_per_page();
-        for (i, &idx) in indices.iter().skip(ui.store_page * per).take(per).enumerate() {
-            self.store_row(&ui.store[idx], ui.store_list_row(i));
-        }
-        self.store_pager(ui);
-    }
-
-    fn store_pager(&mut self, ui: &Ui) {
-        let pages = ui.store_pages();
-        if pages > 1 {
-            let label = format!("{} of {}", ui.store_page + 1, pages);
-            let p = ui.store_page_label();
-            self.text(Text { text: &label, x: p.x as f32, y: (p.y + 14) as f32, w: p.w as f32, size: 28.0, bold: true, align: Align::Center, lines: 1, gray: 85 });
-            for (visible, label, align) in [(ui.store_page > 0, "‹  Previous", Align::Start), (ui.store_page + 1 < pages, "Next  ›", Align::End)] {
-                if visible {
-                    self.text(Text { text: label, x: 40.0, y: (p.y + 14) as f32, w: (p.w - 80) as f32, size: 28.0, bold: true, align, lines: 1, gray: BLACK });
-                }
-            }
-        }
+        let height = viewport.h as i64;
+        let thumb = (height * height / (height + i64::from(max))).max(height.min(40));
+        let travel = height - thumb;
+        let top = i64::from(scroll.clamp(0, max)) * travel / i64::from(max);
+        let bar = Rect::new(viewport.right() - 18, viewport.y + top as i32, 6, thumb as i32);
+        self.rounded(bar, 3.0, 85);
     }
 
     /// A message in the middle of a tab, when there is nothing to list.
-    fn store_empty(&mut self, text: &str) {
-        self.text(Text { text, x: 80.0, y: 620.0, w: 1104.0, size: 36.0, bold: false, align: Align::Center, lines: 3, gray: 85 });
+    fn store_empty(&mut self, viewport: Rect, text: &str) {
+        self.text(Text { text, x: (viewport.x + 80) as f32, y: (viewport.y + (viewport.h - 120).max(0) / 3) as f32, w: (viewport.w - 160).max(0) as f32, size: 36.0, bold: false, align: Align::Center, lines: 3, gray: 85 });
     }
 
     /// One app's row: its icon, name and summary, and its action on the right.
@@ -1189,13 +1211,11 @@ impl Renderer {
     }
 
     /// An app's icon tile: its picture when the store has it at this size, else a black or white tile with the
-    /// app's first letter. A picture scrolled under the header is not drawn (the header covers it).
+    /// app's first letter. The frame blit keeps scrolling pictures inside the viewport.
     fn store_tile(&mut self, tile: Rect, e: &kl_core::store::StoreEntry, bg: u8, ink: u8) {
         let key = store_icon_key(&e.id, tile.w as u32);
         if self.icons.contains_key(&key) {
-            if tile.y >= 170 {
-                self.store_blits.push((tile, key));
-            }
+            self.store_blits.push((tile, key));
             return;
         }
         self.rounded(tile, Self::icon_radius(tile), bg);
@@ -1486,12 +1506,17 @@ impl Renderer {
         });
         self.text(Text { text: &caption, x: 40.0, y: dev.y as f32, w, size: 26.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
 
-        // The information strip: version, size, firmware, split by hairlines.
+        // The information strip, split by hairlines.
         let cells = l.store_info_cells(scroll);
         let version = e.latest.clone().unwrap_or_else(|| "—".to_string());
         let size = e.size.map(kl_core::store::format_size).unwrap_or_else(|| "—".to_string());
         let firmware = if e.firmware_min.is_empty() { "—".to_string() } else { format!("{}+", e.firmware_min) };
-        let strip = [("VERSION", version), ("SIZE", size), ("FIRMWARE", firmware)];
+        let strip = [
+            ("VERSION", version),
+            ("SIZE", size),
+            ("FIRMWARE", firmware),
+            ("DOWNLOADS", download_count_label(e.downloads)),
+        ];
         self.hairline(cells[0].y, 40, l.width - 40);
         self.hairline(cells[0].bottom() - 1, 40, l.width - 40);
         for (i, (cell, (label, value))) in cells.iter().zip(strip.iter()).enumerate() {
@@ -1499,7 +1524,10 @@ impl Renderer {
                 self.fill(Rect::new(cell.x, cell.y + 28, 2, cell.h - 56), 200);
             }
             self.text(Text { text: label, x: cell.x as f32, y: (cell.y + 26) as f32, w: cell.w as f32, size: 24.0, bold: true, align: Align::Center, lines: 1, gray: 60 });
-            self.text(Text { text: value, x: cell.x as f32, y: (cell.y + 68) as f32, w: cell.w as f32, size: 36.0, bold: true, align: Align::Center, lines: 1, gray: BLACK });
+            let value_width = (cell.w - 16) as f32;
+            let text_width = self.text_width(value, 36.0, true).max(1.0);
+            let size = 36.0 * (value_width / text_width).min(1.0);
+            self.text(Text { text: value, x: (cell.x + 8) as f32, y: (cell.y + 68) as f32, w: value_width, size, bold: true, align: Align::Center, lines: 1, gray: BLACK });
         }
 
         // Screenshots, when the store has them for this app (from the cache, or the desktop preview).
@@ -1840,7 +1868,7 @@ impl Renderer {
             image::invert_except(&mut out, width, &[], None);
         }
         if let Some(picture) = picture {
-            blit(&mut out, width, area.picture.inset(4), picture, 0.0);
+            blit(&mut out, width, area.picture.inset(4), picture, 0.0, None);
         }
         out
     }
@@ -2175,7 +2203,7 @@ impl Renderer {
             let inner = tile(4).inset(18);
             let mut fitted = image::fit(logo, inner.w as u32, inner.h as u32);
             image::dither16(&mut fitted);
-            blit(&mut out, w as usize, inner, &fitted, 0.0);
+            blit(&mut out, w as usize, inner, &fitted, 0.0, None);
         }
         out
     }
@@ -2313,23 +2341,43 @@ fn shade_home_wallpaper(out: &mut [u8], layout: &Layout, picture: &GrayImage, da
     }
 }
 
-/// Copy a tile into the screen buffer at `r`, clipping to the tile, screen, and any rounded corners.
-fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, radius: f32) {
-    let height = out.len() / width;
-    for ty in 0..(tile.height as usize).min(r.h.max(0) as usize) {
-        let y = r.y as usize + ty;
-        if y >= height {
-            break;
+fn download_count_label(downloads: Option<u64>) -> String {
+    let Some(count) = downloads else { return "Unavailable".into() };
+    let digits = count.to_string();
+    let mut label = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            label.push(',');
         }
-        let n = (tile.width as usize).min(r.w.max(0) as usize).min(width.saturating_sub(r.x as usize));
-        let src = &tile.pixels[ty * tile.width as usize..ty * tile.width as usize + n];
-        let dst = &mut out[y * width + r.x as usize..y * width + r.x as usize + n];
+        label.push(digit);
+    }
+    label
+}
+
+/// Copy a tile into the screen buffer at `r`, clipped to the tile, the screen and `clip`, and to rounded corners of
+/// `radius` (0 for square corners).
+fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, radius: f32, clip: Option<Rect>) {
+    let height = (out.len() / width) as i32;
+    let clip = clip.unwrap_or(Rect::new(0, 0, width as i32, height));
+    let left = r.x.max(clip.x).max(0);
+    let right = r.right().min(r.x + tile.width as i32).min(clip.right()).min(width as i32);
+    if left >= right {
+        return;
+    }
+    let top = r.y.max(clip.y).max(0);
+    let bottom = r.bottom().min(r.y + tile.height as i32).min(clip.bottom()).min(height);
+    let n = (right - left) as usize;
+    for y in top..bottom {
+        let source = (y - r.y) as usize * tile.width as usize + (left - r.x) as usize;
+        let destination = y as usize * width + left as usize;
+        let src = &tile.pixels[source..source + n];
+        let dst = &mut out[destination..destination + n];
         if radius == 0.0 {
             dst.copy_from_slice(src);
             continue;
         }
-        for (x, (ink, &sample)) in dst.iter_mut().zip(src).enumerate() {
-            if image::rect_distance(x as i32, ty as i32, r.w, r.h, radius) < 0.0 {
+        for (i, (ink, &sample)) in dst.iter_mut().zip(src).enumerate() {
+            if image::rect_distance(left - r.x + i as i32, y - r.y, r.w, r.h, radius) < 0.0 {
                 *ink = sample;
             }
         }
@@ -2482,10 +2530,18 @@ mod tests {
     }
 
     #[test]
+    fn download_counts_show_exact_totals_and_distinguish_zero_from_missing() {
+        assert_eq!(download_count_label(None), "Unavailable");
+        assert_eq!(download_count_label(Some(0)), "0");
+        assert_eq!(download_count_label(Some(1_234_567)), "1,234,567");
+        assert_eq!(download_count_label(Some(u64::MAX)), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
     fn blit_stays_inside() {
         let mut out = vec![255u8; 10 * 4];
         let tile = GrayImage { width: 3, height: 3, pixels: vec![0; 9] };
-        blit(&mut out, 10, Rect::new(8, 2, 3, 3), &tile, 0.0);
+        blit(&mut out, 10, Rect::new(8, 2, 3, 3), &tile, 0.0, None);
         assert_eq!(out.iter().filter(|&&p| p == 0).count(), 4);
     }
 
@@ -2494,7 +2550,7 @@ mod tests {
         let tile = GrayImage::blank(20, 20);
         let mut frame = vec![170; tile.pixels.len()];
         let radius = 20.0 * image::ICON_RADIUS;
-        blit(&mut frame, 20, Rect::new(0, 0, 20, 20), &tile, radius);
+        blit(&mut frame, 20, Rect::new(0, 0, 20, 20), &tile, radius, None);
         assert_eq!((frame[0], frame[10 * 20 + 10]), (170, WHITE));
         image::invert_except(&mut frame, 20, &[((0, 0, 20, 20), radius)], None);
         assert_eq!((frame[0], frame[10 * 20 + 10]), (85, WHITE));
@@ -2529,6 +2585,26 @@ mod tests {
             assert_eq!(&frame[y..y + 3], &[BLACK, 153, WHITE]);
             assert_eq!(&dark[y..y + 3], &[WHITE, BLACK, 102]);
         }
+    }
+
+    #[test]
+    fn scrolling_store_picture_keeps_its_grays_inside_the_viewport_only() {
+        let width = 8;
+        let mut frame = vec![WHITE; width * 8];
+        let tile = GrayImage {
+            width: 4, height: 8,
+            pixels: (0..8).flat_map(|y| [70 + y * 10; 4]).collect(),
+        };
+        let rect = Rect::new(1, -1, 4, 8);
+        let clip = Rect::new(0, 2, width as i32, 3);
+        let sample = |pixels: &[u8]| (1..=5).map(|y| pixels[y * width + 2]).collect::<Vec<_>>();
+        blit(&mut frame, width, rect, &tile, 0.0, Some(clip));
+        assert_eq!(sample(&frame), [WHITE, 100, 110, 120, WHITE]);
+        image::invert_except_clipped(
+            &mut frame, width, &[((rect.x, rect.y, rect.w, rect.h), 1.0)], None,
+            Some((clip.x, clip.y, clip.w, clip.h)),
+        );
+        assert_eq!(sample(&frame), [BLACK, 100, 110, 120, BLACK]);
     }
 
     #[test]

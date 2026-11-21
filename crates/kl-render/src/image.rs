@@ -283,14 +283,22 @@ pub fn copy_rounded(out: &mut [u8], layer: &[u8], width: usize, (x0, y0, w, h): 
 /// their rounded shape (`(area, corner radius)`; the corners outside it turn dark like the page). Where a pop-up
 /// (`over`) covers a picture, the pop-up is inverted like the rest.
 pub fn invert_except(out: &mut [u8], width: usize, pictures: &[(Area, f32)], over: Option<Area>) {
+    invert_except_clipped(out, width, pictures, over, None);
+}
+
+/// Limit visible portions of pictures to a scrolling viewport while inverting the whole frame.
+pub(crate) fn invert_except_clipped(
+    out: &mut [u8], width: usize, pictures: &[(Area, f32)], over: Option<Area>, clip: Option<Area>,
+) {
     for px in out.iter_mut() {
         *px = 255 - *px;
     }
     let height = (out.len() / width) as i32;
+    let (cx, cy, cw, ch) = clip.unwrap_or((0, 0, width as i32, height));
     let inside = |x: i32, y: i32, (ax, ay, aw, ah): Area| x >= ax && y >= ay && x < ax + aw && y < ay + ah;
     for &((x0, y0, w, h), radius) in pictures {
-        for y in y0.max(0)..(y0 + h).min(height) {
-            for x in x0.max(0)..(x0 + w).min(width as i32) {
+        for y in y0.max(cy).max(0)..(y0 + h).min(cy + ch).min(height) {
+            for x in x0.max(cx).max(0)..(x0 + w).min(cx + cw).min(width as i32) {
                 if !over.is_some_and(|o| inside(x, y, o)) && rect_distance(x - x0, y - y0, w, h, radius) < 0.0 {
                     let i = y as usize * width + x as usize;
                     out[i] = 255 - out[i];
