@@ -91,6 +91,8 @@ pub enum DeviceCmd {
     ToggleSleepScreen,
     ToggleLowPower,
     OpenInstalledApps,
+    /// Uninstall the confirmed app at this index of the current installed list.
+    RemoveInstalledApp(usize),
     ToggleDarkMode,
     ToggleAnimation,
     ToggleLargeText,
@@ -328,6 +330,14 @@ impl StoreRequirementReview {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledApp {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub can_remove: bool,
+}
+
 pub struct Ui {
     apps: Vec<App>,
     pub layout: Layout,
@@ -337,10 +347,13 @@ pub struct Ui {
     pub clock_syncing: bool,
     settings_parents: Vec<Page>,
     pub visibility_scroll: i32,
+    installed_apps: Option<Vec<InstalledApp>>,
+    installed_remove_confirm: Option<usize>,
+    pub installed_scroll: i32,
+    pub installed_busy: bool,
     pub wallpapers: WallpaperSettings,
     pub wallpaper_scroll: i32,
     pub wallpaper_preview: Option<WallpaperDraft>,
-    pub managed_count: Option<usize>,
     pub firmware: Option<String>,
     pub device_profile: Option<String>,
     pub screen: Screen,
@@ -439,10 +452,13 @@ impl Ui {
             clock_syncing: false,
             settings_parents: Vec::new(),
             visibility_scroll: 0,
+            installed_apps: None,
+            installed_remove_confirm: None,
+            installed_scroll: 0,
+            installed_busy: false,
             wallpapers: WallpaperSettings::default(),
             wallpaper_scroll: 0,
             wallpaper_preview: None,
-            managed_count: None,
             firmware: None,
             device_profile: None,
             screen: Screen::Home,
@@ -1416,6 +1432,28 @@ impl Ui {
         self.layout.visibility_scroll_max(self.visibility_len())
     }
 
+    pub fn set_installed_apps(&mut self, apps: Option<Vec<InstalledApp>>) {
+        self.installed_apps = apps;
+        self.installed_remove_confirm = None;
+        self.installed_scroll = self.installed_scroll.clamp(0, self.installed_scroll_max());
+    }
+
+    pub fn installed_apps(&self) -> Option<&[InstalledApp]> {
+        self.installed_apps.as_deref()
+    }
+
+    pub fn installed_app(&self, index: usize) -> Option<&InstalledApp> {
+        self.installed_apps()?.get(index)
+    }
+
+    pub fn installed_confirmation(&self) -> Option<&InstalledApp> {
+        self.installed_app(self.installed_remove_confirm?)
+    }
+
+    pub fn installed_scroll_max(&self) -> i32 {
+        self.layout.visibility_scroll_max(self.installed_apps().map_or(0, |apps| apps.len()))
+    }
+
     pub fn wallpaper_scroll_max(&self, target: WallpaperTarget) -> i32 {
         self.layout.visibility_scroll_max(self.wallpapers.choices(target).count())
     }
@@ -1674,6 +1712,9 @@ impl Ui {
             }
             _ if self.screen == Screen::Sleep => return Action::None,
             _ => {}
+        }
+        if self.installed_busy {
+            return Action::None;
         }
         // Hit-test against the frame the user saw if this input also dismisses a notice.
         let store_viewport = if self.screen == Screen::Store { self.store_list_viewport() } else { Rect::default() };
@@ -1972,6 +2013,44 @@ impl Ui {
         }
     }
 
+    fn installed_apps_page(&mut self, input: Input) -> Action {
+        let l = self.layout;
+        if let Some(index) = self.installed_remove_confirm {
+            let [(_, cancel), (_, uninstall)] = l.confirm_buttons();
+            match input {
+                Input::Tap(x, y) if uninstall.inset(-12).contains(x, y) => {
+                    self.installed_remove_confirm = None;
+                    return Action::Device(DeviceCmd::RemoveInstalledApp(index));
+                }
+                Input::Tap(x, y) if !l.confirm_box().contains(x, y) || cancel.inset(-12).contains(x, y) => {}
+                Input::PageBack => {}
+                _ => return Action::None,
+            }
+            self.installed_remove_confirm = None;
+            return Action::Redraw { full: false };
+        }
+
+        match input {
+            Input::PageBack if self.installed_scroll == 0 => self.back_from_setting(),
+            Input::Tap(x, y) if l.done_button().inset(-20).contains(x, y) => self.back_from_setting(),
+            Input::Tap(x, y) => {
+                let Some(index) = l.visibility_at(self.installed_scroll, x, y) else { return Action::None };
+                let row = l.visibility_row(index, self.installed_scroll);
+                if !self.installed_app(index).is_some_and(|app| app.can_remove)
+                    || !l.installed_remove_button(row).contains(x, y)
+                {
+                    return Action::None;
+                }
+                self.installed_remove_confirm = Some(index);
+                Action::Redraw { full: false }
+            }
+            _ => {
+                let max = self.installed_scroll_max();
+                scroll_settings_list(input, l.visibility_viewport(), &mut self.installed_scroll, max)
+            }
+        }
+    }
+
     fn wallpaper_picker(&mut self, input: Input, target: WallpaperTarget) -> Action {
         match input {
             Input::PageBack if self.wallpaper_scroll == 0 => self.go(Screen::Page(Page::Wallpaper)),
@@ -2042,6 +2121,9 @@ impl Ui {
         if page == Page::AppVisibility {
             return self.app_visibility(input);
         }
+        if page == Page::InstalledApps {
+            return self.installed_apps_page(input);
+        }
         if page == Page::Display {
             if let Input::Tap(x, y) = input {
                 match self.layout.display_level_at(x, y) {
@@ -2106,7 +2188,13 @@ impl Ui {
                     self.wallpaper_scroll = 0;
                     self.go(Screen::WallpaperPicker(target))
                 }
-                Some(Button::ManageInstalled) => Action::Device(DeviceCmd::OpenInstalledApps),
+                Some(Button::ManageInstalled) => {
+                    self.settings_parents.push(page);
+                    self.installed_scroll = 0;
+                    self.set_installed_apps(None);
+                    self.go(Screen::Page(Page::InstalledApps));
+                    Action::Device(DeviceCmd::OpenInstalledApps)
+                }
                 Some(Button::LowPower) => Action::Device(DeviceCmd::ToggleLowPower),
                 Some(Button::GridColumns) => Action::SetGrid {
                     columns: if self.layout.cols == 5 { 3 } else { self.layout.cols as u32 + 1 },
@@ -2321,6 +2409,9 @@ mod tests {
         assert_eq!(u.screen, Screen::Page(Page::Apps));
         let manage = setting_row(&u, Page::Apps, Row::ManageInstalled);
         assert_eq!(u.handle(centre(manage)), Action::Device(DeviceCmd::OpenInstalledApps));
+        assert_eq!(u.screen, Screen::Page(Page::InstalledApps));
+        assert_eq!(u.handle(Input::PageBack), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Page(Page::Apps));
         let columns = setting_row(&u, Page::Apps, Row::GridColumns);
         assert_eq!(u.handle(centre(columns)), Action::SetGrid { columns: 4, rows: 3 });
         u.set_grid(4, 3);
@@ -2356,6 +2447,70 @@ mod tests {
         assert_eq!(u.screen, Screen::Page(Page::Display));
         u.handle(Input::PageBack);
         assert_eq!(u.screen, Screen::Page(Page::Battery));
+
+        u.handle(Input::PageBack);
+        u.handle(swipe(-900.0));
+        u.handle(centre(home_row(&u, Page::Storage)));
+        let manage = setting_row(&u, Page::Storage, Row::ManageInstalled);
+        assert_eq!(u.handle(centre(manage)), Action::Device(DeviceCmd::OpenInstalledApps));
+        assert_eq!(u.screen, Screen::Page(Page::InstalledApps));
+        assert_eq!(u.handle(centre(u.layout.done_button())), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Page(Page::Storage));
+    }
+
+    #[test]
+    fn installed_apps_scroll_and_uninstall_only_after_confirmation() {
+        let mut u = ui(0);
+        let layout = u.layout;
+        let app = |index| InstalledApp {
+            id: format!("app-{index}"),
+            name: format!("App {index}"),
+            version: "1.0".into(),
+            can_remove: index != 0,
+        };
+        let button = |index, scroll| centre(layout.installed_remove_button(layout.visibility_row(index, scroll)));
+        let [(_, cancel), (_, confirm)] = layout.confirm_buttons();
+
+        u.screen = Screen::Page(Page::InstalledApps);
+        assert!(u.installed_apps().is_none());
+        u.set_installed_apps(Some((0..30).map(app).collect()));
+        assert_eq!(u.handle(button(0, 0)), Action::None);
+        assert_eq!(u.handle(centre(layout.visibility_row(1, 0))), Action::None);
+        assert!(u.installed_confirmation().is_none());
+        assert_eq!(u.handle(button(1, 0)), Action::Redraw { full: false });
+        assert_eq!(u.installed_confirmation(), u.installed_app(1));
+        assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: false });
+        assert!(u.installed_confirmation().is_none());
+        u.handle(button(1, 0));
+        assert_eq!(u.handle(Input::PageBack), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::Page(Page::InstalledApps));
+        assert!(u.installed_confirmation().is_none());
+
+        assert_eq!(u.handle(Input::Swipe { dx: 0.0, dy: -6000.0, start_y: 600.0 }), Action::Redraw { full: false });
+        let offset = u.installed_scroll;
+        assert_eq!(offset, u.installed_scroll_max());
+        assert!(offset > 0);
+        assert_eq!(u.handle(button(0, offset)), Action::None);
+        assert_eq!(u.handle(button(29, offset)), Action::Redraw { full: false });
+        assert_eq!(u.handle(centre(confirm)), Action::Device(DeviceCmd::RemoveInstalledApp(29)));
+        assert!(u.installed_confirmation().is_none());
+
+        u.installed_busy = true;
+        u.notice = Some("Uninstalling".into());
+        assert_eq!(u.handle(button(29, offset)), Action::None);
+        assert_eq!(u.handle(centre(layout.done_button())), Action::None);
+        assert_eq!(u.handle(Input::PageBack), Action::None);
+        assert_eq!(u.notice.as_deref(), Some("Uninstalling"));
+        assert_eq!(u.handle(Input::Sleep), Action::Redraw { full: true });
+        assert_eq!(u.screen, Screen::Sleep);
+        assert_eq!(u.handle(Input::Wake), Action::Redraw { full: true });
+        assert_eq!(u.screen, Screen::Page(Page::InstalledApps));
+        u.installed_busy = false;
+        u.handle(button(29, offset));
+        u.set_installed_apps(Some(vec![app(0)]));
+        assert_eq!(u.installed_scroll, 0);
+        assert!(u.installed_confirmation().is_none());
+        assert_eq!(u.handle(centre(confirm)), Action::None);
     }
 
     #[test]

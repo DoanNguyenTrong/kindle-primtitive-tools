@@ -1,5 +1,5 @@
 use super::{
-    krect, switch_rect, Align, Layout, Rect, Renderer, Status, Text, Ui, BLACK, MARGIN_X, WHITE,
+    krect, switch_rect, Align, Layout, Rect, Renderer, Status, Text, Ui, BLACK, MARGIN_X, POPUP_RADIUS, WHITE,
 };
 use kl_core::{
     battery::{Sample, Source, HISTORY_SECS},
@@ -91,6 +91,68 @@ impl Renderer {
         }
         self.ctx.pop_clip();
         self.settings_scrollbar(viewport, scroll, ui.visibility_scroll_max());
+    }
+
+    pub(super) fn settings_installed_apps(&mut self, ui: &Ui) {
+        let layout = ui.layout;
+        let scroll = ui.installed_scroll;
+        let first_row = layout.visibility_row(0, scroll);
+        let apps = match ui.installed_apps() {
+            Some(apps) if !apps.is_empty() => apps,
+            apps => {
+                let text = if apps.is_some() { "No installed apps." } else { "Installed apps are unavailable." };
+                self.text(Text { text, x: (first_row.x + 24) as f32, y: (first_row.y + 25) as f32, w: (first_row.w - 48) as f32, size: 34.0, bold: false, align: Align::Start, lines: 2, gray: BLACK });
+                return;
+            }
+        };
+
+        let viewport = layout.visibility_viewport();
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.push_clip_rect(&krect(viewport));
+        let last_row = layout.visibility_row(apps.len() - 1, scroll);
+        self.card(Rect { h: last_row.bottom() - first_row.y, ..first_row });
+        let first_visible = ((viewport.y - first_row.y) / first_row.h).max(0) as usize;
+        for (index, app) in apps.iter().enumerate().skip(first_visible) {
+            let row = layout.visibility_row(index, scroll);
+            if row.y >= viewport.bottom() {
+                break;
+            }
+            let button = layout.installed_remove_button(row);
+            let x = (row.x + 32) as f32;
+            let w = (button.x - row.x - 56) as f32;
+            self.text(Text { text: &app.name, x, y: (row.y + 22) as f32, w, size: 36.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+            self.text(Text { text: &app.version, x, y: (row.y + 69) as f32, w, size: 26.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+            if !app.can_remove {
+                self.text(Text { text: "Protected", x: button.x as f32, y: (row.y + 42) as f32, w: button.w as f32, size: 28.0, bold: false, align: Align::Center, lines: 1, gray: 85 });
+            } else if !ui.installed_busy {
+                self.button(button, "Uninstall", false);
+            }
+            if index + 1 < apps.len() {
+                self.hairline(row.bottom() - 1, row.x + 32, row.right() - 32);
+            }
+        }
+        self.ctx.pop_clip();
+        self.settings_scrollbar(viewport, scroll, ui.installed_scroll_max());
+    }
+
+    pub(super) fn settings_uninstall_sheet(&mut self, ui: &Ui) {
+        let name = ui.installed_confirmation().map(|app| app.name.as_str());
+        if !ui.installed_busy && name.is_none() {
+            return;
+        }
+        let sheet = ui.layout.confirm_box();
+        let inner = sheet.inset(48);
+        self.rounded_frame(sheet, POPUP_RADIUS as f64, 6, BLACK, WHITE);
+        let title = if ui.installed_busy { "Uninstalling app…" } else { "Uninstall this app?" };
+        self.text(Text { text: title, x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        if !ui.installed_busy {
+            if let Some(name) = name {
+                self.text(Text { text: name, x: inner.x as f32, y: (inner.y + 100) as f32, w: inner.w as f32, size: 36.0, bold: false, align: Align::Start, lines: 3, gray: BLACK });
+            }
+            let [(_, cancel), (_, uninstall)] = ui.layout.confirm_buttons();
+            self.button(cancel, "Cancel", false);
+            self.button(uninstall, "Uninstall", true);
+        }
     }
 
     pub(super) fn settings_wallpaper_picker(&mut self, ui: &Ui, target: WallpaperTarget) {

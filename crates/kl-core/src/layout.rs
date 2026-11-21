@@ -60,6 +60,7 @@ pub enum Page {
     Battery,
     Sleep,
     Apps,
+    InstalledApps,
     AppVisibility,
     Store,
     Storage,
@@ -76,10 +77,10 @@ pub struct Group {
 }
 
 impl Page {
-    pub const ALL: [Page; 15] = [
+    pub const ALL: [Page; 16] = [
         Page::Battery, Page::Display, Page::Wallpaper, Page::Accessibility, Page::Sleep, Page::Wifi,
-        Page::Connection, Page::FileTransfer, Page::Apps, Page::AppVisibility, Page::Store,
-        Page::Storage, Page::Device, Page::DateTime, Page::About,
+        Page::Connection, Page::FileTransfer, Page::Apps, Page::InstalledApps, Page::AppVisibility,
+        Page::Store, Page::Storage, Page::Device, Page::DateTime, Page::About,
     ];
 
     pub fn title(self) -> &'static str {
@@ -93,6 +94,7 @@ impl Page {
             Page::Battery => "Battery",
             Page::Sleep => "Sleep",
             Page::Apps => "Apps",
+            Page::InstalledApps => "Installed apps",
             Page::AppVisibility => "App visibility",
             Page::Store => "Store",
             Page::Storage => "Storage",
@@ -158,7 +160,7 @@ impl Page {
                 footer: "Use Launcher pictures, or return to the Kindle screensaver after opening the Kindle UI or restarting.",
             }],
             Page::Apps => &[
-                Group { header: "Installed apps", rows: &[Row::ManageInstalled], footer: "Store opens the installed list for updates and removal." },
+                Group { header: "Management", rows: &[Row::ManageInstalled], footer: "" },
                 Group { header: "Home screen", rows: &[Row::AppVisibility, Row::Hidden, Row::GridColumns, Row::GridRows], footer: "Long-press an app on the home screen to move it or change its icon." },
             ],
             Page::Store => &[Group {
@@ -179,7 +181,7 @@ impl Page {
                 Group { header: "Kindle clock", rows: &[Row::LocalTime, Row::LocalDate, Row::SyncClock], footer: "Sync uses Cloudflare’s time service over Wi-Fi." },
                 Group { header: "Time zone", rows: &[Row::TimeZone], footer: "Launcher follows the Kindle’s time zone." },
             ],
-            Page::About | Page::FileTransfer | Page::AppVisibility => &[],
+            Page::About | Page::FileTransfer | Page::InstalledApps | Page::AppVisibility => &[],
         }
     }
 }
@@ -364,7 +366,7 @@ impl Row {
             Row::Autostart => "Start with the Kindle",
             Row::Hidden => "Hidden apps",
             Row::AppVisibility => "App visibility",
-            Row::ManageInstalled => "Manage installed apps",
+            Row::ManageInstalled => "Installed apps",
             Row::GridColumns => "Grid columns",
             Row::GridRows => "Grid rows",
             Row::BatteryReading => "Battery level",
@@ -755,6 +757,12 @@ impl Layout {
             return None;
         }
         Some(((y - first.y as f32) / first.h as f32) as usize)
+    }
+
+    pub fn installed_remove_button(&self, row: Rect) -> Rect {
+        let width = 226;
+        let height = 68;
+        Rect::new(row.right() - 24 - width, row.y + (row.h - height) / 2, width, height)
     }
 
     /// A device-proportioned picture above the preview's opacity and Apply controls.
@@ -1354,7 +1362,7 @@ mod tests {
         let d = l.done_button();
         assert_eq!(l.settings_button_at(Page::Display, (d.x + 1) as f32, (d.y + 1) as f32), Some(Button::Done));
         let top = l.settings_home_rows(0);
-        assert_eq!(top.len() + 2, Page::ALL.len()); // App visibility and Wallpaper are nested.
+        assert_eq!(top.len() + 3, Page::ALL.len()); // App visibility, Installed apps and Wallpaper are nested.
         let viewport = l.settings_viewport();
         assert!(top.last().unwrap().1.bottom() > viewport.bottom());
         let scroll = l.settings_scroll_max();

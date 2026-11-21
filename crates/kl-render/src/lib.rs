@@ -1916,7 +1916,9 @@ impl Renderer {
         let l = ui.layout;
         let title = l.title();
         self.text(Text { text: page.title(), x: 40.0, y: 36.0, w: 900.0, size: 56.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), "Back", true);
+        if page != kl_core::layout::Page::InstalledApps || !ui.installed_busy {
+            self.button(l.done_button(), "Back", true);
+        }
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         if page == kl_core::layout::Page::About {
             self.about_card(ui, s);
@@ -1928,6 +1930,9 @@ impl Renderer {
         }
         if page == kl_core::layout::Page::AppVisibility {
             self.settings_visibility(ui);
+        }
+        if page == kl_core::layout::Page::InstalledApps {
+            self.settings_installed_apps(ui);
         }
         for section in l.page_sections(page) {
             self.section_header(section.card.x, section.header_y, section.header);
@@ -1953,6 +1958,9 @@ impl Renderer {
         if let Some(notice) = ui.notice.clone() {
             let width = (l.width - 2 * MARGIN_X) as f32;
             self.text(Text { text: &notice, x: MARGIN_X as f32, y: (l.height - 84) as f32, w: width, size: 28.0, bold: true, align: Align::Start, lines: 2, gray: BLACK });
+        }
+        if page == kl_core::layout::Page::InstalledApps {
+            self.settings_uninstall_sheet(ui);
         }
     }
 
@@ -2268,6 +2276,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
         Page::Accessibility => format!("Larger text {} · Higher contrast {}", onoff(s.large_text), onoff(s.high_contrast)),
         Page::Sleep => if s.sleep_launcher { "The launcher's own".into() } else { "The Kindle's".into() },
         Page::Apps => format!("{} hidden", ui.hidden_count()),
+        Page::InstalledApps => "Review and uninstall apps".into(),
         Page::AppVisibility => format!("{} hidden", ui.hidden_count()),
         Page::Battery => settings_management::battery_status(s),
         Page::Storage => settings_management::storage_status(ui, s),
@@ -2332,7 +2341,7 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
             n => format!("{n} hidden"),
         },
         Row::AppVisibility => format!("{} hidden", ui.hidden_count()),
-        Row::ManageInstalled => ui.managed_count.map_or_else(|| "Open in Store".into(), |count| format!("{count} in Store")),
+        Row::ManageInstalled => page_value(kl_core::layout::Page::InstalledApps, ui, s),
         Row::GridColumns => ui.layout.cols.to_string(),
         Row::GridRows => ui.layout.rows.to_string(),
         Row::BatteryReading => settings_management::battery_status(s),

@@ -37,4 +37,10 @@ pub enum Ev {
     StoreBootstrapped(Result<(), String>),
     /// The app the supervisor ran for the launcher has ended (or never started): the launcher takes the screen back.
     AppEnded,
+    /// Settings finished its leased package change and can refresh the app list.
+    ManagedAppsChanged {
+        lease: kl_core::storage_lease::StorageLease,
+        storage_held: bool,
+        message: Option<String>,
+    },
 }
