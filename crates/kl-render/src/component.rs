@@ -292,6 +292,13 @@ impl Canvas {
         });
     }
 
+    /// One key of any keyboard (a key set the app defines), in the keyboard's shared look. Registered for the tap
+    /// feedback like the keyboard's own keys.
+    pub fn key(&mut self, key: &primitive_keyboard::KeyDef, rect: Rect) {
+        let active = self.control_pressed(rect, false);
+        self.renderer.key(key, rect, active);
+    }
+
     pub fn keyboard(
         &mut self,
         layer: primitive_keyboard::Layer,
