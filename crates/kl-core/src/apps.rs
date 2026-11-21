@@ -102,8 +102,9 @@ pub enum IconSource {
     /// An image file (PNG): the light form. The dark form is the file beside it with `-dark` before `.png`
     /// (`icon.png` and `icon-dark.png`), when present.
     File(String),
-    /// Base64 PNG data from a `data:` URI: one form, used in both themes.
-    Data(String),
+    /// Base64 PNG data from a `data:` URI: the light form, and the dark form from `# IconDark:` when there is one
+    /// (the light form is drawn in both themes otherwise).
+    Data { light: String, dark: Option<String> },
     /// PNGs built into the launcher (the first-party apps' icons): the light form and the dark form.
     Bundled { light: &'static [u8], dark: Option<&'static [u8]> },
 }
@@ -113,7 +114,7 @@ impl IconSource {
     pub fn light_png(&self) -> Result<Option<Vec<u8>>, String> {
         Ok(Some(match self {
             Self::None => return Ok(None),
-            Self::Data(b64) => crate::base64::decode(b64).ok_or("icon: bad base64")?,
+            Self::Data { light, .. } => crate::base64::decode(light).ok_or("icon: bad base64")?,
             Self::File(path) => fs::read(path).map_err(|e| format!("icon {path}: {e}"))?,
             Self::Bundled { light, .. } => light.to_vec(),
         }))
@@ -125,7 +126,8 @@ impl IconSource {
         match self {
             Self::Bundled { dark, .. } => dark.map(<[u8]>::to_vec),
             Self::File(path) => fs::read(dark_form_path(path)?).ok(),
-            Self::None | Self::Data(_) => None,
+            Self::Data { dark, .. } => crate::base64::decode(dark.as_deref()?),
+            Self::None => None,
         }
     }
 
@@ -190,10 +192,21 @@ impl App {
     }
 }
 
+/// The base64 data of a `data:` URI (`None` for anything else).
+fn data_uri(value: &str) -> Option<String> {
+    value.starts_with("data:").then(|| value.split_once(";base64,").map(|(_, data)| data.to_string())).flatten()
+}
+
 fn icon_from(value: Option<&str>) -> IconSource {
-    match value {
-        Some(v) if v.starts_with("data:") => match v.split_once(";base64,") {
-            Some((_, data)) => IconSource::Data(data.to_string()),
+    icon_forms(value, None)
+}
+
+/// An icon from its light value (`# Icon:`) and its dark value (`# IconDark:`, a `data:` URI). A dark value that is
+/// not a `data:` URI is ignored: the light form is used in both themes.
+fn icon_forms(light: Option<&str>, dark: Option<&str>) -> IconSource {
+    match light {
+        Some(v) if v.starts_with("data:") => match data_uri(v) {
+            Some(light) => IconSource::Data { light, dark: dark.and_then(data_uri) },
             None => IconSource::None,
         },
         Some(v) if v.starts_with('/') => IconSource::File(v.to_string()),
@@ -274,7 +287,7 @@ pub fn scriptlets(documents: &Path) -> Vec<App> {
         let icon = if header.icon.is_none() && header.author.as_deref() == Some("Primitive AI") {
             native_icon(&file)
         } else {
-            icon_from(header.icon.as_deref())
+            icon_forms(header.icon.as_deref(), header.icon_dark.as_deref())
         };
         apps.push(App {
             id: file,
@@ -437,7 +450,7 @@ mod tests {
         let apps = scriptlets(&dir);
         let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Primitive Browser", "Hooks", "Plain"]);
-        assert_eq!(apps[0].icon, IconSource::Data("QUJD".into()));
+        assert_eq!(apps[0].icon, IconSource::Data { light: "QUJD".into(), dark: None });
         assert_eq!(apps[0].id, "Browser.sh");
         assert!(matches!(&apps[1].launch, Launch::Script { hooks: true, .. }));
         fs::remove_dir_all(&dir).unwrap();
@@ -483,9 +496,21 @@ mod tests {
         assert_eq!(kindle.dark_png(), None);
         assert_eq!(kindle.png_for(true).unwrap().as_deref(), Some(KINDLE_UI_ICON));
         // A `# Icon:` data URI has one form (KOReader, the browser).
-        let data = IconSource::Data("QUJD".into());
+        let data = IconSource::Data { light: "QUJD".into(), dark: None };
         assert_eq!(data.dark_png(), None);
         assert_eq!(data.png_for(true).unwrap().as_deref(), Some(&b"ABC"[..]));
+    }
+
+    #[test]
+    fn a_data_icon_takes_its_dark_form_from_icon_dark() {
+        let both = icon_forms(Some("data:image/png;base64,QUJD"), Some("data:image/png;base64,REVG"));
+        assert_eq!(both, IconSource::Data { light: "QUJD".into(), dark: Some("REVG".into()) });
+        assert_eq!(both.png_for(false).unwrap().as_deref(), Some(&b"ABC"[..]));
+        assert_eq!(both.png_for(true).unwrap().as_deref(), Some(&b"DEF"[..]));
+        let light_only = icon_forms(Some("data:image/png;base64,QUJD"), None);
+        assert_eq!(light_only.png_for(true).unwrap().as_deref(), Some(&b"ABC"[..]), "no dark form: light in both");
+        let not_a_uri = icon_forms(Some("data:image/png;base64,QUJD"), Some("/mnt/us/dark.png"));
+        assert_eq!(not_a_uri.dark_png(), None, "a dark value that is not a data URI is ignored");
     }
 
     #[test]

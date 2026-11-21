@@ -6,6 +6,7 @@
 //! # Name: Primitive Browser
 //! # Author: Primitive AI
 //! # Icon: data:image/png;base64,iVBOR...
+//! # IconDark: data:image/png;base64,iVBOR...
 //! # UseHooks
 //! # DontUseFBInk
 //! ```
@@ -17,6 +18,8 @@ pub struct Header {
     pub author: Option<String>,
     /// The `# Icon:` value as written: an absolute path or a `data:` URI.
     pub icon: Option<String>,
+    /// The `# IconDark:` value as written: the dark form of the icon (a `data:` URI), shown in dark mode.
+    pub icon_dark: Option<String>,
     /// `# UseHooks`: the script defines `on_run` (and `on_install`, `on_remove`) instead of running whole.
     pub use_hooks: bool,
     /// This launcher's own library entry carries this marker, so it is not listed as an app.
@@ -43,6 +46,7 @@ pub fn parse(text: &str) -> Header {
                 "name" if !value.is_empty() => header.name = Some(value.to_string()),
                 "author" if !value.is_empty() => header.author = Some(value.to_string()),
                 "icon" if !value.is_empty() => header.icon = Some(value.to_string()),
+                "icondark" if !value.is_empty() => header.icon_dark = Some(value.to_string()),
                 _ => {}
             }
         } else if comment.eq_ignore_ascii_case("UseHooks") {
@@ -57,6 +61,14 @@ pub fn parse(text: &str) -> Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_dark_icon_header() {
+        let h = parse("#!/bin/sh\n# Icon: data:image/png;base64,AAAA\n# IconDark: data:image/png;base64,BBBB\n");
+        assert_eq!(h.icon.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(h.icon_dark.as_deref(), Some("data:image/png;base64,BBBB"));
+        assert_eq!(parse("# Icon: /a/b.png\n").icon_dark, None);
+    }
 
     #[test]
     fn reads_the_header_fields() {
