@@ -731,10 +731,16 @@ pub fn power_loop(mut report: impl FnMut(Input)) {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: prctl is async-signal-safe and only sets this child's parent-death signal.
+            // The listener is in the app's process group, and under Primitive Launcher SIGUSR1 to that group asks
+            // an app that declares `# Wake: redraw` to redraw. Ignored here (it stays ignored through exec), the
+            // signal does not end the listener, which would leave the app without power events for five seconds
+            // each time, and for good after five.
+            // SAFETY: prctl and signal are async-signal-safe; they only set this child's parent-death signal and
+            // its SIGUSR1 disposition.
             unsafe {
                 command.pre_exec(|| {
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    libc::signal(libc::SIGUSR1, libc::SIG_IGN);
                     Ok(())
                 });
             }
