@@ -1,9 +1,44 @@
 //! A native app's event loop, screen output, and local persistence.
+//!
+//! An app implements `App` and hands it to `run`. The kit reads the display settings, draws each frame, sends taps,
+//! swipes and page buttons to the app, saves its data at sleep and exit, and handles USB drive mode.
+//!
+//! # Under Primitive Launcher (the system layer)
+//!
+//! Primitive Launcher stays in charge of the Kindle while an app is open. It owns the power button, sleep and wake,
+//! the lock screen, quick settings, the power menu and the theme (`docs/system-architecture.md` and
+//! `docs/contracts.md` §1.1 in the umbrella repo). It starts the app with `PRIMITIVE_LAUNCHER=1`; `run` reads that
+//! once into `under_launcher`. When it is set, the kit does the app's part of the contract, and the app needs no code
+//! of its own for it:
+//!
+//! - **SIGUSR1 asks for a redraw.** The kit sets a handler that only marks the request; a thread wakes the event loop.
+//!   Without the launcher the kit leaves SIGUSR1 alone, and the signal ends the app.
+//! - **The redraw order.** Each time the loop wakes, it takes a waiting request first, before the event that woke it:
+//!   it reads `dark_mode` again from the launcher's `settings.txt`, and draws the whole screen once. An event that
+//!   waited while the app was frozen under quick settings is handled in the same pass, so nothing is drawn in the old
+//!   theme first. A request that comes while the app sleeps waits for the wake.
+//! - **Wake.** The launcher puts the app's saved screen back after the sleep picture, so the kit draws nothing on
+//!   wake. Only when a redraw was asked for while the app slept does it draw the whole screen, with a full update.
+//! - **No flash on the redraw.** The redraw for a request uses `Display::show_calm` (`primitive_app::display`): the
+//!   whole screen with GC16 in partial mode, which changes the pixels without a flash. The launcher has just flashed
+//!   the screen for the theme switch, and a second flash would show the inverse of the new theme (the old one) for a
+//!   moment.
+//! - **The system swipe.** A swipe down from the top edge (it starts in the top 160 px, moves more than 150 px down,
+//!   and is mostly vertical) opens the launcher's quick settings. The kit drops it, so the app never gets it in
+//!   `App::input` or `App::swipe`. Other swipes from the top edge (up, or sideways) still reach the app.
+//!
+//! The app's library entry declares `# Wake: redraw` in its first ten lines and ignores SIGUSR1 in its own shell
+//! (`[ "${PRIMITIVE_LAUNCHER:-0}" = 1 ] && trap '' USR1`), as the app template's `deploy/Hello.sh` does.
+//!
+//! What an app on this kit must not do: put the Kindle to sleep, draw a lock screen or its own quick settings, load or
+//! unload the stock screensaver, or offer its own light or dark switch. Under the launcher the kit ignores
+//! `App::preferred_dark_mode` and `dark_mode` in the app's own `settings.txt`: the system theme always wins. On its own
+//! (opened from the Kindle library) an app's preference still counts.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,7 +82,8 @@ pub trait App {
         None
     }
 
-    /// Override the inherited interface colors. Pictures retain their original shades.
+    /// Override the inherited interface colors. Pictures retain their original shades. Under Primitive Launcher the
+    /// app follows the system theme: keep this `None` there (see the module docs).
     fn preferred_dark_mode(&self) -> Option<bool> {
         None
     }
@@ -217,7 +253,15 @@ fn persist(app: &mut impl App, on_save_error: impl FnOnce(io::Error)) {
 pub fn frame(app: &impl App, canvas: &mut Canvas, dark: bool) -> Vec<u8> {
     canvas.begin();
     app.draw(canvas);
-    canvas.finish(app.preferred_dark_mode().unwrap_or(dark))
+    canvas.finish(effective_dark(app.preferred_dark_mode(), dark, UNDER_LAUNCHER.load(Ordering::Relaxed)))
+}
+
+/// Under Primitive Launcher the theme is the system's (`docs/system-architecture.md` §4.2 in the umbrella repo): an
+/// app's own preference counts only when it runs on its own.
+static UNDER_LAUNCHER: AtomicBool = AtomicBool::new(false);
+
+fn effective_dark(preferred: Option<bool>, system: bool, under_launcher: bool) -> bool {
+    if under_launcher { system } else { preferred.unwrap_or(system) }
 }
 
 pub fn font_paths(directory: &Path) -> Vec<String> {
@@ -259,9 +303,15 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn display_settings(launcher: &str, app: &str) -> Settings {
+    display_settings_for(launcher, app, UNDER_LAUNCHER.load(Ordering::Relaxed))
+}
+
+fn display_settings_for(launcher: &str, app: &str, system_theme: bool) -> Settings {
     let mut settings = Settings::parse(launcher);
     for (key, value) in app.lines().filter_map(|line| line.split_once('=')) {
         match (key.trim(), value.trim()) {
+            // Under the launcher the app's own dark_mode does not override the system theme.
+            ("dark_mode", _) if system_theme => {}
             ("rotation", "upright") => settings.rotation = Rotation::Upright,
             ("rotation", "upside-down") => settings.rotation = Rotation::UpsideDown,
             ("auto_rotation", "on") => settings.auto_rotation = true,
@@ -274,11 +324,46 @@ fn display_settings(launcher: &str, app: &str) -> Settings {
     settings
 }
 
+/// Set by SIGUSR1 (the system layer's redraw signal, `docs/system-architecture.md` §4.1 in the umbrella repo).
+static REDRAW: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_redraw(_: libc::c_int) {
+    REDRAW.store(true, Ordering::Relaxed);
+}
+
+/// The swipe that opens quick settings under the launcher: down from the top edge, the launcher's own rule
+/// (`opens_quick_settings` in kl-launcher; the status bar is 120 px, plus 40 px of slack).
+fn is_system_swipe(input: Input) -> bool {
+    matches!(input, Input::Swipe { dx, dy, start_y } if dy > 150.0 && dy.abs() > dx.abs() * 1.5 && start_y <= 160.0)
+}
+
+/// Under Primitive Launcher the app answers the redraw signal: SIGUSR1 marks `REDRAW`, and this thread wakes the
+/// loop with `Event::Redraw`. Without the launcher the signal is left alone.
+fn follow_redraw_signal(events: mpsc::Sender<Event>) {
+    // SAFETY: the handler only stores to an atomic, which is safe in a signal handler.
+    unsafe { libc::signal(libc::SIGUSR1, on_redraw as *const () as libc::sighandler_t) };
+    // This thread only wakes the loop; the loop takes the request itself, before the event that woke it, so nothing
+    // queued behind the freeze is drawn in the old theme first.
+    thread::spawn(move || {
+        let mut woken = false;
+        loop {
+            thread::sleep(Duration::from_millis(150));
+            let pending = REDRAW.load(Ordering::Relaxed);
+            if pending && !woken && events.send(Event::Redraw).is_err() {
+                break;
+            }
+            woken = pending;
+        }
+    });
+}
+
 enum Event {
     Input(Input, Option<f32>),
     Turn(Rotation),
     StorageChanged,
     UsbRedraw,
+    /// Under Primitive Launcher: SIGUSR1, the launcher asks for the whole screen again in the current theme.
+    Redraw,
 }
 
 fn publish_rotation(run: &Path, rotation: Rotation) {
@@ -307,6 +392,7 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             writeln!(file, "{message}")
         });
     };
+    UNDER_LAUNCHER.store(std::env::var("PRIMITIVE_LAUNCHER").as_deref() == Ok("1"), Ordering::Relaxed);
     let mut settings = display_settings(
         &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
         &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
@@ -380,6 +466,12 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         let events = tx.clone();
         thread::spawn(move || watch_usb(events));
     }
+    // Under Primitive Launcher the launcher owns sleep, the lock screen and the theme; it asks for a redraw.
+    let under_launcher = std::env::var("PRIMITIVE_LAUNCHER").as_deref() == Ok("1");
+    if under_launcher {
+        follow_redraw_signal(tx.clone());
+    }
+    let mut redraw_on_wake = false;
     drop(tx);
 
     let mut lifecycle = Lifecycle::default();
@@ -389,6 +481,25 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             Some(deadline) => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
+        // The launcher's redraw request (SIGUSR1, sent while the app was frozen) comes first: read the theme again
+        // before handling what woke the loop, and draw the whole screen once.
+        let mut redraw_now = false;
+        if under_launcher && REDRAW.swap(false, Ordering::Relaxed) {
+            let fresh = display_settings(
+                &fs::read_to_string(launcher.join("settings.txt")).unwrap_or_default(),
+                &fs::read_to_string(app_dir.join("settings.txt")).unwrap_or_default(),
+            );
+            settings.dark_mode = fresh.dark_mode;
+            // A turn in launcher Settings over the app: without auto-rotation the setting is the rotation.
+            if !settings.auto_rotation {
+                inherited_rotation = fresh.rotation;
+            }
+            if lifecycle.is_awake() {
+                redraw_now = true;
+            } else {
+                redraw_on_wake = true;
+            }
+        }
         let usb_drive = managed_storage && !user_storage_is_mounted();
         let usb_changed = lifecycle.set_usb_drive(usb_drive);
         let usb_redraw = matches!(event, Ok(Event::UsbRedraw));
@@ -396,6 +507,8 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
         let mut change = match event {
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if !usb_drive => app.tick(Instant::now()),
+            // The swipe down from the top edge is the system's (quick settings) under the launcher, not the app's.
+            Ok(Event::Input(input, _)) if under_launcher && is_system_swipe(input) => Change::None,
             Ok(Event::Input(input, start_x)) => {
                 if !usb_changed {
                     if let Some(image) =
@@ -405,14 +518,26 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
                         pressed = true;
                     }
                 }
-                lifecycle.dispatch_input(&mut app, input, start_x, on_save_error)
+                let change = lifecycle.dispatch_input(&mut app, input, start_x, on_save_error);
+                // Under the launcher the screen is put back after the sleep picture: the app redraws on wake only
+                // when a redraw was asked for while it slept.
+                if under_launcher && input == Input::Wake && change == Change::Full {
+                    if std::mem::take(&mut redraw_on_wake) { Change::Full } else { Change::None }
+                } else {
+                    change
+                }
             }
+            // Only a wake-up: the request was taken above.
+            Ok(Event::Redraw) => Change::None,
             Ok(Event::Turn(rotation)) => {
                 inherited_rotation = rotation;
                 Change::None
             }
             _ => Change::None,
         };
+        if redraw_now && change != Change::Exit {
+            change = Change::Full;
+        }
         if usb_changed && !usb_drive {
             match app.storage_returned() {
                 Ok(()) if storage::pending_save() => persist(&mut app, on_save_error),
@@ -459,7 +584,13 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             Change::Exit => break,
             Change::None | Change::Partial | Change::Full => {
                 let image = frame(&app, &mut canvas, settings.dark_mode);
-                display.show(image, &settings, change == Change::Full);
+                if redraw_now && change == Change::Full {
+                    // The launcher flashed the screen when the theme changed; a second flash would show the old
+                    // theme for a moment (the inverse of the new one).
+                    display.show_calm(image, &settings);
+                } else {
+                    display.show(image, &settings, change == Change::Full);
+                }
             }
         }
     }
@@ -494,6 +625,14 @@ fn watch_usb(events: mpsc::Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_swipe_is_down_from_the_top_edge_only() {
+        assert!(is_system_swipe(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 30.0 }));
+        assert!(!is_system_swipe(Input::Swipe { dx: 0.0, dy: 400.0, start_y: 700.0 }), "a move in the app");
+        assert!(!is_system_swipe(Input::Swipe { dx: 0.0, dy: -400.0, start_y: 30.0 }), "up is the app's");
+        assert!(!is_system_swipe(Input::Swipe { dx: 400.0, dy: 20.0, start_y: 30.0 }), "sideways is the app's");
+    }
 
     #[derive(Default)]
     struct Demo {
@@ -710,6 +849,17 @@ mod tests {
         );
         assert!(!lifecycle.is_awake());
         assert_eq!(demo.saves, 2);
+    }
+
+    #[test]
+    fn under_the_launcher_the_system_theme_wins() {
+        let launcher = "dark_mode=on";
+        assert!(display_settings_for(launcher, "dark_mode=off", true).dark_mode, "the app's own setting is ignored");
+        assert!(!display_settings_for(launcher, "dark_mode=off", false).dark_mode, "on its own it still counts");
+        assert!(display_settings_for("dark_mode=off", "rotation=upside-down", true).rotation == Rotation::UpsideDown);
+        assert!(effective_dark(Some(false), true, true), "a preference does not override the system theme");
+        assert!(!effective_dark(Some(false), true, false));
+        assert!(effective_dark(None, true, false));
     }
 
     #[test]
