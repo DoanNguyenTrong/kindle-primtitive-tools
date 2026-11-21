@@ -2812,7 +2812,7 @@ mod tests {
             std::fs::write(dir.join(format!("{name}.sh")), "# Author: Primitive AI\n").unwrap();
         }
         let (apps, _) = kl_core::discover(&dir, &kl_core::Config::default());
-        assert_eq!(apps.iter().filter(|app| matches!(app.icon, IconSource::Bundled { .. })).count(), 15);
+        assert_eq!(apps.iter().filter(|app| matches!(app.icon, IconSource::Bundled { .. })).count(), 16);
         for app in apps.iter().filter(|app| matches!(app.icon, IconSource::Bundled { .. })) {
             let ring = |png: Vec<u8>| {
                 let img = image::decode_png(&png).unwrap();
