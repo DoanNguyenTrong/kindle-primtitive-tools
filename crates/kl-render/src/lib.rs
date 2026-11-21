@@ -2187,7 +2187,7 @@ impl Renderer {
         let rows = [
             ("System", SYSTEM_NAME.into()),
             ("Launcher version", ui.version.clone()),
-            ("Device name", ui.device_name.clone().unwrap_or_else(|| "Tap to set".into())),
+            ("Device name", ui.device_name.clone().unwrap_or_else(|| "Not set".into())),
             ("Device profile", ui.device_profile.clone().unwrap_or_else(|| "Unavailable".into())),
             ("Kindle firmware", ui.firmware.clone().unwrap_or_else(|| "Unavailable".into())),
             ("Series number", or_unknown(&ui.series)),
@@ -2211,7 +2211,7 @@ impl Renderer {
                 self.hairline(r.bottom() - 1, r.x + 32, r.right() - 32);
             }
         }
-        self.text(Text { text: "Change the device name in Settings › Device. From the Kindle UI, open “Launcher” in the library to come back.", x: (card.x + 8) as f32, y: (card.bottom() + 16) as f32, w: (card.w - 16) as f32, size: 24.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+        self.text(Text { text: "From the Kindle UI, open “Launcher” in the library to come back.", x: (card.x + 8) as f32, y: (card.bottom() + 16) as f32, w: (card.w - 16) as f32, size: 24.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
     }
 
     /// A section header above a card: small, bold, at `x`, `y`.
