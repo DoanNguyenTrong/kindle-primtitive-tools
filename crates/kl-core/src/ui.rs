@@ -3096,6 +3096,30 @@ mod tests {
     }
 
     #[test]
+    fn device_name_row_opens_the_name_page_and_saves_a_name() {
+        use crate::layout::Row;
+        let mut u = ui(1);
+        u.screen = Screen::Page(Page::Device);
+        let rows: Vec<_> = u.layout.page_sections(Page::Device).into_iter().flat_map(|s| s.rows).collect();
+        let row = rows.iter().find(|x| x.row == Row::DeviceName).expect("the Device name row is on the Device page");
+        let button = row.buttons.first().map(|b| b.1).expect("the Device name row has a tap target");
+        u.handle(centre(button));
+        assert_eq!(u.screen, Screen::DeviceName, "tapping the row opens the name page");
+        // Type "Bo" and Save on the keyboard: the name goes to the driver.
+        let key_tap = |u: &Ui, key: primitive_keyboard::Key| {
+            let keys = u.layout.keyboard_keys_with(u.device_name_entry.layer, "Save");
+            let (_, r) = keys.iter().find(|(k, _)| k.key == key).expect("key on the keyboard");
+            Input::Tap((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)
+        };
+        let tap = key_tap(&u, primitive_keyboard::Key::Char('b'));
+        u.handle(tap);
+        let tap = key_tap(&u, primitive_keyboard::Key::Char('o'));
+        u.handle(tap);
+        let save = key_tap(&u, primitive_keyboard::Key::Go);
+        assert_eq!(u.handle(save), Action::SetDeviceName("bo".into()), "Save sends the typed name");
+    }
+
+    #[test]
     fn connection_page_gives_ssh_and_dns_commands_and_a_password_screen() {
         use primitive_keyboard::Key;
         use crate::layout::Row;
