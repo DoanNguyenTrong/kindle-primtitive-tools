@@ -56,6 +56,16 @@ pub fn codename_from_version(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_ascii_lowercase())
 }
 
+/// The series number the stock Device Info shows, built from the system version string: the build number after the last
+/// `-` followed by the leading number before the first `-` (`025-juno_…_zelda-443455` gives `443455025`).
+pub fn series_number(version_text: &str) -> Option<String> {
+    let token = version_text.split_once("Version: ").map_or(version_text, |(_, rest)| rest).split_whitespace().next()?;
+    let (lead, build) = (token.split('-').next()?, token.rsplit('-').next()?);
+    let lead: String = lead.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let build: String = build.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!lead.is_empty() && !build.is_empty()).then(|| format!("{build}{lead}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +75,13 @@ mod tests {
         let text = "System Software Version: 025-juno_1802_stinger_zelda-443455\n";
         assert_eq!(codename_from_version(text).as_deref(), Some("zelda"));
         assert_eq!(model_for_codename("zelda").map(|m| m.id), Some("oasis3"));
+    }
+
+    #[test]
+    fn the_series_number_is_the_build_then_the_lead() {
+        let text = "System Software Version: 025-juno_1802_stinger_zelda-443455 Thu Apr 10 02:26:31 UTC 2025 com.lab126";
+        assert_eq!(series_number(text).as_deref(), Some("443455025"));
+        assert_eq!(series_number("nothing"), None);
     }
 
     #[test]

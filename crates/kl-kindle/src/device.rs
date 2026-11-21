@@ -64,8 +64,7 @@ pub fn store_device() -> Option<kl_store::resolve::Device> {
 
 /// The platform codename of this Kindle (`zelda` on the Oasis 3), from its version file. The serial is never read.
 pub fn platform_codename() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/version.txt").ok()?;
-    kl_core::models::codename_from_version(&text)
+    kl_core::models::codename_from_version(&version_text()?)
 }
 
 /// The Kindle model this device is, when its codename is known. `None` means the owner must choose it.
@@ -79,4 +78,23 @@ pub fn launcher_model(launcher: &Path) -> Option<String> {
     let text = std::fs::read_to_string(launcher.join("device.txt")).ok()?;
     let id = text.lines().find_map(|line| line.strip_prefix("model="))?.trim();
     kl_core::models::model_by_id(id).map(|model| model.catalog_name.to_string())
+}
+
+/// The system version text (`System Software Version: …`), as the stock UI reads it. Empty when unreadable.
+pub fn version_text() -> Option<String> {
+    std::fs::read_to_string("/etc/version.txt").ok()
+}
+
+/// The Wi-Fi adapter's MAC address, from the kernel. `None` when there is no Wi-Fi adapter.
+pub fn mac_address() -> Option<String> {
+    let address = std::fs::read_to_string("/sys/class/net/wlan0/address").ok()?;
+    let address = address.trim().to_ascii_uppercase();
+    (!address.is_empty()).then_some(address)
+}
+
+/// The screen panel's code (the system property `panelCode`, such as `A033_ED070KC3U1`), as the stock UI reads it.
+pub fn panel_code() -> Option<String> {
+    let output = std::process::Command::new("lipc-get-prop").args(["com.lab126.system", "panelCode"]).output().ok()?;
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !code.is_empty()).then_some(code)
 }
