@@ -2671,7 +2671,7 @@ mod tests {
         let fonts = vec![format!("{dir}/NotoSans-Regular.ttf"), format!("{dir}/NotoSans-Bold.ttf")];
         let (width, height) = (1264, 1680);
         let mut renderer = Renderer::new(width, height, &fonts).unwrap();
-        let mut ui = Ui::new(Vec::new(), Layout::new(width as u32, height as u32, 3, 3));
+        let mut ui = Ui::new(Vec::new(), Layout::new(width, height, 3, 3));
         ui.screen = Screen::Page(kl_core::layout::Page::Display);
         let status = Status::default();
         let plain = renderer.draw(&ui, &status);
@@ -2698,7 +2698,7 @@ mod tests {
         let fonts = vec![format!("{dir}/NotoSans-Regular.ttf"), format!("{dir}/NotoSans-Bold.ttf")];
         let (width, height) = (1264, 1680);
         let mut renderer = Renderer::new(width, height, &fonts).unwrap();
-        let mut ui = Ui::new(Vec::new(), Layout::new(width as u32, height as u32, 3, 3));
+        let mut ui = Ui::new(Vec::new(), Layout::new(width, height, 3, 3));
         ui.screen = Screen::Settings;
         let status = Status::default();
         let plain = renderer.draw(&ui, &status);
