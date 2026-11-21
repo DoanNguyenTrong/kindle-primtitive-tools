@@ -98,3 +98,38 @@ pub fn panel_code() -> Option<String> {
     let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !code.is_empty()).then_some(code)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::launcher_model;
+    use std::path::PathBuf;
+
+    /// A fresh folder for one test, so tests never share a `device.txt`.
+    fn folder(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("kl-kindle-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_store_reads_the_catalog_name_of_the_model_the_launcher_recorded() {
+        let dir = folder("oasis3");
+        std::fs::write(dir.join("device.txt"), "model=oasis3\nmodel_name=Kindle Oasis 3\narch=armhf\n").unwrap();
+        assert_eq!(launcher_model(&dir).as_deref(), Some("KindleOasis3"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_model_or_a_missing_record_gives_no_model() {
+        let dir = folder("unknown");
+        std::fs::write(dir.join("device.txt"), "model=unknown\narch=armhf\n").unwrap();
+        assert_eq!(launcher_model(&dir), None, "the Store says the model is not known");
+        std::fs::remove_file(dir.join("device.txt")).unwrap();
+        assert_eq!(launcher_model(&dir), None, "no device.txt yet: the launcher has not run");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
