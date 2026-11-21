@@ -11,6 +11,24 @@ pub struct Index {
     #[serde(default)]
     pub categories: Vec<Category>,
     pub apps: Vec<Card>,
+    #[serde(default, deserialize_with = "optional_downloads", skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<DownloadCounts>,
+}
+
+/// Snapshot of the package download totals collected by the catalog publisher.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DownloadCounts {
+    pub as_of: String,
+    pub by_app: BTreeMap<String, u64>,
+}
+
+fn optional_downloads<'de, D>(d: D) -> Result<Option<DownloadCounts>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    // A missing or unrecognised analytics snapshot must not interrupt app discovery or installs.
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -203,6 +221,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index.apps[0].source, Source::Link);
+        assert!(index.downloads.is_none());
         let m: Manifest = serde_json::from_str(
             r#"{"schema":1,"id":"x","dir":"x","version":"1.0.0","arch":"armhf",
             "firmware":{"min":"5.16.3"},"files":["x/a","documents/X.sh"]}"#,
@@ -210,5 +229,14 @@ mod tests {
         .unwrap();
         assert_eq!(m.files.len(), 2);
         assert!(m.hooks.is_empty());
+    }
+
+    #[test]
+    fn unknown_download_metadata_does_not_make_the_catalog_unreadable() {
+        let index: Index = serde_json::from_str(
+            r#"{"schema":1,"generated_at":"2026-11-20T10:00:00Z","apps":[],
+            "downloads":{"as_of":"2026-11-20T10:00:00Z","by_app":{"notes":-1}}}"#,
+        ).unwrap();
+        assert!(index.downloads.is_none());
     }
 }
