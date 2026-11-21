@@ -22,6 +22,11 @@ const MAX_PIXELS: u64 = 4_000_000;
 
 /// Decode a PNG into gray, compositing any transparency over white.
 pub fn decode_png(bytes: &[u8]) -> Result<GrayImage, String> {
+    decode_png_on(bytes, 255)
+}
+
+/// Decode a PNG into gray, compositing any transparency over `background` (black for an icon's dark form).
+fn decode_png_on(bytes: &[u8], background: u8) -> Result<GrayImage, String> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().map_err(|e| format!("png: {e}"))?;
@@ -51,7 +56,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<GrayImage, String> {
                 3 => (luma(p[0], p[1], p[2]), 255),
                 _ => (luma(p[0], p[1], p[2]), p[3] as u32),
             };
-            pixels.push(((luma * alpha + 255 * (255 - alpha)) / 255) as u8);
+            pixels.push(((luma * alpha + background as u32 * (255 - alpha)) / 255) as u8);
         }
     }
     Ok(GrayImage { width: w, height: h, pixels })
@@ -64,7 +69,13 @@ fn luma(r: u8, g: u8, b: u8) -> u32 {
 /// Scale `img` to fit inside `w` × `h` keeping its shape, centred on white. Each output pixel is the
 /// average of the source area it covers, so large icons shrink without sparkle.
 pub fn fit(img: &GrayImage, w: u32, h: u32) -> GrayImage {
+    fit_on(img, w, h, 255)
+}
+
+/// `fit`, with `background` around a picture of another shape.
+fn fit_on(img: &GrayImage, w: u32, h: u32, background: u8) -> GrayImage {
     let mut out = GrayImage::blank(w, h);
+    out.pixels.fill(background);
     if img.width == 0 || img.height == 0 || w == 0 || h == 0 {
         return out;
     }
@@ -204,11 +215,25 @@ pub fn rounded_distance(x: f32, y: f32, side: f32, radius: f32) -> f32 {
     (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - radius
 }
 
-/// An app icon: the picture fitted into a rounded square of side `size` (white around a picture of another
-/// shape), dithered, with a thin black outline and white outside the corners.
+/// An app icon's light form: the picture fitted into a rounded square of side `size` (white around a picture of
+/// another shape), dithered, with a thin black outline and white outside the corners.
 pub fn icon_tile(png_bytes: &[u8], size: u32) -> Result<GrayImage, String> {
-    let img = decode_png(png_bytes)?;
-    let mut tile = fit(&img, size, size);
+    form_tile(png_bytes, size, false)
+}
+
+/// An app icon's dark form, drawn in dark mode and kept out of its inversion (`invert_except`): the picture
+/// fitted into a rounded square (black around it and under any transparency), dithered, with a thin white outline so the black tile keeps
+/// its shape on the black page. Inside the rounded square it is the picture as it is. The pixels outside it are
+/// part of the page, which dark mode inverts: they are stored inverted, so the corners end up black with an
+/// anti-aliased edge.
+pub fn dark_icon_tile(png_bytes: &[u8], size: u32) -> Result<GrayImage, String> {
+    form_tile(png_bytes, size, true)
+}
+
+fn form_tile(png_bytes: &[u8], size: u32, dark: bool) -> Result<GrayImage, String> {
+    let background = if dark { 0 } else { 255 };
+    let img = decode_png_on(png_bytes, background)?;
+    let mut tile = fit_on(&img, size, size, background);
     dither16(&mut tile);
     let (s, r) = (size as f32, size as f32 * ICON_RADIUS);
     for y in 0..size {
@@ -217,10 +242,36 @@ pub fn icon_tile(png_bytes: &[u8], size: u32) -> Result<GrayImage, String> {
             let outer = (0.5 - d).clamp(0.0, 1.0);
             let inner = (0.5 - (d + ICON_OUTLINE)).clamp(0.0, 1.0);
             let px = &mut tile.pixels[(y * size + x) as usize];
-            *px = (255.0 * (1.0 - outer) + *px as f32 * inner).round().clamp(0.0, 255.0) as u8;
+            let value = if dark {
+                // Over the black page: the outline white, the page black.
+                let seen = 255.0 * (outer - inner) + *px as f32 * inner;
+                if d < 0.0 { seen } else { 255.0 - seen }
+            } else {
+                255.0 * (1.0 - outer) + *px as f32 * inner
+            };
+            *px = value.round().clamp(0.0, 255.0) as u8;
         }
     }
     Ok(tile)
+}
+
+/// Keep `area` (x, y, w, h) of `out` and take every other pixel from `backdrop` (the same size as `out`).
+pub fn keep_area(out: &mut [u8], backdrop: &[u8], width: usize, area: (i32, i32, i32, i32)) {
+    if width == 0 || out.len() != backdrop.len() {
+        return;
+    }
+    let rows = out.len() / width;
+    let (x0, x1) = (area.0.clamp(0, width as i32) as usize, (area.0 + area.2).clamp(0, width as i32) as usize);
+    let (y0, y1) = (area.1.clamp(0, rows as i32) as usize, (area.1 + area.3).clamp(0, rows as i32) as usize);
+    for y in 0..rows {
+        let row = y * width;
+        if y < y0 || y >= y1 || x1 <= x0 {
+            out[row..row + width].copy_from_slice(&backdrop[row..row + width]);
+        } else {
+            out[row..row + x0].copy_from_slice(&backdrop[row..row + x0]);
+            out[row + x1..row + width].copy_from_slice(&backdrop[row + x1..row + width]);
+        }
+    }
 }
 
 /// Darken the inside of a rounded-square icon at `r` in a screen buffer: the pressed look.
@@ -305,8 +356,14 @@ const TILE_VERSION: &[u8] = b"rounded-square-1";
 
 /// FNV-1a, for cache file names keyed by the icon's source bytes, the tile size and the tile version.
 pub fn cache_key(bytes: &[u8], w: u32, h: u32) -> String {
+    form_cache_key(bytes, w, h, false)
+}
+
+/// `cache_key` for the tile of an icon's light or dark form: the same PNG makes a different tile in each.
+pub fn form_cache_key(bytes: &[u8], w: u32, h: u32, dark: bool) -> String {
+    let form: &[u8] = if dark { b"dark-form" } else { b"" };
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in TILE_VERSION.iter().chain(bytes.iter()).chain(w.to_le_bytes().iter()).chain(h.to_le_bytes().iter()) {
+    for b in TILE_VERSION.iter().chain(form).chain(bytes.iter()).chain(w.to_le_bytes().iter()).chain(h.to_le_bytes().iter()) {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -338,6 +395,14 @@ pub fn from_cache(bytes: &[u8]) -> Option<GrayImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_area_keeps_the_pop_up_and_takes_the_rest_from_the_backdrop() {
+        let mut out = vec![1u8; 16];
+        let backdrop = vec![9u8; 16];
+        keep_area(&mut out, &backdrop, 4, (1, 1, 2, 2));
+        assert_eq!(out, vec![9, 9, 9, 9, 9, 1, 1, 9, 9, 1, 1, 9, 9, 9, 9, 9]);
+    }
 
     fn png_bytes(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -424,6 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn a_dark_form_tile_shows_on_the_black_page_as_its_picture_with_a_white_outline() {
+        let gray = png_bytes(4, 4, png::ColorType::Grayscale, &[0, 0, 0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 0, 0, 0]);
+        let tile = dark_icon_tile(&gray, 100).unwrap();
+        // Dark mode inverts the page and keeps the rounded square of the icon as it is.
+        let mut screen = tile.pixels.clone();
+        let radius = 100.0 * ICON_RADIUS;
+        invert_except(&mut screen, 100, &[((0, 0, 100, 100), radius)], None);
+        let at = |x: usize, y: usize| screen[y * 100 + x];
+        assert_eq!(at(0, 0), 0, "outside the corner: the black page");
+        assert_eq!(at(50, 1), 255, "the white outline at the top edge");
+        assert_eq!((at(10, 10), at(50, 50)), (0, 255), "the picture inside, as it is");
+        // Transparency in a dark form is black, not white.
+        let clear = png_bytes(2, 2, png::ColorType::GrayscaleAlpha, &[255, 0, 255, 0, 255, 0, 255, 0]);
+        assert_eq!(dark_icon_tile(&clear, 100).unwrap().pixels[50 * 100 + 50], 0);
+        assert_eq!(icon_tile(&clear, 100).unwrap().pixels[50 * 100 + 50], 255);
+    }
+
+    #[test]
     fn darkening_stays_inside_the_rounded_square() {
         let mut out = vec![255u8; 20 * 20];
         darken_icon(&mut out, 20, 5, 5, 10);
@@ -471,5 +554,7 @@ mod tests {
         assert_eq!(from_cache(&to_cache(&img)), Some(img));
         assert_eq!(from_cache(b"KLG1\x02\0\0\0\x02\0\0\0\x01"), None);
         assert_ne!(cache_key(b"a", 1, 2), cache_key(b"a", 2, 1));
+        assert_eq!(form_cache_key(b"a", 1, 2, false), cache_key(b"a", 1, 2));
+        assert_ne!(form_cache_key(b"a", 1, 2, true), cache_key(b"a", 1, 2));
     }
 }

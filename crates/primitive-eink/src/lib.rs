@@ -269,6 +269,23 @@ impl Panel {
 }
 
 impl Panel {
+    /// The visible page as it is in memory (panel orientation), `width` bytes a row for `height` rows: what is on the
+    /// screen now, so it can be put back later. `None` when the page does not fit the mapping.
+    pub fn snapshot(&self, width: u32, height: u32) -> Option<Vec<u8>> {
+        let var = var_info(self.file.as_raw_fd()).ok()?;
+        let (w, h) = (width as usize, height as usize);
+        let base = var.yoffset as usize * self.line_length;
+        if h == 0 || w > self.line_length || base + (h - 1) * self.line_length + w > self.len {
+            return None;
+        }
+        let mut out = vec![0u8; w * h];
+        for r in 0..h {
+            // SAFETY: the source run is inside the mapping (checked above) and the destination inside `out`.
+            unsafe { std::ptr::copy_nonoverlapping(self.map.add(base + r * self.line_length), out.as_mut_ptr().add(r * w), w) };
+        }
+        Some(out)
+    }
+
     /// The framebuffer's own rotation (0 upright, 2 upside down, 1 and 3 landscape).
     pub fn turn(&self) -> u32 {
         var_info(self.file.as_raw_fd()).map_or(0, |v| v.rotate)

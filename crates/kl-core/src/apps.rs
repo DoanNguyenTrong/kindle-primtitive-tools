@@ -5,10 +5,21 @@ use std::{collections::BTreeSet, ffi::OsStr, fs, path::Path};
 
 use crate::{config::Config, scriptlet};
 
+/// A bundled icon's two forms: `assets/icons/apps/<name>.png` (light) and `<name>-dark.png` (dark), made by
+/// `scripts/icon-forms.py`.
+macro_rules! bundled {
+    ($name:literal) => {
+        IconSource::Bundled {
+            light: include_bytes!(concat!("../../../assets/icons/apps/", $name, ".png")),
+            dark: Some(include_bytes!(concat!("../../../assets/icons/apps/", $name, "-dark.png"))),
+        }
+    };
+}
+
 pub const STORE_ENTRY_FILE: &str = "Store.sh";
 pub const STORE_BINARY: &str = "store/bin/kl-store-app";
 const STORE_NAME: &str = "Store";
-const STORE_ICON: &[u8] = include_bytes!("../../../assets/icons/apps/store.png");
+const STORE_ICON: IconSource = bundled!("store");
 
 /// Reserved spellings used by the built-in Store tile and standalone library entries.
 pub fn is_store_alias(name: &str) -> bool {
@@ -55,7 +66,7 @@ pub fn store_entry(mut app: App, documents: &Path) -> Option<App> {
 fn use_store_script(app: &mut App, documents: &Path) {
     app.name = STORE_NAME.into();
     if matches!(app.icon, IconSource::None) {
-        app.icon = IconSource::Bundled(STORE_ICON);
+        app.icon = STORE_ICON;
     }
     app.background = false;
     app.dir = documents.to_string_lossy().into_owned();
@@ -82,20 +93,68 @@ pub enum Launch {
     Store,
 }
 
+/// An app's icon. Every icon has a light form (black glyph on a white tile) and may have a dark form (white glyph
+/// on a black tile); the launcher draws the form for the theme, and the light form when there is no dark one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IconSource {
     /// No icon: a monogram is drawn.
     None,
-    /// An image file (PNG).
+    /// An image file (PNG): the light form. The dark form is the file beside it with `-dark` before `.png`
+    /// (`icon.png` and `icon-dark.png`), when present.
     File(String),
-    /// Base64 PNG data from a `data:` URI.
-    Data(String),
-    /// A PNG built into the launcher (the built-ins' icons).
-    Bundled(&'static [u8]),
+    /// Base64 PNG data from a `data:` URI: the light form, and the dark form from `# IconDark:` when there is one
+    /// (the light form is drawn in both themes otherwise).
+    Data { light: String, dark: Option<String> },
+    /// PNGs built into the launcher (the first-party apps' icons): the light form and the dark form.
+    Bundled { light: &'static [u8], dark: Option<&'static [u8]> },
+}
+
+impl IconSource {
+    /// The light form's PNG; `Ok(None)` when there is no icon.
+    pub fn light_png(&self) -> Result<Option<Vec<u8>>, String> {
+        Ok(Some(match self {
+            Self::None => return Ok(None),
+            Self::Data { light, .. } => crate::base64::decode(light).ok_or("icon: bad base64")?,
+            Self::File(path) => fs::read(path).map_err(|e| format!("icon {path}: {e}"))?,
+            Self::Bundled { light, .. } => light.to_vec(),
+        }))
+    }
+
+    /// The dark form's PNG, when the icon has one: a bundled icon's dark form, or the `-dark` file beside an
+    /// icon file. `None` otherwise (the light form is drawn in both themes).
+    pub fn dark_png(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Bundled { dark, .. } => dark.map(<[u8]>::to_vec),
+            Self::File(path) => fs::read(dark_form_path(path)?).ok(),
+            Self::Data { dark, .. } => crate::base64::decode(dark.as_deref()?),
+            Self::None => None,
+        }
+    }
+
+    /// The PNG of the form for the theme: the dark form in dark mode when there is one, else the light form.
+    pub fn png_for(&self, dark_mode: bool) -> Result<Option<Vec<u8>>, String> {
+        match dark_mode.then(|| self.dark_png()).flatten() {
+            Some(png) => Ok(Some(png)),
+            None => self.light_png(),
+        }
+    }
+}
+
+/// Where the dark form of the icon file `path` would be: `-dark` before its `.png` (`/a/icon.png` gives
+/// `/a/icon-dark.png`). `None` for a file that is not a `.png`, or that is a dark form itself.
+pub fn dark_form_path(path: &str) -> Option<String> {
+    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let extension = file.len().checked_sub(4).filter(|&i| file.is_char_boundary(i))?;
+    let (stem, png) = file.split_at(extension);
+    if !png.eq_ignore_ascii_case(".png") || stem.is_empty() || stem.ends_with("-dark") {
+        return None;
+    }
+    let prefix = if path.contains('/') { format!("{dir}/") } else { String::new() };
+    Some(format!("{prefix}{stem}-dark{png}"))
 }
 
 /// The Kindle UI tile's icon: the Kindle app's reader under the arcs, in the panel's grays
-/// (`assets/icons/kindle-ui.png`, made from `assets/kindle-icon.png`).
+/// (`assets/icons/kindle-ui.png`, made from `assets/kindle-icon.png`). One form: it is a picture.
 pub const KINDLE_UI_ICON: &[u8] = include_bytes!("../../../assets/icons/kindle-ui.png");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +192,21 @@ impl App {
     }
 }
 
+/// The base64 data of a `data:` URI (`None` for anything else).
+fn data_uri(value: &str) -> Option<String> {
+    value.starts_with("data:").then(|| value.split_once(";base64,").map(|(_, data)| data.to_string())).flatten()
+}
+
 fn icon_from(value: Option<&str>) -> IconSource {
-    match value {
-        Some(v) if v.starts_with("data:") => match v.split_once(";base64,") {
-            Some((_, data)) => IconSource::Data(data.to_string()),
+    icon_forms(value, None)
+}
+
+/// An icon from its light value (`# Icon:`) and its dark value (`# IconDark:`, a `data:` URI). A dark value that is
+/// not a `data:` URI is ignored: the light form is used in both themes.
+fn icon_forms(light: Option<&str>, dark: Option<&str>) -> IconSource {
+    match light {
+        Some(v) if v.starts_with("data:") => match data_uri(v) {
+            Some(light) => IconSource::Data { light, dark: dark.and_then(data_uri) },
             None => IconSource::None,
         },
         Some(v) if v.starts_with('/') => IconSource::File(v.to_string()),
@@ -145,24 +215,23 @@ fn icon_from(value: Option<&str>) -> IconSource {
 }
 
 fn native_icon(file: &str) -> IconSource {
-    let bytes: &[u8] = match file {
-        "Blocks.sh" => include_bytes!("../../../assets/icons/apps/blocks.png"),
-        "Calculator.sh" => include_bytes!("../../../assets/icons/apps/calculator.png"),
-        "Cards.sh" => include_bytes!("../../../assets/icons/apps/cards.png"),
-        "Cascade.sh" => include_bytes!("../../../assets/icons/apps/cascade.png"),
-        "Chess.sh" => include_bytes!("../../../assets/icons/apps/chess.png"),
-        "Crossword.sh" => include_bytes!("../../../assets/icons/apps/crossword.png"),
-        "Focus.sh" => include_bytes!("../../../assets/icons/apps/focus.png"),
-        "Hello.sh" => include_bytes!("../../../assets/icons/apps/hello.png"),
-        "Minesweeper.sh" => include_bytes!("../../../assets/icons/apps/minesweeper.png"),
-        "Notes.sh" => include_bytes!("../../../assets/icons/apps/notes.png"),
-        "Ships.sh" => include_bytes!("../../../assets/icons/apps/ships.png"),
-        "Solitaire.sh" => include_bytes!("../../../assets/icons/apps/solitaire.png"),
-        "Sudoku.sh" => include_bytes!("../../../assets/icons/apps/sudoku.png"),
-        "Words.sh" => include_bytes!("../../../assets/icons/apps/words.png"),
-        _ => return IconSource::None,
-    };
-    IconSource::Bundled(bytes)
+    match file {
+        "Blocks.sh" => bundled!("blocks"),
+        "Calculator.sh" => bundled!("calculator"),
+        "Cards.sh" => bundled!("cards"),
+        "Cascade.sh" => bundled!("cascade"),
+        "Chess.sh" => bundled!("chess"),
+        "Crossword.sh" => bundled!("crossword"),
+        "Focus.sh" => bundled!("focus"),
+        "Hello.sh" => bundled!("hello"),
+        "Minesweeper.sh" => bundled!("minesweeper"),
+        "Notes.sh" => bundled!("notes"),
+        "Ships.sh" => bundled!("ships"),
+        "Solitaire.sh" => bundled!("solitaire"),
+        "Sudoku.sh" => bundled!("sudoku"),
+        "Words.sh" => bundled!("words"),
+        _ => IconSource::None,
+    }
 }
 
 fn builtins() -> Vec<App> {
@@ -180,20 +249,10 @@ fn builtins() -> Vec<App> {
         App {
             id: "store".into(),
             name: STORE_NAME.into(),
-            icon: IconSource::Bundled(STORE_ICON),
+            icon: STORE_ICON,
             launch: Launch::Store,
             dir: "/".into(),
             order: Some(9_000),
-            hidden: false,
-            background: false,
-        },
-        App {
-            id: "kindle".into(),
-            name: "Kindle UI".into(),
-            icon: IconSource::Bundled(KINDLE_UI_ICON),
-            launch: Launch::KindleMode,
-            dir: "/".into(),
-            order: Some(9_001),
             hidden: false,
             background: false,
         },
@@ -228,7 +287,7 @@ pub fn scriptlets(documents: &Path) -> Vec<App> {
         let icon = if header.icon.is_none() && header.author.as_deref() == Some("Primitive AI") {
             native_icon(&file)
         } else {
-            icon_from(header.icon.as_deref())
+            icon_forms(header.icon.as_deref(), header.icon_dark.as_deref())
         };
         apps.push(App {
             id: file,
@@ -391,7 +450,7 @@ mod tests {
         let apps = scriptlets(&dir);
         let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Primitive Browser", "Hooks", "Plain"]);
-        assert_eq!(apps[0].icon, IconSource::Data("QUJD".into()));
+        assert_eq!(apps[0].icon, IconSource::Data { light: "QUJD".into(), dark: None });
         assert_eq!(apps[0].id, "Browser.sh");
         assert!(matches!(&apps[1].launch, Launch::Script { hooks: true, .. }));
         fs::remove_dir_all(&dir).unwrap();
@@ -413,11 +472,66 @@ mod tests {
         let mut images = BTreeSet::new();
         for id in files.into_iter().chain(["store"]) {
             let app = apps.iter().find(|app| app.id == id).unwrap();
-            let IconSource::Bundled(bytes) = app.icon else { panic!("{id} has no icon") };
-            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "{id}");
-            assert!(images.insert(bytes), "{id} shares another app's icon");
+            let IconSource::Bundled { light, dark: Some(dark) } = app.icon else { panic!("{id} has no icon in two forms") };
+            for bytes in [light, dark] {
+                assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "{id}");
+                assert!(images.insert(bytes), "{id} shares another app's icon or its forms are the same");
+            }
         }
-        assert_eq!(images.len(), 15);
+        assert_eq!(images.len(), 30);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_form_for_the_theme_is_the_dark_one_in_dark_mode() {
+        let icon = IconSource::Bundled { light: b"light", dark: Some(b"dark") };
+        assert_eq!(icon.png_for(false).unwrap().as_deref(), Some(&b"light"[..]));
+        assert_eq!(icon.png_for(true).unwrap().as_deref(), Some(&b"dark"[..]));
+        assert_eq!(IconSource::None.png_for(true).unwrap(), None);
+    }
+
+    #[test]
+    fn without_a_dark_form_the_light_one_is_drawn_in_both_themes() {
+        let kindle = IconSource::Bundled { light: KINDLE_UI_ICON, dark: None };
+        assert_eq!(kindle.dark_png(), None);
+        assert_eq!(kindle.png_for(true).unwrap().as_deref(), Some(KINDLE_UI_ICON));
+        // A `# Icon:` data URI has one form (KOReader, the browser).
+        let data = IconSource::Data { light: "QUJD".into(), dark: None };
+        assert_eq!(data.dark_png(), None);
+        assert_eq!(data.png_for(true).unwrap().as_deref(), Some(&b"ABC"[..]));
+    }
+
+    #[test]
+    fn a_data_icon_takes_its_dark_form_from_icon_dark() {
+        let both = icon_forms(Some("data:image/png;base64,QUJD"), Some("data:image/png;base64,REVG"));
+        assert_eq!(both, IconSource::Data { light: "QUJD".into(), dark: Some("REVG".into()) });
+        assert_eq!(both.png_for(false).unwrap().as_deref(), Some(&b"ABC"[..]));
+        assert_eq!(both.png_for(true).unwrap().as_deref(), Some(&b"DEF"[..]));
+        let light_only = icon_forms(Some("data:image/png;base64,QUJD"), None);
+        assert_eq!(light_only.png_for(true).unwrap().as_deref(), Some(&b"ABC"[..]), "no dark form: light in both");
+        let not_a_uri = icon_forms(Some("data:image/png;base64,QUJD"), Some("/mnt/us/dark.png"));
+        assert_eq!(not_a_uri.dark_png(), None, "a dark value that is not a data URI is ignored");
+    }
+
+    #[test]
+    fn an_icon_file_takes_its_dark_form_from_the_file_beside_it() {
+        assert_eq!(dark_form_path("/mnt/us/notes/icon.png").as_deref(), Some("/mnt/us/notes/icon-dark.png"));
+        assert_eq!(dark_form_path("/mnt/us/launcher/icons/KOReader.PNG").as_deref(), Some("/mnt/us/launcher/icons/KOReader-dark.PNG"));
+        assert_eq!(dark_form_path("icon.png").as_deref(), Some("icon-dark.png"));
+        for path in ["/a/icon-dark.png", "/a/icon.jpg", "/a/.png", "/a/b.png/", "/a/é"] {
+            assert_eq!(dark_form_path(path), None, "{path}");
+        }
+
+        let dir = temp_dir("icon-forms");
+        let light = dir.join("icon.png");
+        fs::write(&light, "light").unwrap();
+        let icon = IconSource::File(light.to_string_lossy().into_owned());
+        assert_eq!(icon.png_for(true).unwrap().as_deref(), Some(&b"light"[..]), "no icon-dark.png: the light form");
+        fs::write(dir.join("icon-dark.png"), "dark").unwrap();
+        assert_eq!(icon.png_for(true).unwrap().as_deref(), Some(&b"dark"[..]));
+        assert_eq!(icon.png_for(false).unwrap().as_deref(), Some(&b"light"[..]));
+        fs::remove_file(&light).unwrap();
+        assert!(icon.png_for(false).is_err(), "a missing light form is a problem");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -461,7 +575,7 @@ mod tests {
             assert_eq!(store.len(), 1);
             store[0].icon.clone()
         };
-        assert_eq!(icon(&Config::default()), IconSource::Bundled(STORE_ICON));
+        assert_eq!(icon(&Config::default()), STORE_ICON);
 
         let binary = root.join(STORE_BINARY);
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
@@ -469,7 +583,7 @@ mod tests {
         fs::set_permissions(binary, fs::Permissions::from_mode(0o755)).unwrap();
         for name in ["Store", "Primitive Store"] {
             fs::write(documents.join(STORE_ENTRY_FILE), format!("# Name: {name}\n")).unwrap();
-            assert_eq!(icon(&Config::default()), IconSource::Bundled(STORE_ICON));
+            assert_eq!(icon(&Config::default()), STORE_ICON);
         }
         let (config, _) = Config::parse("[[app]]\nid = \"Store.sh\"\nicon = \"/mnt/us/store/custom.png\"\n");
         assert_eq!(icon(&config), IconSource::File("/mnt/us/store/custom.png".into()));
@@ -515,7 +629,7 @@ mod tests {
         );
         let (apps, problems) = merge(vec![script("a.sh", "Alpha"), script("b.sh", "Beta"), script("z.sh", "Zed")], &config);
         let ids: Vec<_> = apps.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["koreader", "b.sh", "a.sh", "z.sh", "settings", "store", "kindle"]);
+        assert_eq!(ids, ["koreader", "b.sh", "a.sh", "z.sh", "settings", "store"]);
         assert!(apps[3].hidden);
         assert_eq!(apps[0].launch, Launch::Shell { command: "/mnt/us/koreader/koreader.sh".into() });
         assert_eq!(problems.len(), 1);
@@ -580,11 +694,17 @@ mod tests {
 
     #[test]
     fn builtins_keep_their_launch() {
-        let (config, _) = Config::parse("[[app]]\nid = \"kindle\"\ncommand = \"rm -rf /\"\nname = \"Stock\"\n");
+        let (config, _) = Config::parse("[[app]]\nid = \"store\"\ncommand = \"rm -rf /\"\nname = \"Shop\"\n");
         let (apps, _) = merge(vec![], &config);
-        let kindle = apps.iter().find(|a| a.id == "kindle").unwrap();
-        assert_eq!(kindle.launch, Launch::KindleMode);
-        assert_eq!(kindle.name, "Stock");
+        let store = apps.iter().find(|a| a.id == "store").unwrap();
+        assert_eq!(store.launch, Launch::Store);
+        assert_eq!(store.name, "Shop");
+    }
+
+    #[test]
+    fn the_kindle_ui_is_not_a_tile_on_the_home_screen() {
+        let (apps, _) = merge(vec![], &Config::default());
+        assert!(apps.iter().all(|a| a.launch != Launch::KindleMode), "it is in the power menu instead");
     }
 
     #[test]

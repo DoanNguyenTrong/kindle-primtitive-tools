@@ -1250,9 +1250,12 @@ impl Ui {
         }
     }
 
-    /// The icon files "Change icon" cycles through.
+    /// The icon files "Change icon" cycles through. A dark form (`<name>-dark.png` beside `<name>.png`) is not a
+    /// choice of its own: it comes with its light form.
     pub fn set_icon_choices(&mut self, choices: Vec<String>) {
-        self.icon_choices = choices;
+        let dark_forms: std::collections::HashSet<String> =
+            choices.iter().filter_map(|path| crate::apps::dark_form_path(path)).collect();
+        self.icon_choices = choices.into_iter().filter(|path| !dark_forms.contains(path)).collect();
     }
 
     /// The Wi-Fi scan list on the Wi-Fi page (networks other than the current one).
@@ -2063,8 +2066,11 @@ impl Ui {
     /// The power menu: Restart and Power off run the device's command; Cancel, or a tap outside the box, goes home.
     fn power_menu(&mut self, input: Input) -> Action {
         let Input::Tap(x, y) = input else { return Action::None };
-        let [(_, cancel), (_, restart), (_, off)] = self.layout.power_buttons();
-        if off.inset(-12).contains(x, y) {
+        let [(_, cancel), (_, kindle), (_, restart), (_, off)] = self.layout.power_buttons();
+        if kindle.inset(-12).contains(x, y) {
+            // Opening the Kindle UI takes about a minute: it is confirmed first.
+            self.go(Screen::ConfirmKindle)
+        } else if off.inset(-12).contains(x, y) {
             Action::Device(DeviceCmd::PowerOff)
         } else if restart.inset(-12).contains(x, y) {
             Action::Device(DeviceCmd::Restart)
@@ -2791,7 +2797,12 @@ mod tests {
         let (_, tile) = u.layout.quick_buttons()[6];
         assert_eq!(u.handle(centre(u.layout.quick_button_circle(tile))), Action::Redraw { full: false });
         assert_eq!(u.screen, Screen::PowerMenu, "the quick panel closes and the menu opens");
-        let [(_, cancel), (_, restart), (_, off)] = u.layout.power_buttons();
+        let [(_, cancel), (_, kindle), (_, restart), (_, off)] = u.layout.power_buttons();
+        assert_eq!(u.handle(centre(kindle)), Action::Redraw { full: false });
+        assert_eq!(u.screen, Screen::ConfirmKindle, "the Kindle UI is confirmed first");
+        let [(_, _), (_, open)] = u.layout.confirm_buttons();
+        assert_eq!(u.handle(centre(open)), Action::KindleMode);
+        u.screen = Screen::PowerMenu;
         assert_eq!(u.handle(centre(restart)), Action::Device(DeviceCmd::Restart));
         assert_eq!(u.handle(centre(off)), Action::Device(DeviceCmd::PowerOff));
         assert_eq!(u.handle(centre(cancel)), Action::Redraw { full: false });
@@ -2990,6 +3001,18 @@ mod tests {
         assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/b.png".into()) });
         assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: None });
         assert_eq!(u.apps()[0].icon, IconSource::None);
+    }
+
+    #[test]
+    fn change_icon_skips_the_dark_forms_of_the_icon_files() {
+        let mut u = ui(1);
+        u.set_icon_choices(vec!["/i/a-dark.png".into(), "/i/a.png".into(), "/i/b-dark.png".into()]);
+        let id = u.apps()[0].id.clone();
+        open_menu(&mut u, 0);
+        let icon = menu_row(&u, Button::MenuIcon);
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/a.png".into()) });
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/b-dark.png".into()) }, "no light form: a choice");
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id, icon: None });
     }
 
     #[test]

@@ -98,6 +98,9 @@ pub struct Renderer {
     wallpaper_preview: Option<GrayImage>,
     /// The launcher's own sleep screen picture, when one is set (screensavers folder).
     sleep_image: Option<GrayImage>,
+    /// Over an app (the system layer), the app's screen (upright): the backdrop of the system's pop-ups instead of
+    /// the home screen.
+    backdrop: Option<Vec<u8>>,
     /// The drive-mode picture (`assets/usb-drive-mode.png`), fitted to the screen and snapped to black and white.
     usb_picture: Option<GrayImage>,
     /// Store pictures (screenshots) to draw over the store's product page, collected while it is drawn.
@@ -114,6 +117,21 @@ pub const STORE_SHOT_H: u32 = 540;
 
 pub fn store_icon_key(id: &str, size: u32) -> String {
     format!("store-icon:{id}:{size}")
+}
+
+/// The key of an app's dark-form tile among the renderer's icons (the light form's key is the app's id).
+pub fn dark_icon_key(id: &str) -> String {
+    format!("dark-form:{id}")
+}
+
+/// The tile to draw for app `id` in the theme: its dark form in dark mode when it has one, else its light form.
+fn icon_key_for_theme(icons: &HashMap<String, GrayImage>, id: &str, dark_mode: bool) -> String {
+    let dark = dark_icon_key(id);
+    if dark_mode && icons.contains_key(&dark) {
+        dark
+    } else {
+        id.to_string()
+    }
 }
 
 pub fn store_shot_key(id: &str, index: usize) -> String {
@@ -184,6 +202,7 @@ impl Renderer {
             home_wallpaper: None,
             wallpaper_preview: None,
             sleep_image: None,
+            backdrop: None,
             store_blits: Vec::new(),
             usb_picture: None,
         })
@@ -225,9 +244,21 @@ impl Renderer {
         self.sleep_image = image;
     }
 
-    /// Drop an app's tile (its icon was changed; the driver loads the new one).
+    /// The app's screen (upright, one byte a pixel, the screen's size) while the system layer shows its pop-ups over
+    /// an app; `None` when no app is under them.
+    pub fn set_backdrop(&mut self, picture: Option<Vec<u8>>) {
+        self.backdrop = picture;
+    }
+
+    /// Set the tile of an app's dark form, drawn instead of its light one in dark mode.
+    pub fn set_dark_icon(&mut self, id: &str, tile: GrayImage) {
+        self.icons.insert(dark_icon_key(id), tile);
+    }
+
+    /// Drop an app's tiles, both forms (its icon was changed; the driver loads the new one).
     pub fn forget_icon(&mut self, id: &str) {
         self.icons.remove(id);
+        self.icons.remove(&dark_icon_key(id));
     }
 
     /// Whether a sleep picture is set (the launcher's own sleep screen has something to show).
@@ -544,10 +575,7 @@ impl Renderer {
                     }
                     pictures.push(((rect.x, top, rect.w, bottom - top), 0.0));
                 } else {
-                    let radius = rect.w as f32 * image::ICON_RADIUS;
-                    let clip_radius = if wallpaper.is_some() { radius } else { 0.0 };
-                    blit(&mut out, width, rect, tile, clip_radius);
-                    pictures.push(((rect.x, rect.y, rect.w, rect.h), radius));
+                    pictures.push(blit_icon(&mut out, width, rect, tile, wallpaper.is_some()));
                 }
             }
         }
@@ -596,6 +624,14 @@ impl Renderer {
         if status.dark_mode && ui.screen != Screen::Sleep {
             let over = popup.map(|b| (b.x - halo, b.y - halo, b.w + 2 * halo, b.h + 2 * halo));
             image::invert_except(&mut out, width, &pictures, over);
+        }
+        // Over an app, the system's pop-ups float over the app's screen: every pixel outside the pop-up is the app's.
+        if let (Some(backdrop), Some(b)) = (self.backdrop.as_ref(), popup) {
+            if matches!(ui.screen, Screen::QuickSettings | Screen::PowerMenu | Screen::ConfirmKindle | Screen::AppMenu)
+                && backdrop.len() == out.len()
+            {
+                image::keep_area(&mut out, backdrop, width, (b.x - halo, b.y - halo, b.w + 2 * halo, b.h + 2 * halo));
+            }
         }
         // The pressed look: only the touched icon darkens.
         if let (Screen::Home, Some(r)) = (ui.screen, ui.pressed) {
@@ -835,7 +871,7 @@ impl Renderer {
         let page: Vec<(usize, App)> = ui.page_apps().map(|(i, a)| (i, a.clone())).collect();
         for (slot, app) in page {
             let icon = l.icon(slot);
-            self.app_icon(icon, &app, icon_blits);
+            self.app_icon(icon, &app, s.dark_mode, icon_blits);
             if ui.store_update_count > 0 && (app.launch == Launch::Store || app.id == kl_core::apps::STORE_ENTRY_FILE) {
                 let text = if ui.store_update_count > 99 { "99+".into() } else { ui.store_update_count.to_string() };
                 // The badge sits above the icon so a custom picture can never cover it.
@@ -860,11 +896,12 @@ impl Renderer {
         self.home_footer(ui);
     }
 
-    /// An app's icon in a rounded square: its picture (blitted after rendering), a glyph for the built-ins, or
-    /// its initials.
-    fn app_icon(&mut self, r: Rect, app: &App, icon_blits: &mut Vec<(Rect, String)>) {
+    /// An app's icon in a rounded square: its picture in the form for the theme (blitted after rendering, and
+    /// kept out of dark mode's inversion, so the form shows as its PNG), a glyph for the built-ins, or its
+    /// initials.
+    fn app_icon(&mut self, r: Rect, app: &App, dark_mode: bool, icon_blits: &mut Vec<(Rect, String)>) {
         if !matches!(app.icon, IconSource::None) && self.icons.contains_key(&app.id) {
-            icon_blits.push((r, app.id.clone()));
+            icon_blits.push((r, icon_key_for_theme(&self.icons, &app.id, dark_mode)));
         } else if !self.glyph_icon(r, &app.launch) {
             self.monogram(r, app);
         }
@@ -874,23 +911,20 @@ impl Renderer {
         (r.w as f32 * image::ICON_RADIUS) as f64
     }
 
-    /// The built-ins' icons: white glyphs on black. Returns false for other apps.
+    /// The built-ins' icons, in the light form: black glyphs on a white tile with an outline, like the app icons.
+    /// They are part of the page, so dark mode inverts them into the dark form (white glyphs on a black tile).
+    /// Returns false for other apps.
     fn glyph_icon(&mut self, r: Rect, launch: &Launch) -> bool {
-        let glyph: fn(&mut Renderer, f64, f64, f64) = match launch {
-            Launch::Settings => Renderer::gear,
+        let glyph: fn(&mut Renderer, f64, f64, f64, u8, u8) = match launch {
+            Launch::Settings => Renderer::gear_in,
             Launch::KindleMode => Renderer::book,
             Launch::Extensions => Renderer::four_squares,
             Launch::Store => Renderer::bag,
             _ => return false,
         };
-        self.rounded(r, Self::icon_radius(r), BLACK);
-        glyph(self, (r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64, r.w as f64);
+        self.rounded_frame(r, Self::icon_radius(r), 4, BLACK, WHITE);
+        glyph(self, (r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64, r.w as f64, BLACK, WHITE);
         true
-    }
-
-    /// Settings: a gear with eight teeth, centred at (`cx`, `cy`) on an icon of side `s`.
-    fn gear(&mut self, cx: f64, cy: f64, s: f64) {
-        self.gear_in(cx, cy, s, WHITE, BLACK);
     }
 
     /// The gear in colour `fg`, with its hole in `bg`.
@@ -908,15 +942,15 @@ impl Renderer {
         self.ctx.fill_path(&kurbo::Circle::new((cx, cy), 0.11 * s).to_path(0.1));
     }
 
-    /// The Kindle UI: an open book, two pages with lines of text.
-    fn book(&mut self, cx: f64, cy: f64, s: f64) {
+    /// The Kindle UI: an open book, two pages (`fg`) with lines of text (`bg`).
+    fn book(&mut self, cx: f64, cy: f64, s: f64, fg: u8, bg: u8) {
         let (pw, ph, gap) = (0.27 * s, 0.44 * s, 0.035 * s);
         for side in [-1.0, 1.0] {
             let x0 = if side < 0.0 { cx - gap / 2.0 - pw } else { cx + gap / 2.0 };
             self.ctx.set_transform(Affine::IDENTITY);
-            self.ctx.set_paint(gray(WHITE));
+            self.ctx.set_paint(gray(fg));
             self.ctx.fill_path(&kurbo::RoundedRect::new(x0, cy - ph / 2.0, x0 + pw, cy + ph / 2.0, 0.03 * s).to_path(0.1));
-            self.ctx.set_paint(gray(BLACK));
+            self.ctx.set_paint(gray(bg));
             for line in 0..4 {
                 let y = cy - ph / 2.0 + 0.09 * s + line as f64 * 0.085 * s;
                 self.ctx.fill_rect(&kurbo::Rect::new(x0 + 0.05 * s, y, x0 + pw - 0.05 * s, y + 0.025 * s));
@@ -924,22 +958,22 @@ impl Renderer {
         }
     }
 
-    /// Extensions: four rounded squares.
-    /// A shopping bag: a white body with a handle, for the Store tile.
-    fn bag(&mut self, cx: f64, cy: f64, s: f64) {
+    /// A shopping bag: a body with a handle (`fg`), for the Store tile.
+    fn bag(&mut self, cx: f64, cy: f64, s: f64, fg: u8, bg: u8) {
         self.ctx.set_transform(Affine::IDENTITY);
-        self.ctx.set_paint(gray(WHITE));
+        self.ctx.set_paint(gray(fg));
         self.ctx.fill_path(&kurbo::RoundedRect::new(cx - 0.3 * s, cy - 0.12 * s, cx + 0.3 * s, cy + 0.32 * s, 0.05 * s).to_path(0.1));
-        // The handle: a white frame, its inside the black of the tile.
+        // The handle: a frame, its inside the colour of the tile.
         self.ctx.fill_path(&kurbo::RoundedRect::new(cx - 0.16 * s, cy - 0.3 * s, cx + 0.16 * s, cy - 0.02 * s, 0.1 * s).to_path(0.1));
-        self.ctx.set_paint(gray(BLACK));
+        self.ctx.set_paint(gray(bg));
         self.ctx.fill_path(&kurbo::RoundedRect::new(cx - 0.1 * s, cy - 0.24 * s, cx + 0.1 * s, cy - 0.06 * s, 0.05 * s).to_path(0.1));
     }
 
-    fn four_squares(&mut self, cx: f64, cy: f64, s: f64) {
+    /// Extensions: four rounded squares.
+    fn four_squares(&mut self, cx: f64, cy: f64, s: f64, fg: u8, _bg: u8) {
         let (q, gap) = (0.2 * s, 0.07 * s);
         self.ctx.set_transform(Affine::IDENTITY);
-        self.ctx.set_paint(gray(WHITE));
+        self.ctx.set_paint(gray(fg));
         for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
             let x0 = if dx < 0.0 { cx - gap / 2.0 - q } else { cx + gap / 2.0 };
             let y0 = if dy < 0.0 { cy - gap / 2.0 - q } else { cy + gap / 2.0 };
@@ -1017,7 +1051,7 @@ impl Renderer {
         self.text(Text { text: title, x: 40.0, y: 50.0, w: (l.width - 80) as f32, size: 84.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
         let refresh = if ui.store_busy { "Refreshing" } else { "Refresh" };
         self.store_capsule(l.store_refresh(), refresh, false, BLACK);
-        self.store_capsule(l.store_done(), "Done", true, BLACK);
+        self.store_capsule(l.store_done(), "Exit", true, BLACK);
         let settings = l.store_settings_button();
         self.rounded_frame(settings, 50.0, 3, BLACK, WHITE);
         self.draw_icon(primitive_quick::icons::SETTINGS, (settings.x + 25) as f64, (settings.y + 25) as f64, 50.0, BLACK);
@@ -1563,7 +1597,7 @@ impl Renderer {
         let heading = ui.ext_title();
         let name_w = (l.done_button().x - 80) as f32;
         self.text(Text { text: &heading, x: 40.0, y: 38.0, w: name_w, size: 48.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), if ui.ext_depth() == 0 { "Done" } else { "Back" }, true);
+        self.button(l.done_button(), if ui.ext_depth() == 0 { "Exit" } else { "Back" }, true);
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         let per = l.list_rows_per_page();
         let items: Vec<_> = ui.ext_items().iter().skip(ui.ext_page * per).take(per).cloned().collect();
@@ -1601,7 +1635,7 @@ impl Renderer {
         let anchor = ui.menu_anchor();
         let ring = anchor.inset(-10);
         self.rounded_frame(ring, Self::icon_radius(ring), 4, BLACK, WHITE);
-        self.app_icon(anchor, &app, icon_blits);
+        self.app_icon(anchor, &app, s.dark_mode, icon_blits);
     }
 
     /// The app menu's box beside the icon: the app's name, then one row per action (a pop-up, drawn last).
@@ -1759,7 +1793,7 @@ impl Renderer {
     fn settings_home(&mut self, ui: &Ui, s: &Status) {
         let l = ui.layout;
         self.text(Text { text: "Settings", x: 40.0, y: 36.0, w: 700.0, size: 64.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), "Done", true);
+        self.button(l.done_button(), "Exit", true);
         let viewport = l.settings_viewport();
         self.ctx.set_transform(Affine::IDENTITY);
         self.ctx.push_clip_rect(&krect(viewport));
@@ -2109,10 +2143,11 @@ impl Renderer {
         self.rounded_frame(b, POPUP_RADIUS as f64, 6, BLACK, WHITE);
         let inner = b.inset(48);
         self.text(Text { text: "Power", x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.text(Text { text: "Restart starts the Kindle again. Power off turns it off until you press its power button.", x: inner.x as f32, y: (inner.y + 80) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 3, gray: 85 });
+        self.text(Text { text: "Kindle UI opens the stock Kindle screens. Restart starts the Kindle again. Power off turns it off until you press its power button.", x: inner.x as f32, y: (inner.y + 80) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 3, gray: 85 });
         for (button, r) in l.power_buttons() {
             let (label, primary) = match button {
                 Button::PowerCancel => ("Cancel", false),
+                Button::PowerKindleUi => ("Kindle UI", true),
                 Button::PowerRestart => ("Restart", true),
                 _ => ("Power off", true),
             };
@@ -2336,6 +2371,14 @@ fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, radius: f32) {
     }
 }
 
+/// Blit an icon tile at `r` (inside its rounded square only over a wallpaper, so the corners show it) and return
+/// its rounded square, which dark mode keeps as it is: the tile is already in the form for the theme.
+fn blit_icon(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, over_wallpaper: bool) -> (image::Area, f32) {
+    let radius = r.w as f32 * image::ICON_RADIUS;
+    blit(out, width, r, tile, if over_wallpaper { radius } else { 0.0 });
+    ((r.x, r.y, r.w, r.h), radius)
+}
+
 /// Turn a screen buffer upside down (rotation by 180°), in place.
 pub fn turn_half(buf: &mut [u8]) {
     buf.reverse();
@@ -2396,25 +2439,35 @@ pub fn sleep_image(path: &std::path::Path, w: u32, h: u32) -> Result<GrayImage, 
     image::picture_tile(&bytes, w, h)
 }
 
-/// The dithered rounded-square icon tile for `app`, of side `w` (`h` is the same), from its `# Icon:` data or file. With `cache`, tiles
-/// are read from and written to that folder (keyed by the source bytes and size). `Ok(None)` when the app
-/// has no icon.
+/// The dithered rounded-square icon tile for `app`, of side `w` (`h` is the same), from its `# Icon:` data or file:
+/// its light form. With `cache`, tiles are read from and written to that folder (keyed by the source bytes and
+/// size). `Ok(None)` when the app has no icon.
 pub fn app_icon(app: &App, w: u32, h: u32, cache: Option<&std::path::Path>) -> Result<Option<GrayImage>, String> {
-    let bytes = match &app.icon {
-        IconSource::None => return Ok(None),
-        IconSource::Data(b64) => kl_core::base64::decode(b64).ok_or("icon: bad base64")?,
-        IconSource::File(path) => std::fs::read(path).map_err(|e| format!("icon {path}: {e}"))?,
-        IconSource::Bundled(bytes) => bytes.to_vec(),
-    };
-    let key = image::cache_key(&bytes, w, h);
+    match app.icon.light_png()? {
+        Some(bytes) => form_tile(&bytes, w, h, false, cache).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The tile of `app`'s dark form (`app_icon` for dark mode), when it has one: a bundled icon's `-dark` PNG, or
+/// `icon-dark.png` beside an `icon.png`. `Ok(None)` when it has none; the light form is drawn in both themes.
+pub fn dark_app_icon(app: &App, w: u32, h: u32, cache: Option<&std::path::Path>) -> Result<Option<GrayImage>, String> {
+    match app.icon.dark_png() {
+        Some(bytes) => form_tile(&bytes, w, h, true, cache).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn form_tile(bytes: &[u8], w: u32, h: u32, dark: bool, cache: Option<&std::path::Path>) -> Result<GrayImage, String> {
+    let key = image::form_cache_key(bytes, w, h, dark);
     if let Some(dir) = cache {
         if let Some(tile) = std::fs::read(dir.join(&key)).ok().and_then(|b| image::from_cache(&b)) {
             if (tile.width, tile.height) == (w, h) {
-                return Ok(Some(tile));
+                return Ok(tile);
             }
         }
     }
-    let tile = image::icon_tile(&bytes, w.min(h))?;
+    let tile = if dark { image::dark_icon_tile(bytes, w.min(h))? } else { image::icon_tile(bytes, w.min(h))? };
     if let Some(dir) = cache {
         let _ = std::fs::create_dir_all(dir);
         let tmp = dir.join(format!("{key}.tmp"));
@@ -2422,18 +2475,30 @@ pub fn app_icon(app: &App, w: u32, h: u32, cache: Option<&std::path::Path>) -> R
             let _ = std::fs::rename(&tmp, dir.join(&key));
         }
     }
-    Ok(Some(tile))
+    Ok(tile)
 }
 
-/// Load the icon tiles of every app into the renderer. Returns the problems (bad icons draw as monograms).
+/// Load the icon tiles of every app into the renderer, both forms: the light form, and the dark form when the
+/// app has one (drawn in dark mode, so a theme change needs no reload). Returns the problems (bad icons draw as
+/// monograms; a bad dark form leaves the light one in both themes).
 pub fn load_icons(renderer: &mut Renderer, apps: &[App], layout: &Layout, cache: Option<&std::path::Path>) -> Vec<String> {
     let icon = layout.icon(0);
+    let (w, h) = (icon.w as u32, icon.h as u32);
     let mut problems = Vec::new();
     for app in apps {
-        match app_icon(app, icon.w as u32, icon.h as u32, cache) {
+        renderer.icons.remove(&dark_icon_key(&app.id));
+        match app_icon(app, w, h, cache) {
             Ok(Some(tile)) => renderer.set_icon(&app.id, tile),
+            Ok(None) => continue,
+            Err(e) => {
+                problems.push(format!("{}: {e}", app.name));
+                continue;
+            }
+        }
+        match dark_app_icon(app, w, h, cache) {
+            Ok(Some(tile)) => renderer.set_dark_icon(&app.id, tile),
             Ok(None) => {}
-            Err(e) => problems.push(format!("{}: {e}", app.name)),
+            Err(e) => problems.push(format!("{} (dark icon): {e}", app.name)),
         }
     }
     problems
@@ -2467,7 +2532,7 @@ mod tests {
         let kindle = App {
             id: "kindle".into(),
             name: "Kindle UI".into(),
-            icon: IconSource::Bundled(kl_core::apps::KINDLE_UI_ICON),
+            icon: IconSource::Bundled { light: kl_core::apps::KINDLE_UI_ICON, dark: None },
             launch: Launch::KindleMode,
             dir: "/".into(),
             order: None,
@@ -2479,6 +2544,108 @@ mod tests {
         // The reader's silhouette is black; the sky above it is a mid gray.
         assert!(tile.pixels.iter().filter(|&&p| p == 0).count() > 184 * 184 / 5);
         assert!(tile.pixels.iter().any(|&p| p > 60 && p < 200));
+    }
+
+    fn bundled(id: &str, icon: IconSource) -> App {
+        App { id: id.into(), name: id.into(), icon, launch: Launch::Shell { command: "true".into() }, dir: "/".into(),
+            order: None, hidden: false, background: false }
+    }
+
+    fn store_app() -> App {
+        let (apps, _) = kl_core::apps::merge(Vec::new(), &kl_core::Config::default());
+        apps.into_iter().find(|app| app.launch == Launch::Store).unwrap()
+    }
+
+    #[test]
+    fn the_theme_picks_the_dark_form_when_there_is_one() {
+        let mut icons = HashMap::new();
+        icons.insert("a.sh".to_string(), GrayImage::blank(4, 4));
+        icons.insert("b.sh".to_string(), GrayImage::blank(4, 4));
+        icons.insert(dark_icon_key("b.sh"), GrayImage::blank(4, 4));
+        assert_eq!(icon_key_for_theme(&icons, "b.sh", false), "b.sh");
+        assert_eq!(icon_key_for_theme(&icons, "b.sh", true), dark_icon_key("b.sh"));
+        assert_eq!(icon_key_for_theme(&icons, "a.sh", true), "a.sh", "no dark form: the light one in dark mode");
+    }
+
+    #[test]
+    fn a_bundled_icon_makes_a_tile_of_each_form_and_a_file_icon_takes_the_file_beside_it() {
+        let store = store_app();
+        let light = app_icon(&store, 184, 184, None).unwrap().unwrap();
+        let dark = dark_app_icon(&store, 184, 184, None).unwrap().unwrap();
+        assert_eq!((light.pixels[92 * 184 + 1], dark.pixels[92 * 184 + 1]), (BLACK, WHITE), "the outline");
+        assert_eq!((light.pixels[92 * 184 + 8], dark.pixels[92 * 184 + 8]), (WHITE, BLACK), "the tile inside it");
+        let dir = std::env::temp_dir().join(format!("kl-render-file-forms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("icon.png"), kl_core::apps::KINDLE_UI_ICON).unwrap();
+        let file = bundled("f.sh", IconSource::File(dir.join("icon.png").to_string_lossy().into_owned()));
+        assert!(app_icon(&file, 184, 184, None).unwrap().is_some());
+        assert!(dark_app_icon(&file, 184, 184, None).unwrap().is_none(), "no icon-dark.png beside it");
+        std::fs::write(dir.join("icon-dark.png"), store.icon.dark_png().unwrap()).unwrap();
+        assert_eq!(dark_app_icon(&file, 184, 184, None).unwrap().unwrap(), dark);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_bundled_icon_is_a_white_tile_in_light_form_and_a_black_tile_in_dark_form() {
+        let dir = std::env::temp_dir().join(format!("kl-render-forms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["Blocks", "Calculator", "Cards", "Cascade", "Chess", "Crossword", "Focus", "Hello", "Minesweeper",
+            "Notes", "Ships", "Solitaire", "Sudoku", "Words"] {
+            std::fs::write(dir.join(format!("{name}.sh")), "# Author: Primitive AI\n").unwrap();
+        }
+        let (apps, _) = kl_core::discover(&dir, &kl_core::Config::default());
+        assert_eq!(apps.iter().filter(|app| matches!(app.icon, IconSource::Bundled { .. })).count(), 15);
+        for app in apps.iter().filter(|app| matches!(app.icon, IconSource::Bundled { .. })) {
+            let ring = |png: Vec<u8>| {
+                let img = image::decode_png(&png).unwrap();
+                let (w, h) = (img.width as usize, img.height as usize);
+                let edge: Vec<u32> = (0..w).flat_map(|x| [x, (h - 1) * w + x]).map(|i| img.pixels[i] as u32).collect();
+                edge.iter().sum::<u32>() / edge.len() as u32
+            };
+            assert_eq!(ring(app.icon.light_png().unwrap().unwrap()), 255, "{}: light form", app.id);
+            assert_eq!(ring(app.icon.dark_png().unwrap()), 0, "{}: dark form", app.id);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_icon_in_the_form_for_the_theme_shows_as_its_png() {
+        let store = store_app();
+        let (size, width) = (184, 200);
+        let r = Rect::new(8, 8, size as i32, size as i32);
+        let centre = |screen: &[u8]| screen[(r.y as usize + 92) * width + r.x as usize + 92];
+        let png_centre = |png: Vec<u8>| {
+            let img = image::decode_png(&png).unwrap();
+            img.pixels[(img.height / 2 * img.width + img.width / 2) as usize]
+        };
+        for over_wallpaper in [false, true] {
+            // Light mode: the light form, drawn as it is.
+            let light = app_icon(&store, size, size, None).unwrap().unwrap();
+            let mut screen = vec![WHITE; width * width];
+            blit_icon(&mut screen, width, r, &light, over_wallpaper);
+            assert_eq!(centre(&screen), png_centre(store.icon.light_png().unwrap().unwrap()));
+
+            // Dark mode: the dark form, kept out of the inversion (not inverted a second time).
+            let dark = dark_app_icon(&store, size, size, None).unwrap().unwrap();
+            let mut screen = vec![WHITE; width * width];
+            let picture = blit_icon(&mut screen, width, r, &dark, over_wallpaper);
+            image::invert_except(&mut screen, width, &[picture], None);
+            let dark_png = store.icon.dark_png().unwrap();
+            assert_eq!(centre(&screen), png_centre(dark_png.clone()));
+            assert_ne!(centre(&screen), png_centre(store.icon.light_png().unwrap().unwrap()));
+            for y in 0..size as usize {
+                for x in 0..size as usize {
+                    let inside = image::rect_distance(x as i32, y as i32, r.w, r.h, picture.1) < 0.0;
+                    if inside {
+                        assert_eq!(screen[(r.y as usize + y) * width + r.x as usize + x], dark.pixels[y * size as usize + x]);
+                    }
+                }
+            }
+            assert_eq!(screen[0], BLACK, "the page around it is dark");
+            assert_eq!(screen[(r.y as usize + 1) * width + r.x as usize + 1], BLACK, "so is the corner outside the tile");
+        }
     }
 
     #[test]

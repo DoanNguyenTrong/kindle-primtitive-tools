@@ -140,9 +140,11 @@ pub fn profile_input(name: &str, password: Option<&str>) -> String {
         out.push('"');
         out
     };
+    // The Kindle's profile parser rejects a `store_nw_user_pref` field (a parse error, nothing saved): the tested
+    // one-line form without it saves. Keep the input to these fields.
     match password {
-        Some(pw) => format!("[{{ essid = {}, secured = \"yes\", psk = {}, store_nw_user_pref = 0 }}]\n", quote(name), quote(pw)),
-        None => format!("[{{ essid = {}, secured = \"no\", store_nw_user_pref = 0 }}]\n", quote(name)),
+        Some(pw) => format!("[{{ essid = {}, secured = \"yes\", psk = {} }}]\n", quote(name), quote(pw)),
+        None => format!("[{{ essid = {}, secured = \"no\" }}]\n", quote(name)),
     }
 }
 
@@ -292,7 +294,8 @@ Hash Index: 4
     #[test]
     fn the_profile_input_escapes_and_keeps_open_networks_free_of_a_password() {
         let open = profile_input("Guest \"cafe\"", None);
-        assert_eq!(open, "[{ essid = \"Guest \\\"cafe\\\"\", secured = \"no\", store_nw_user_pref = 0 }]\n");
+        assert_eq!(open, "[{ essid = \"Guest \\\"cafe\\\"\", secured = \"no\" }]\n");
+        assert!(!open.contains("store_nw_user_pref"), "{open}");
         let locked = profile_input("Home", Some("pa\\ss\"w0rd"));
         assert!(locked.contains("psk = \"pa\\\\ss\\\"w0rd\""), "{locked}");
         assert!(locked.starts_with("[{ essid = \"Home\", secured = \"yes\""));

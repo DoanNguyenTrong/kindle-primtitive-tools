@@ -245,6 +245,7 @@ pub enum Button {
     ConfirmCancel,
     ConfirmOpen,
     PowerCancel,
+    PowerKindleUi,
     PowerRestart,
     PowerOff,
     DarkMode,
@@ -1025,17 +1026,18 @@ impl Layout {
         self.confirm_box()
     }
 
-    /// The power menu's three buttons, in a row at the bottom of its box: Cancel, Restart, Power off.
-    pub fn power_buttons(&self) -> [(Button, Rect); 3] {
+    /// The power menu's four buttons, in a row at the bottom of its box: Cancel, Kindle UI, Restart, Power off.
+    pub fn power_buttons(&self) -> [(Button, Rect); 4] {
         let b = self.power_box();
         let gap = 20;
-        let bw = (b.w - 80 - 2 * gap) / 3;
+        let bw = (b.w - 80 - 3 * gap) / 4;
         let y = b.bottom() - 40 - BUTTON_H;
         let x = |i: i32| b.x + 40 + i * (bw + gap);
         [
             (Button::PowerCancel, Rect::new(x(0), y, bw, BUTTON_H)),
-            (Button::PowerRestart, Rect::new(x(1), y, bw, BUTTON_H)),
-            (Button::PowerOff, Rect::new(x(2), y, bw, BUTTON_H)),
+            (Button::PowerKindleUi, Rect::new(x(1), y, bw, BUTTON_H)),
+            (Button::PowerRestart, Rect::new(x(2), y, bw, BUTTON_H)),
+            (Button::PowerOff, Rect::new(x(3), y, bw, BUTTON_H)),
         ]
     }
 
