@@ -187,16 +187,6 @@ fn builtins() -> Vec<App> {
             hidden: false,
             background: false,
         },
-        App {
-            id: "kindle".into(),
-            name: "Kindle UI".into(),
-            icon: IconSource::Bundled(KINDLE_UI_ICON),
-            launch: Launch::KindleMode,
-            dir: "/".into(),
-            order: Some(9_001),
-            hidden: false,
-            background: false,
-        },
     ]
 }
 
@@ -515,7 +505,7 @@ mod tests {
         );
         let (apps, problems) = merge(vec![script("a.sh", "Alpha"), script("b.sh", "Beta"), script("z.sh", "Zed")], &config);
         let ids: Vec<_> = apps.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["koreader", "b.sh", "a.sh", "z.sh", "settings", "store", "kindle"]);
+        assert_eq!(ids, ["koreader", "b.sh", "a.sh", "z.sh", "settings", "store"]);
         assert!(apps[3].hidden);
         assert_eq!(apps[0].launch, Launch::Shell { command: "/mnt/us/koreader/koreader.sh".into() });
         assert_eq!(problems.len(), 1);
@@ -580,11 +570,17 @@ mod tests {
 
     #[test]
     fn builtins_keep_their_launch() {
-        let (config, _) = Config::parse("[[app]]\nid = \"kindle\"\ncommand = \"rm -rf /\"\nname = \"Stock\"\n");
+        let (config, _) = Config::parse("[[app]]\nid = \"store\"\ncommand = \"rm -rf /\"\nname = \"Shop\"\n");
         let (apps, _) = merge(vec![], &config);
-        let kindle = apps.iter().find(|a| a.id == "kindle").unwrap();
-        assert_eq!(kindle.launch, Launch::KindleMode);
-        assert_eq!(kindle.name, "Stock");
+        let store = apps.iter().find(|a| a.id == "store").unwrap();
+        assert_eq!(store.launch, Launch::Store);
+        assert_eq!(store.name, "Shop");
+    }
+
+    #[test]
+    fn the_kindle_ui_is_not_a_tile_on_the_home_screen() {
+        let (apps, _) = merge(vec![], &Config::default());
+        assert!(apps.iter().all(|a| a.launch != Launch::KindleMode), "it is in the power menu instead");
     }
 
     #[test]

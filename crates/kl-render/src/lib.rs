@@ -2126,10 +2126,11 @@ impl Renderer {
         self.rounded_frame(b, POPUP_RADIUS as f64, 6, BLACK, WHITE);
         let inner = b.inset(48);
         self.text(Text { text: "Power", x: inner.x as f32, y: inner.y as f32, w: inner.w as f32, size: 50.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.text(Text { text: "Restart starts the Kindle again. Power off turns it off until you press its power button.", x: inner.x as f32, y: (inner.y + 80) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 3, gray: 85 });
+        self.text(Text { text: "Kindle UI opens the stock Kindle screens. Restart starts the Kindle again. Power off turns it off until you press its power button.", x: inner.x as f32, y: (inner.y + 80) as f32, w: inner.w as f32, size: 30.0, bold: false, align: Align::Start, lines: 3, gray: 85 });
         for (button, r) in l.power_buttons() {
             let (label, primary) = match button {
                 Button::PowerCancel => ("Cancel", false),
+                Button::PowerKindleUi => ("Kindle UI", true),
                 Button::PowerRestart => ("Restart", true),
                 _ => ("Power off", true),
             };
