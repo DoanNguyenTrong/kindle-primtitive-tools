@@ -73,6 +73,8 @@ pub struct StoreEntry {
     pub screenshots: usize,
     pub versions: Vec<VersionNotes>,
     pub availability: Option<String>,
+    /// What the owner's Kindle means for this app, shown on its page ("Not tested on your Kindle yet").
+    pub device_note: Option<String>,
     /// A known launcher entry can be opened through the supervisor.
     pub launchable: bool,
 }
@@ -142,6 +144,13 @@ pub fn change_lines(c: &Changes) -> Vec<String> {
     lines
 }
 
+/// Whether a listing is shown for this device: an app with no package for the device's architecture is hidden (a
+/// link is always shown: it installs nothing). The firmware range is not a reason to hide anything.
+pub fn listed_for_device(listing: &Listing, device: &Device) -> bool {
+    listing.source == Source::Link
+        || listing.versions.iter().any(|v| v.withdrawn.is_none() && v.assets.contains_key(&device.arch))
+}
+
 impl StoreEntry {
     /// The entry for a listing, given what is installed under its id.
     pub fn from_listing(listing: &Listing, installed: Option<&Installed>) -> StoreEntry {
@@ -156,6 +165,16 @@ impl StoreEntry {
             Ok(version) => Self::from_selection(listing, installed, Some(version), Some(&device.arch), None),
             Err(error) => Self::from_selection(listing, installed, None, None, Some(error.to_string())),
         }
+    }
+
+    /// The page note for a model: a model not in the listing's `tested_on` is not tested yet. `model` is the catalog
+    /// name of the Kindle, or `None` when the launcher could not tell which Kindle this is.
+    pub fn note_for_model(&mut self, model: Option<&str>) {
+        self.device_note = Some(match model {
+            Some(name) if self.tested_on.iter().any(|tested| tested == name) => return,
+            Some(_) => "Not tested on your Kindle yet".to_string(),
+            None => "Your Kindle model is not known. Not tested on it yet".to_string(),
+        });
     }
 
     fn from_selection(listing: &Listing, installed: Option<&Installed>, newest: Option<&VersionEntry>, arch: Option<&str>, availability: Option<String>) -> StoreEntry {
@@ -209,6 +228,7 @@ impl StoreEntry {
             screenshots: listing.screenshots.len().min(2),
             versions,
             availability,
+            device_note: None,
             launchable: installed.and_then(crate::store_open::entry_file).is_some(),
         }
     }
@@ -236,6 +256,7 @@ impl StoreEntry {
             screenshots: 0,
             versions: Vec::new(),
             availability: None,
+            device_note: None,
             launchable: crate::store_open::entry_file(app).is_some(),
         }
     }
@@ -270,14 +291,18 @@ impl StoreEntry {
 
     /// The information rows of the product page: label and value, in the order the page shows them.
     pub fn info_rows(&self) -> Vec<(String, String)> {
-        let mut rows = vec![
+        let mut rows = Vec::new();
+        if let Some(note) = &self.device_note {
+            rows.push(("Your Kindle".to_string(), note.clone()));
+        }
+        rows.extend([
             ("Developer".to_string(), self.developer.clone()),
             ("Licence".to_string(), self.licence.clone()),
             ("Category".to_string(), self.categories.iter().map(|c| capitalise(c)).collect::<Vec<_>>().join(", ")),
             ("Kindle firmware".to_string(), if self.firmware_min.is_empty() { String::new() } else { format!("{} or later", self.firmware_min) }),
             ("Tested on".to_string(), if self.tested_on.is_empty() { "Not yet".to_string() } else { self.tested_on.join(", ") }),
             ("Repository".to_string(), self.repo.trim_start_matches("https://").to_string()),
-        ];
+        ]);
         for line in &self.changes {
             rows.push(("Change".to_string(), line.clone()));
         }
@@ -334,6 +359,7 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
         screenshots: 0,
         versions: Vec::new(),
         availability: None,
+        device_note: None,
         launchable: false,
     }
 }
@@ -341,6 +367,39 @@ pub(crate) fn test_entry(id: &str, name: &str, status: Status) -> StoreEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn device_for(arch: &str) -> kl_store::resolve::Device {
+        kl_store::resolve::Device { arch: arch.into(), firmware: kl_store::Version::parse("5.18.2").unwrap() }
+    }
+
+    #[test]
+    fn an_app_without_a_package_for_the_device_arch_is_not_listed() {
+        let listing = sample_listing();
+        assert!(listed_for_device(&listing, &device_for("armhf")));
+        assert!(!listed_for_device(&listing, &device_for("armel")), "the sample has only armhf packages");
+    }
+
+    #[test]
+    fn firmware_never_hides_an_app() {
+        let mut listing = sample_listing();
+        for version in &mut listing.versions {
+            version.firmware = kl_store::catalog::Firmware { min: "9.9.9".into(), max: None };
+        }
+        assert!(listed_for_device(&listing, &device_for("armhf")));
+    }
+
+    #[test]
+    fn a_model_not_in_tested_on_gets_the_untested_note_and_the_tested_one_does_not() {
+        let listing = sample_listing();
+        let mut entry = StoreEntry::for_device(&listing, None, &device_for("armhf"));
+        entry.note_for_model(Some("KindleOasis3"));
+        assert_eq!(entry.device_note, None, "the sample is tested on the Oasis 3");
+        entry.note_for_model(Some("KindlePaperwhite5"));
+        assert_eq!(entry.device_note.as_deref(), Some("Not tested on your Kindle yet"));
+        entry.note_for_model(None);
+        assert_eq!(entry.device_note.as_deref(), Some("Your Kindle model is not known. Not tested on it yet"));
+        assert!(entry.info_rows().first().is_some_and(|(label, _)| label == "Your Kindle"));
+    }
+
     fn sample_listing() -> Listing {
         serde_json::from_str(
             r#"{
