@@ -1,4 +1,39 @@
 //! A native app's event loop, screen output, and local persistence.
+//!
+//! An app implements `App` and hands it to `run`. The kit reads the display settings, draws each frame, sends taps,
+//! swipes and page buttons to the app, saves its data at sleep and exit, and handles USB drive mode.
+//!
+//! # Under Primitive Launcher (the system layer)
+//!
+//! Primitive Launcher stays in charge of the Kindle while an app is open. It owns the power button, sleep and wake,
+//! the lock screen, quick settings, the power menu and the theme (`docs/system-architecture.md` and
+//! `docs/contracts.md` §1.1 in the umbrella repo). It starts the app with `PRIMITIVE_LAUNCHER=1`; `run` reads that
+//! once into `under_launcher`. When it is set, the kit does the app's part of the contract, and the app needs no code
+//! of its own for it:
+//!
+//! - **SIGUSR1 asks for a redraw.** The kit sets a handler that only marks the request; a thread wakes the event loop.
+//!   Without the launcher the kit leaves SIGUSR1 alone, and the signal ends the app.
+//! - **The redraw order.** Each time the loop wakes, it takes a waiting request first, before the event that woke it:
+//!   it reads `dark_mode` again from the launcher's `settings.txt`, and draws the whole screen once. An event that
+//!   waited while the app was frozen under quick settings is handled in the same pass, so nothing is drawn in the old
+//!   theme first. A request that comes while the app sleeps waits for the wake.
+//! - **Wake.** The launcher puts the app's saved screen back after the sleep picture, so the kit draws nothing on
+//!   wake. Only when a redraw was asked for while the app slept does it draw the whole screen, with a full update.
+//! - **No flash on the redraw.** The redraw for a request uses `Display::show_calm` (`primitive_app::display`): the
+//!   whole screen with GC16 in partial mode, which changes the pixels without a flash. The launcher has just flashed
+//!   the screen for the theme switch, and a second flash would show the inverse of the new theme (the old one) for a
+//!   moment.
+//! - **The system swipe.** A swipe down from the top edge (it starts in the top 160 px, moves more than 150 px down,
+//!   and is mostly vertical) opens the launcher's quick settings. The kit drops it, so the app never gets it in
+//!   `App::input` or `App::swipe`. Other swipes from the top edge (up, or sideways) still reach the app.
+//!
+//! The app's library entry declares `# Wake: redraw` in its first ten lines and ignores SIGUSR1 in its own shell
+//! (`[ "${PRIMITIVE_LAUNCHER:-0}" = 1 ] && trap '' USR1`), as the app template's `deploy/Hello.sh` does.
+//!
+//! What an app on this kit must not do: put the Kindle to sleep, draw a lock screen or its own quick settings, load or
+//! unload the stock screensaver, or offer its own light or dark switch. Under the launcher keep
+//! `App::preferred_dark_mode` at `None` and leave `dark_mode` out of the app's own `settings.txt`: both still override
+//! the system theme in this kit.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -47,7 +82,8 @@ pub trait App {
         None
     }
 
-    /// Override the inherited interface colors. Pictures retain their original shades.
+    /// Override the inherited interface colors. Pictures retain their original shades. Under Primitive Launcher the
+    /// app follows the system theme: keep this `None` there (see the module docs).
     fn preferred_dark_mode(&self) -> Option<bool> {
         None
     }
@@ -281,14 +317,14 @@ extern "C" fn on_redraw(_: libc::c_int) {
     REDRAW.store(true, Ordering::Relaxed);
 }
 
-/// Under Primitive Launcher the app answers the redraw signal: SIGUSR1 is turned into `Event::Redraw`. Without the
-/// launcher the signal is left alone.
 /// The swipe that opens quick settings under the launcher: down from the top edge, the launcher's own rule
 /// (`opens_quick_settings` in kl-launcher; the status bar is 120 px, plus 40 px of slack).
 fn is_system_swipe(input: Input) -> bool {
     matches!(input, Input::Swipe { dx, dy, start_y } if dy > 150.0 && dy.abs() > dx.abs() * 1.5 && start_y <= 160.0)
 }
 
+/// Under Primitive Launcher the app answers the redraw signal: SIGUSR1 marks `REDRAW`, and this thread wakes the
+/// loop with `Event::Redraw`. Without the launcher the signal is left alone.
 fn follow_redraw_signal(events: mpsc::Sender<Event>) {
     // SAFETY: the handler only stores to an atomic, which is safe in a signal handler.
     unsafe { libc::signal(libc::SIGUSR1, on_redraw as *const () as libc::sighandler_t) };
