@@ -529,7 +529,13 @@ pub fn run(mut app: impl App, app_dir: &Path) -> Result<(), String> {
             Change::Exit => break,
             Change::None | Change::Partial | Change::Full => {
                 let image = frame(&app, &mut canvas, settings.dark_mode);
-                display.show(image, &settings, change == Change::Full);
+                if redraw_now && change == Change::Full {
+                    // The launcher flashed the screen when the theme changed; a second flash would show the old
+                    // theme for a moment (the inverse of the new one).
+                    display.show_calm(image, &settings);
+                } else {
+                    display.show(image, &settings, change == Change::Full);
+                }
             }
         }
     }

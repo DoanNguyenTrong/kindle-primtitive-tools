@@ -75,6 +75,34 @@ impl Display {
         }
     }
 
+    /// Show the whole of `upright` without the flash of a full update (GC16 in partial mode). For a redraw the
+    /// launcher asks for after a theme switch: the launcher has just flashed the screen, and a flash here would show
+    /// the inverse of the new theme, which is the old one, for a moment.
+    pub fn show_calm(&mut self, upright: Vec<u8>, settings: &Settings) {
+        let fb_turn = self.fb_turn();
+        let frame = kl_render::for_panel(upright, settings.rotation, fb_turn);
+        let Some(panel) = self.panel.as_mut() else {
+            self.last = frame;
+            return;
+        };
+        let t = Instant::now();
+        match panel.draw(W, (0, 0, W, H), &frame, eink::WAVE_GC16, false) {
+            Ok(true) => {
+                self.presented_frame = true;
+                self.last = frame;
+                log(&format!("draw GC16 calm {W}x{H} in {} ms (fb turn {fb_turn})", t.elapsed().as_millis()));
+            }
+            Ok(false) => {
+                self.last.clear();
+                log("draw: the framebuffer is not in a drawable state");
+            }
+            Err(e) => {
+                self.last.clear();
+                log(&format!("draw: {e}"));
+            }
+        }
+    }
+
     /// Show only `area` of `upright` (a pop-up), leaving the rest of the panel as it is. The next `show` draws
     /// the whole screen, as what is on the panel is no longer known.
     pub fn show_region(&mut self, upright: Vec<u8>, area: kl_core::Rect, settings: &Settings) {
