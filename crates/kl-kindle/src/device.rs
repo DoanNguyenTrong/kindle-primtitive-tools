@@ -72,3 +72,11 @@ pub fn platform_codename() -> Option<String> {
 pub fn detected_model() -> Option<&'static kl_core::models::Model> {
     platform_codename().and_then(|codename| kl_core::models::model_for_codename(&codename))
 }
+
+/// The catalog name of the Kindle model the launcher recorded in `device.txt`. `None` when the model is unknown (or the
+/// launcher has not written the file yet): the Store then says the model is not known.
+pub fn launcher_model(launcher: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(launcher.join("device.txt")).ok()?;
+    let id = text.lines().find_map(|line| line.strip_prefix("model="))?.trim();
+    kl_core::models::model_by_id(id).map(|model| model.catalog_name.to_string())
+}
