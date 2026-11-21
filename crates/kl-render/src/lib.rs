@@ -2424,9 +2424,11 @@ fn blit(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, radius: f32, cl
 
 /// Blit an icon tile at `r` (inside its rounded square only over a wallpaper, so the corners show it) and return
 /// its rounded square, which dark mode keeps as it is: the tile is already in the form for the theme.
+/// An icon's tile with its picture rectangle and corner radius (the tests draw icons this way).
+#[cfg(test)]
 fn blit_icon(out: &mut [u8], width: usize, r: Rect, tile: &GrayImage, over_wallpaper: bool) -> (image::Area, f32) {
     let radius = r.w as f32 * image::ICON_RADIUS;
-    blit(out, width, r, tile, if over_wallpaper { radius } else { 0.0 });
+    blit(out, width, r, tile, if over_wallpaper { radius } else { 0.0 }, None);
     ((r.x, r.y, r.w, r.h), radius)
 }
 
