@@ -105,6 +105,11 @@ pub struct Renderer {
     usb_picture: Option<GrayImage>,
     /// Store pictures (screenshots) to draw over the store's product page, collected while it is drawn.
     store_blits: Vec<(Rect, String)>,
+    /// The controls of the last frame drawn: each one's rectangle and corner radius, in drawing order. A tap on one of
+    /// them shows that control reversed before its action runs (`press_frame`).
+    targets: Vec<(Rect, f64)>,
+    /// The control a tap has touched, drawn reversed (black and white swapped) by `draw`.
+    press: Option<Rect>,
 }
 
 /// The sizes of a store icon's tiles (a row, the featured card, the product page), and a screenshot's size.
@@ -204,6 +209,8 @@ impl Renderer {
             sleep_image: None,
             backdrop: None,
             store_blits: Vec::new(),
+            targets: Vec::new(),
+            press: None,
             usb_picture: None,
         })
     }
@@ -479,8 +486,36 @@ impl Renderer {
 
     // ----- screens -----
 
-    /// Draw the current screen. Returns `width × height` gray pixels, upright.
+    /// Draw the current screen. Returns `width × height` gray pixels, upright. The controls drawn are recorded for
+    /// `press_frame`, and a pressed control is reversed.
     pub fn draw(&mut self, ui: &Ui, status: &Status) -> Vec<u8> {
+        self.targets.clear();
+        let mut out = self.draw_frame(ui, status);
+        if let Some(r) = self.press {
+            let width = ui.layout.width as usize;
+            let radius = self.targets.iter().find(|(t, _)| *t == r).map_or(0.0, |(_, radius)| *radius);
+            invert_control(&mut out, width, r, radius);
+        }
+        out
+    }
+
+    /// The frame for a tap at (x, y) on the screen last drawn: the frame with the control under the tap reversed, or
+    /// `None` when the tap is not on a control. The app shows it before the tap's action runs, so the tap is seen at
+    /// once.
+    pub fn press_frame(&mut self, ui: &Ui, status: &Status, x: f32, y: f32) -> Option<Vec<u8>> {
+        let target = self.targets.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(r, _)| *r)?;
+        self.press = Some(target);
+        let frame = self.draw(ui, status);
+        self.press = None;
+        Some(frame)
+    }
+
+    /// Record a control for the tap feedback (see `draw`).
+    fn touch(&mut self, r: Rect, radius: f64) {
+        self.targets.push((r, radius));
+    }
+
+    fn draw_frame(&mut self, ui: &Ui, status: &Status) -> Vec<u8> {
         let launcher = !matches!(ui.screen, Screen::Store | Screen::StoreApp);
         self.large_text = launcher && status.large_text;
         self.high_contrast = launcher && status.high_contrast;
@@ -860,6 +895,7 @@ impl Renderer {
 
     /// A round button with a bar (−) or a bar and a bar (+) in its middle, as Primitive Browser's level rows.
     fn round_button(&mut self, r: Rect, plus: bool) {
+        self.touch(r, r.w as f64 / 2.0);
         self.rounded_frame(r, r.w as f64 / 2.0, 2, BLACK, WHITE);
         let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
         self.fill(Rect::new(cx - 18, cy - 2, 36, 4), BLACK);
@@ -1037,6 +1073,7 @@ impl Renderer {
     }
 
     fn button(&mut self, r: Rect, label: &str, filled: bool) {
+        self.touch(r, 16.0);
         let (bg, fg) = if filled { (BLACK, WHITE) } else { (WHITE, BLACK) };
         self.rounded_frame(r, 16.0, 4, BLACK, bg);
         let size = 36.0;
@@ -1171,6 +1208,7 @@ impl Renderer {
     }
 
     fn store_feature_card(&mut self, e: &kl_core::store::StoreEntry, f: Rect) {
+        self.touch(f, 48.0);
         self.rounded(f, 48.0, BLACK);
         self.text(Text { text: "Featured", x: (f.x + 56) as f32, y: (f.y + 56) as f32, w: 600.0, size: 26.0, bold: true, align: Align::Start, lines: 1, gray: WHITE });
         self.text(Text { text: &e.name, x: (f.x + 56) as f32, y: (f.y + 100) as f32, w: (f.w - 56 * 2 - 240) as f32, size: 68.0, bold: true, align: Align::Start, lines: 2, gray: WHITE });
@@ -1237,6 +1275,7 @@ impl Renderer {
     /// An action pill: filled (primary) or outlined, with its label centred.
     fn store_capsule(&mut self, r: Rect, label: &str, primary: bool, outline_ink: u8) {
         let radius = r.h as f64 / 2.0;
+        self.touch(r, radius);
         let ink = if primary { WHITE } else { outline_ink };
         if primary {
             self.rounded(r, radius, BLACK);
@@ -1273,6 +1312,7 @@ impl Renderer {
         let names = ["Today", "Apps", "Updates", "Search"];
         for (i, name) in names.iter().enumerate() {
             let r = l.store_tab(i);
+            self.touch(r, r.h as f64 / 2.0);
             let on = i == active;
             if on {
                 self.rounded(r, r.h as f64 / 2.0, BLACK);
@@ -1986,6 +2026,7 @@ impl Renderer {
     /// buttons for a level, a pill for "Show all", a chevron for something that opens.
     fn setting_row(&mut self, ui: &Ui, s: &Status, row: &kl_core::layout::SettingsRow) {
         let r = row.rect;
+        self.touch(r, 0.0);
         let value = row_value(row.row, ui, s);
         let level = match row.row {
             Row::Frontlight if s.display_support.front_light => Some(s.light),
@@ -2145,6 +2186,7 @@ impl Renderer {
 
     /// A card: a rounded outline with white inside (the grouped list's container).
     fn card(&mut self, r: Rect) {
+        self.touch(r, 22.0);
         self.rounded_frame(r, 22.0, 2, BLACK, WHITE);
     }
 
@@ -2566,9 +2608,90 @@ pub fn load_icons(renderer: &mut Renderer, apps: &[App], layout: &Layout, cache:
     problems
 }
 
+/// Reverse the pixels of a control (black and white swapped), inside its rounded shape only, so the corners of the
+/// screen behind it keep their colour.
+fn invert_control(out: &mut [u8], width: usize, r: Rect, radius: f64) {
+    if width == 0 {
+        return;
+    }
+    let rows = out.len() / width;
+    let x0 = r.x.max(0) as usize;
+    let x1 = (r.x + r.w).clamp(0, width as i32) as usize;
+    let y0 = r.y.max(0) as usize;
+    let y1 = (r.y + r.h).clamp(0, rows as i32) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if inside_rounded(x as i32 - r.x, y as i32 - r.y, r.w, r.h, radius) {
+                let i = y * width + x;
+                out[i] = 255 - out[i];
+            }
+        }
+    }
+}
+
+/// Whether the point (x, y), measured from a rectangle's top-left corner, lies inside its rounded shape.
+fn inside_rounded(x: i32, y: i32, w: i32, h: i32, radius: f64) -> bool {
+    let rad = radius.min(w as f64 / 2.0).min(h as f64 / 2.0);
+    let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+    let corner = |cx: f64, cy: f64| (px - cx).powi(2) + (py - cy).powi(2) <= rad * rad;
+    if rad <= 0.0 {
+        return true;
+    }
+    if px < rad && py < rad {
+        return corner(rad, rad);
+    }
+    if px > w as f64 - rad && py < rad {
+        return corner(w as f64 - rad, rad);
+    }
+    if px < rad && py > h as f64 - rad {
+        return corner(rad, h as f64 - rad);
+    }
+    if px > w as f64 - rad && py > h as f64 - rad {
+        return corner(w as f64 - rad, h as f64 - rad);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tap on a control reverses that control and nothing else. Needs the Noto Sans fonts: set `KL_TEST_FONTS` to
+    /// the folder that holds them (the launcher's `assets/fonts`), otherwise the test does nothing.
+    #[test]
+    fn a_tap_on_a_control_reverses_that_control_only() {
+        let Ok(dir) = std::env::var("KL_TEST_FONTS") else { return };
+        let fonts = vec![format!("{dir}/NotoSans-Regular.ttf"), format!("{dir}/NotoSans-Bold.ttf")];
+        let (width, height) = (1264, 1680);
+        let mut renderer = Renderer::new(width, height, &fonts).unwrap();
+        let mut ui = Ui::new(Vec::new(), Layout::new(width as u32, height as u32, 3, 3));
+        ui.screen = Screen::Settings;
+        let status = Status::default();
+        let plain = renderer.draw(&ui, &status);
+        let done = ui.layout.done_button();
+        let (x, y) = (done.x as f32 + done.w as f32 / 2.0, done.y as f32 + done.h as f32 / 2.0);
+        let pressed = renderer.press_frame(&ui, &status, x, y).expect("the Done button is a control");
+        let (mut inside, mut outside) = (0, 0);
+        for py in 0..height as i32 {
+            for px in 0..width as i32 {
+                let i = (py * width as i32 + px) as usize;
+                if plain[i] == pressed[i] {
+                    continue;
+                }
+                if done.contains(px as f32 + 0.5, py as f32 + 0.5) {
+                    inside += 1;
+                    assert_eq!(pressed[i], 255 - plain[i], "a pressed pixel is reversed");
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        assert!(inside > 0, "the pressed control changed");
+        assert_eq!(outside, 0, "nothing outside the control changed");
+    }
 
     #[test]
     fn changed_rows_finds_the_band() {
