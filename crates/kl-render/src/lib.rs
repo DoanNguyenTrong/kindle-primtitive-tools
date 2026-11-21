@@ -503,7 +503,13 @@ impl Renderer {
     /// `None` when the tap is not on a control. The app shows it before the tap's action runs, so the tap is seen at
     /// once.
     pub fn press_frame(&mut self, ui: &Ui, status: &Status, x: f32, y: f32) -> Option<Vec<u8>> {
-        let target = self.targets.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(r, _)| *r)?;
+        // The smallest control under the tap: a row inside a card is the control, not the card around it.
+        let target = self
+            .targets
+            .iter()
+            .filter(|(r, _)| r.contains(x, y))
+            .min_by_key(|(r, _)| r.w as i64 * r.h as i64)
+            .map(|(r, _)| *r)?;
         self.press = Some(target);
         let frame = self.draw(ui, status);
         self.press = None;
@@ -2186,7 +2192,6 @@ impl Renderer {
 
     /// A card: a rounded outline with white inside (the grouped list's container).
     fn card(&mut self, r: Rect) {
-        self.touch(r, 22.0);
         self.rounded_frame(r, 22.0, 2, BLACK, WHITE);
     }
 
@@ -2658,6 +2663,32 @@ fn inside_rounded(x: i32, y: i32, w: i32, h: i32, radius: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tap on one row of a settings card reverses that row only, not the other rows or the card around them.
+    #[test]
+    fn a_tap_on_a_row_in_a_card_reverses_the_row_only() {
+        let Ok(dir) = std::env::var("KL_TEST_FONTS") else { return };
+        let fonts = vec![format!("{dir}/NotoSans-Regular.ttf"), format!("{dir}/NotoSans-Bold.ttf")];
+        let (width, height) = (1264, 1680);
+        let mut renderer = Renderer::new(width, height, &fonts).unwrap();
+        let mut ui = Ui::new(Vec::new(), Layout::new(width as u32, height as u32, 3, 3));
+        ui.screen = Screen::Page(kl_core::layout::Page::Display);
+        let status = Status::default();
+        let plain = renderer.draw(&ui, &status);
+        let rows: Vec<Rect> = renderer.targets.iter().map(|(r, _)| *r).collect();
+        assert!(rows.len() >= 2, "a settings page has several rows");
+        let row = rows[0];
+        let (x, y) = (row.x as f32 + row.w as f32 / 2.0, row.y as f32 + row.h as f32 / 2.0);
+        let pressed = renderer.press_frame(&ui, &status, x, y).unwrap();
+        let changed_outside = (0..height as i32)
+            .flat_map(|py| (0..width as i32).map(move |px| (px, py)))
+            .filter(|&(px, py)| {
+                let i = (py * width as i32 + px) as usize;
+                plain[i] != pressed[i] && !row.contains(px as f32 + 0.5, py as f32 + 0.5)
+            })
+            .count();
+        assert_eq!(changed_outside, 0, "only the touched row changed");
+    }
 
     /// A tap on a control reverses that control and nothing else. Needs the Noto Sans fonts: set `KL_TEST_FONTS` to
     /// the folder that holds them (the launcher's `assets/fonts`), otherwise the test does nothing.
