@@ -1836,12 +1836,12 @@ impl Renderer {
         let l = ui.layout;
         let title = l.title();
         self.text(Text { text: "Device name", x: 40.0, y: 36.0, w: 800.0, size: 56.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
-        self.button(l.done_button(), "Back", true);
+        self.button(l.done_button(), "Cancel", true);
         self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
         self.text(Text { text: "The name of this Kindle", x: MARGIN_X as f32, y: (title.bottom() + 24) as f32, w: 600.0, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
         let field = l.password_field();
         self.single_line_field(field, &ui.device_name_entry, "Type a name", false);
-        let note = "1 to 32 letters, digits or spaces. It is shown on the Device information page.";
+        let note = "Type a name, then tap Save (bottom right). Cancel leaves without saving. 1 to 32 letters, digits or spaces.";
         self.text(Text { text: note, x: MARGIN_X as f32, y: (field.bottom() + 24) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 26.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
         let area = l.keyboard_area();
         self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
@@ -2429,7 +2429,7 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
         Row::StoreSettings => if ui.store_daily_check { "Daily check on".into() } else { "Daily check off".into() },
         Row::StorageUsage => settings_management::storage_status(ui, s),
         Row::DeviceAbout => ui.firmware.as_ref().map_or_else(|| "Device profile and firmware".into(), |version| format!("Kindle firmware {version}")),
-        Row::DeviceName => ui.device_name.clone().unwrap_or_else(|| "Not set".into()),
+        Row::DeviceName => ui.device_name.clone().unwrap_or_else(|| "Tap to set".into()),
         Row::DeviceModel => {
             let how = match ui.device_source.as_str() {
                 "detected" => "detected",
