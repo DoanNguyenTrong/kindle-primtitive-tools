@@ -42,6 +42,8 @@ pub enum Screen {
     NetworkName,
     /// The SSH server's root password, typed on the keyboard.
     SshPassword,
+    /// The owner's name for this Kindle, typed on the keyboard.
+    DeviceName,
     /// Primitive Store: the list of the catalog's apps.
     Store,
     /// Primitive Store: one app's page (`Ui::store_open`).
@@ -140,6 +142,8 @@ pub enum Action {
     /// Set the root password the SSH server checks, from the SSH password screen. The driver gives it to the
     /// device on stdin only: it is not logged, kept, or put in a command line.
     SetSshPassword(String),
+    /// Save the owner's device name (validated: 1 to 32 characters, no control characters).
+    SetDeviceName(String),
     /// Check the SSH server (its process, port and firewall): the driver shows the result in the notice.
     CheckSsh,
 }
@@ -279,6 +283,8 @@ pub const MAX_NAME: usize = 32;
 /// The SSH root password: 6 to 64 characters of letters, digits and - _ . @ # % + = ! (no spaces).
 pub const MIN_SSH_PASSWORD: usize = 6;
 pub const MAX_SSH_PASSWORD: usize = 64;
+/// The longest device name the owner can type.
+pub const MAX_DEVICE_NAME: usize = 32;
 
 /// Whether `pw` is an acceptable SSH password. Only these characters can reach the device's shell or chpasswd, so
 /// nothing in it can change what the launcher runs.
@@ -443,6 +449,12 @@ pub struct Ui {
     pub wifi_hidden: bool,
     /// The SSH password being typed (kept here only until Set; never logged).
     pub ssh_password: primitive_keyboard::Editor,
+    /// The device name being typed, and the saved name and the About page's values.
+    pub device_name_entry: primitive_keyboard::Editor,
+    pub device_name: Option<String>,
+    pub series: Option<String>,
+    pub mac: Option<String>,
+    pub panel: Option<String>,
 }
 
 impl Ui {
@@ -525,6 +537,11 @@ impl Ui {
             network_name: primitive_keyboard::Editor::new(MAX_NAME),
             wifi_hidden: false,
             ssh_password: primitive_keyboard::Editor::new(MAX_SSH_PASSWORD),
+            device_name_entry: primitive_keyboard::Editor::new(MAX_DEVICE_NAME),
+            device_name: None,
+            series: None,
+            mac: None,
+            panel: None,
         }
     }
 
@@ -1687,6 +1704,7 @@ impl Ui {
             Screen::Password => self.layout.keyboard_keys(self.password.layer),
             Screen::NetworkName => self.layout.keyboard_keys_with(self.network_name.layer, "Next"),
             Screen::SshPassword => self.layout.keyboard_keys_with(self.ssh_password.layer, "Set"),
+            Screen::DeviceName => self.layout.keyboard_keys_with(self.device_name_entry.layer, "Save"),
             Screen::Store if self.store_search_keyboard && !self.store_settings_open => self.layout.keyboard_keys_with(self.store_query.layer, "Search"),
             _ => return false,
         };
@@ -1741,6 +1759,7 @@ impl Ui {
             Screen::Password => self.password_screen(input),
             Screen::NetworkName => self.network_name_screen(input),
             Screen::SshPassword => self.ssh_password_screen(input),
+            Screen::DeviceName => self.device_name_screen(input),
             Screen::ConfirmKindle => self.confirm(input),
             Screen::PowerMenu => self.power_menu(input),
             Screen::AppMenu => self.app_menu(input),
@@ -1879,6 +1898,31 @@ impl Ui {
     /// the network screen.
     /// The SSH password: type it on the keyboard, then Set gives it to the driver. Back returns to the SSH & DNS page.
     /// The password is not shown after this screen and is never logged.
+    fn device_name_screen(&mut self, input: Input) -> Action {
+        match input {
+            Input::PageBack => self.go(Screen::Page(Page::Device)),
+            Input::Tap(x, y) => {
+                if self.layout.done_button().inset(-20).contains(x, y) {
+                    return self.go(Screen::Page(Page::Device));
+                }
+                let Some(key) = self.layout.keyboard_key_at(self.device_name_entry.layer, x, y) else { return Action::None };
+                if self.device_name_entry.press(key) != primitive_keyboard::Press::Go {
+                    return Action::Redraw { full: false };
+                }
+                let name = self.device_name_entry.string().trim().to_string();
+                if !valid_device_name(&name) {
+                    self.notice = Some(format!("Use 1 to {MAX_DEVICE_NAME} letters, digits or spaces."));
+                    return Action::Redraw { full: false };
+                }
+                self.device_name_entry = primitive_keyboard::Editor::new(MAX_DEVICE_NAME);
+                self.notice = Some("Saving the name…".into());
+                self.screen = Screen::Page(Page::Device);
+                Action::SetDeviceName(name)
+            }
+            _ => Action::None,
+        }
+    }
+
     fn ssh_password_screen(&mut self, input: Input) -> Action {
         match input {
             Input::PageBack => self.go(Screen::Page(Page::Connection)),
@@ -2229,6 +2273,16 @@ impl Ui {
                     self.ssh_password = primitive_keyboard::Editor::new(MAX_SSH_PASSWORD);
                     self.go(Screen::SshPassword)
                 }
+                Some(Button::DeviceName) => {
+                    self.device_name_entry = primitive_keyboard::Editor::new(MAX_DEVICE_NAME);
+                    if let Some(name) = self.device_name.clone() {
+                        for c in name.chars() {
+                            let key = if c == ' ' { primitive_keyboard::Key::Space } else { primitive_keyboard::Key::Char(c) };
+                            self.device_name_entry.press(key);
+                        }
+                    }
+                    self.go(Screen::DeviceName)
+                }
                 Some(Button::Autostart) => Action::Device(DeviceCmd::ToggleAutostart),
                 Some(Button::PickModel(index)) => Action::Device(DeviceCmd::PickModel(index)),
                 Some(Button::ShowHidden) => self.show_all(),
@@ -2289,9 +2343,24 @@ fn is_builtin(app: &App) -> bool {
     matches!(app.launch, Launch::Settings | Launch::KindleMode | Launch::Extensions | Launch::Store)
 }
 
+/// A device name the owner can use: 1 to 32 characters, letters, digits and spaces only.
+pub fn valid_device_name(name: &str) -> bool {
+    let len = name.chars().count();
+    (1..=MAX_DEVICE_NAME).contains(&len) && name.chars().all(|c| c.is_alphanumeric() || c == ' ')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_name_is_1_to_32_letters_digits_and_spaces() {
+        assert!(valid_device_name("Doan's Oasis".replace('\'', "").as_str()));
+        assert!(valid_device_name("My Kindle 2"));
+        assert!(!valid_device_name(""));
+        assert!(!valid_device_name(&"a".repeat(33)));
+        assert!(!valid_device_name("tab\there"));
+    }
 
     #[test]
     fn date_and_time_actions_are_reachable_and_sync_cannot_overlap_or_run_in_usb_mode() {

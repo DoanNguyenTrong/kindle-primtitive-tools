@@ -572,6 +572,7 @@ impl Renderer {
             Screen::Password => self.password_screen(ui),
             Screen::NetworkName => self.network_name_screen(ui),
             Screen::SshPassword => self.ssh_password_screen(ui),
+            Screen::DeviceName => self.device_name_screen(ui),
             // The dialog is a pop-up over the grid, drawn last (below).
             Screen::ConfirmKindle => self.home(ui, status, &mut icon_blits),
             Screen::PowerMenu => self.home(ui, status, &mut icon_blits),
@@ -1831,6 +1832,29 @@ impl Renderer {
     }
 
     /// The SSH password screen: the password field with its caret, the rule, and the keyboard whose Go key says Set.
+    fn device_name_screen(&mut self, ui: &Ui) {
+        let l = ui.layout;
+        let title = l.title();
+        self.text(Text { text: "Device name", x: 40.0, y: 36.0, w: 800.0, size: 56.0, bold: true, align: Align::Start, lines: 1, gray: BLACK });
+        self.button(l.done_button(), "Back", true);
+        self.fill(Rect::new(0, title.bottom() - 4, title.w, 4), BLACK);
+        self.text(Text { text: "The name of this Kindle", x: MARGIN_X as f32, y: (title.bottom() + 24) as f32, w: 600.0, size: 30.0, bold: false, align: Align::Start, lines: 1, gray: 85 });
+        let field = l.password_field();
+        self.single_line_field(field, &ui.device_name_entry, "Type a name", false);
+        let note = "1 to 32 letters, digits or spaces. It is shown on the Device information page.";
+        self.text(Text { text: note, x: MARGIN_X as f32, y: (field.bottom() + 24) as f32, w: (l.width - 2 * MARGIN_X) as f32, size: 26.0, bold: false, align: Align::Start, lines: 2, gray: 85 });
+        let area = l.keyboard_area();
+        self.fill(Rect::new(area.x, area.y, area.w, primitive_keyboard::style::TOP_LINE as i32), primitive_keyboard::style::TOP_LINE_GRAY);
+        for (key, r) in l.keyboard_keys_with(ui.device_name_entry.layer, "Save") {
+            let pressed = ui.pressed_key == Some(r);
+            self.key(&key, r, pressed);
+        }
+        if let Some(notice) = ui.notice.clone() {
+            let n = l.password_notice();
+            self.text(Text { text: &notice, x: n.x as f32, y: n.y as f32, w: n.w as f32, size: 28.0, bold: false, align: Align::Center, lines: 2, gray: BLACK });
+        }
+    }
+
     fn ssh_password_screen(&mut self, ui: &Ui) {
         let l = ui.layout;
         let title = l.title();
@@ -2159,19 +2183,24 @@ impl Renderer {
     fn about_card(&mut self, ui: &Ui, s: &Status) {
         let l = ui.layout;
         let top = l.title().bottom() + 24;
+        let or_unknown = |value: &Option<String>| value.clone().unwrap_or_else(|| "Unknown".into());
         let rows = [
             ("System", SYSTEM_NAME.into()),
             ("Launcher version", ui.version.clone()),
+            ("Device name", ui.device_name.clone().unwrap_or_else(|| "Not set".into())),
             ("Device profile", ui.device_profile.clone().unwrap_or_else(|| "Unavailable".into())),
             ("Kindle firmware", ui.firmware.clone().unwrap_or_else(|| "Unavailable".into())),
+            ("Series number", or_unknown(&ui.series)),
+            ("Wi-Fi MAC address", or_unknown(&ui.mac)),
+            ("IP address", s.ip.clone()),
+            ("Screen panel", or_unknown(&ui.panel)),
             ("USB", settings_management::usb_status(ui.usb).into()),
             ("Apps", ui.apps().len().to_string()),
             ("Memory", if s.memory.is_empty() { "unknown".into() } else { s.memory.clone() }),
             ("Storage", s.storage.clone()),
-            ("Wi-Fi address", s.ip.clone()),
         ];
         self.section_header(MARGIN_X, top, "Device information");
-        let row_height = 96;
+        let row_height = 80;
         let card = Rect::new(MARGIN_X, top + 56, self.width as i32 - 2 * MARGIN_X, rows.len() as i32 * row_height);
         self.card(card);
         for (i, (key, value)) in rows.iter().enumerate() {
@@ -2400,6 +2429,7 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
         Row::StoreSettings => if ui.store_daily_check { "Daily check on".into() } else { "Daily check off".into() },
         Row::StorageUsage => settings_management::storage_status(ui, s),
         Row::DeviceAbout => ui.firmware.as_ref().map_or_else(|| "Device profile and firmware".into(), |version| format!("Kindle firmware {version}")),
+        Row::DeviceName => ui.device_name.clone().unwrap_or_else(|| "Not set".into()),
         Row::DeviceModel => {
             let how = match ui.device_source.as_str() {
                 "detected" => "detected",

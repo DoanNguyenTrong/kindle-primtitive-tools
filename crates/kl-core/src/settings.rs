@@ -55,6 +55,8 @@ pub struct Settings {
     pub store_daily_check: bool,
     /// The Kindle model the owner chose (`models::MODELS` id), used only when the model cannot be detected.
     pub device_model: Option<String>,
+    /// The owner's name for this Kindle, typed on the Device name page (up to 32 characters).
+    pub device_name: Option<String>,
 }
 
 impl Default for Settings {
@@ -70,6 +72,7 @@ impl Default for Settings {
             low_power: false,
             store_daily_check: true,
             device_model: None,
+            device_name: None,
         }
     }
 }
@@ -113,6 +116,7 @@ impl Settings {
                 ("store_daily_check", "1") => s.store_daily_check = true,
                 ("store_daily_check", "0") => s.store_daily_check = false,
                 ("device_model", value) if !value.is_empty() => s.device_model = Some(value.to_string()),
+                ("device_name", value) if !value.is_empty() => s.device_name = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -147,6 +151,7 @@ impl Settings {
             u8::from(self.high_contrast),
             u8::from(self.low_power),
         ) + &self.device_model.as_ref().map_or_else(String::new, |id| format!("device_model={id}\n"))
+            + &self.device_name.as_ref().map_or_else(String::new, |name| format!("device_name={name}\n"))
     }
 }
 
@@ -167,6 +172,7 @@ mod tests {
             low_power: true,
             store_daily_check: false,
             device_model: None,
+            device_name: None,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert!(Settings::default().animation && !Settings::default().dark_mode);

@@ -198,6 +198,7 @@ impl Page {
                 Group { header: "Manage storage", rows: &[Row::ManageInstalled, Row::StoreSettings], footer: "Use Store settings to clear the saved catalog." },
             ],
             Page::Device => &[
+                Group { header: "Device name", rows: &[Row::DeviceName], footer: "Shown on the Device information page." },
                 Group { header: "Kindle model", rows: &[Row::DeviceModel], footer: "The launcher detects your Kindle. If it cannot, choose it from the list." },
                 Group { header: "Startup", rows: &[Row::Autostart], footer: "Choose whether Launcher opens when the Kindle starts." },
                 Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
@@ -238,6 +239,8 @@ pub struct Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
     Done,
+    /// Open the Device name page.
+    DeviceName,
     /// Choose model `index` of `models::MODELS` on the Choose your Kindle page.
     PickModel(u8),
     LightDown,
@@ -304,6 +307,8 @@ pub enum QuickTile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
+    /// The owner's name for this Kindle; opens the Device name page.
+    DeviceName,
     /// The Kindle model in use (detected, or chosen); opens the Choose your Kindle page.
     DeviceModel,
     /// Model `index` of `models::MODELS` on the Choose your Kindle page.
@@ -410,6 +415,7 @@ impl Row {
             Row::StorageUsage => "Used storage",
             Row::DeviceAbout => "Device information",
             Row::DeviceModel => "Kindle model",
+            Row::DeviceName => "Device name",
             Row::Model(i) => crate::models::MODELS[i as usize].name,
             Row::StoreDailyCheck => "Check for updates daily",
             Row::StoreClearCache => "Clear saved catalog",
@@ -576,6 +582,7 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
         Row::StoreSettings => vec![(Button::OpenPage(Page::Store), r)],
         Row::DeviceAbout => vec![(Button::OpenPage(Page::About), r)],
         Row::DeviceModel => vec![(Button::OpenPage(Page::ChooseModel), r)],
+        Row::DeviceName => vec![(Button::DeviceName, r)],
         Row::Model(i) => vec![(Button::PickModel(i), r)],
         Row::BatteryReading | Row::StorageUsage => vec![],
         Row::StoreDailyCheck => vec![(Button::StoreDailyCheck, r)],
