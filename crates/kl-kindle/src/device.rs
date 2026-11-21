@@ -61,3 +61,14 @@ pub fn store_device() -> Option<kl_store::resolve::Device> {
         firmware,
     })
 }
+
+/// The platform codename of this Kindle (`zelda` on the Oasis 3), from its version file. The serial is never read.
+pub fn platform_codename() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/version.txt").ok()?;
+    kl_core::models::codename_from_version(&text)
+}
+
+/// The Kindle model this device is, when its codename is known. `None` means the owner must choose it.
+pub fn detected_model() -> Option<&'static kl_core::models::Model> {
+    platform_codename().and_then(|codename| kl_core::models::model_for_codename(&codename))
+}

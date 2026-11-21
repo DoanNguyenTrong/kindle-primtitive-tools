@@ -18,6 +18,7 @@ pub mod tz;
 pub mod ui;
 pub mod wallpaper;
 pub mod wifi;
+pub mod models;
 
 pub use apps::{discover, App, IconSource, Launch};
 pub use config::Config;
