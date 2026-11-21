@@ -1250,9 +1250,12 @@ impl Ui {
         }
     }
 
-    /// The icon files "Change icon" cycles through.
+    /// The icon files "Change icon" cycles through. A dark form (`<name>-dark.png` beside `<name>.png`) is not a
+    /// choice of its own: it comes with its light form.
     pub fn set_icon_choices(&mut self, choices: Vec<String>) {
-        self.icon_choices = choices;
+        let dark_forms: std::collections::HashSet<String> =
+            choices.iter().filter_map(|path| crate::apps::dark_form_path(path)).collect();
+        self.icon_choices = choices.into_iter().filter(|path| !dark_forms.contains(path)).collect();
     }
 
     /// The Wi-Fi scan list on the Wi-Fi page (networks other than the current one).
@@ -2998,6 +3001,18 @@ mod tests {
         assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/b.png".into()) });
         assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: None });
         assert_eq!(u.apps()[0].icon, IconSource::None);
+    }
+
+    #[test]
+    fn change_icon_skips_the_dark_forms_of_the_icon_files() {
+        let mut u = ui(1);
+        u.set_icon_choices(vec!["/i/a-dark.png".into(), "/i/a.png".into(), "/i/b-dark.png".into()]);
+        let id = u.apps()[0].id.clone();
+        open_menu(&mut u, 0);
+        let icon = menu_row(&u, Button::MenuIcon);
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/a.png".into()) });
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id: id.clone(), icon: Some("/i/b-dark.png".into()) }, "no light form: a choice");
+        assert_eq!(tap(&mut u, icon), Action::SetIcon { id, icon: None });
     }
 
     #[test]
