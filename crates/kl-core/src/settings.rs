@@ -53,6 +53,8 @@ pub struct Settings {
     pub low_power: bool,
     /// Refresh the store automatically when its catalog is a day old.
     pub store_daily_check: bool,
+    /// The Kindle model the owner chose (`models::MODELS` id), used only when the model cannot be detected.
+    pub device_model: Option<String>,
 }
 
 impl Default for Settings {
@@ -67,6 +69,7 @@ impl Default for Settings {
             high_contrast: false,
             low_power: false,
             store_daily_check: true,
+            device_model: None,
         }
     }
 }
@@ -109,6 +112,7 @@ impl Settings {
                 ("low_power", "0") => s.low_power = false,
                 ("store_daily_check", "1") => s.store_daily_check = true,
                 ("store_daily_check", "0") => s.store_daily_check = false,
+                ("device_model", value) if !value.is_empty() => s.device_model = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -142,7 +146,7 @@ impl Settings {
             u8::from(self.large_text),
             u8::from(self.high_contrast),
             u8::from(self.low_power),
-        )
+        ) + &self.device_model.as_ref().map_or_else(String::new, |id| format!("device_model={id}\n"))
     }
 }
 
@@ -162,6 +166,7 @@ mod tests {
             high_contrast: true,
             low_power: true,
             store_daily_check: false,
+            device_model: None,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert!(Settings::default().animation && !Settings::default().dark_mode);

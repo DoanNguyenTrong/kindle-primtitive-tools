@@ -2318,6 +2318,7 @@ fn page_value(page: kl_core::layout::Page, ui: &Ui, s: &Status) -> String {
     let onoff = |on: bool| if on { "on" } else { "off" };
     match page {
         Page::Wifi => wifi_word(s),
+        Page::ChooseModel => "Detected or chosen".into(),
         Page::Display => format!("Front light {} · Dark mode {}", light_description(s.light, s.display_support.front_light), onoff(s.dark_mode)),
         Page::Wallpaper => "Home, sleep, and startup pictures".into(),
         Page::Accessibility => format!("Larger text {} · Higher contrast {}", onoff(s.large_text), onoff(s.high_contrast)),
@@ -2399,6 +2400,19 @@ fn row_value(row: Row, ui: &Ui, s: &Status) -> String {
         Row::StoreSettings => if ui.store_daily_check { "Daily check on".into() } else { "Daily check off".into() },
         Row::StorageUsage => settings_management::storage_status(ui, s),
         Row::DeviceAbout => ui.firmware.as_ref().map_or_else(|| "Device profile and firmware".into(), |version| format!("Kindle firmware {version}")),
+        Row::DeviceModel => {
+            let how = match ui.device_source.as_str() {
+                "detected" => "detected",
+                "selected" => "chosen",
+                _ => "not detected",
+            };
+            let untested = if ui.device_untested { " · untested" } else { "" };
+            format!("{} · {how}{untested}", ui.device_model_name)
+        }
+        Row::Model(i) => {
+            let id = kl_core::models::MODELS[i as usize].id;
+            if ui.device_model_id.as_deref() == Some(id) { "Selected".into() } else { String::new() }
+        }
         Row::KindleUi => "Stock Kindle UI".into(),
         Row::StoreDailyCheck if s.low_power && ui.store_daily_check => "Paused by Low power mode".into(),
         Row::StoreDailyCheck => if ui.store_daily_check { "On".into() } else { "Off".into() },

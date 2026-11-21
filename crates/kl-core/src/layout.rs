@@ -65,9 +65,33 @@ pub enum Page {
     Store,
     Storage,
     Device,
+    ChooseModel,
     DateTime,
     About,
 }
+
+/// The number of models the choice page lists.
+const MODEL_COUNT: usize = crate::models::MODELS.len();
+
+/// One row per model, in the order of `models::MODELS`.
+static MODEL_ROWS: [Row; MODEL_COUNT] = model_rows();
+
+const fn model_rows() -> [Row; MODEL_COUNT] {
+    let mut rows = [Row::Model(0); MODEL_COUNT];
+    let mut i = 0;
+    while i < MODEL_COUNT {
+        rows[i] = Row::Model(i as u8);
+        i += 1;
+    }
+    rows
+}
+
+/// The choice page's one section: every supported model.
+static CHOOSE_MODEL_GROUPS: [Group; 1] = [Group {
+    header: "Supported Kindles",
+    rows: &MODEL_ROWS,
+    footer: "Choose your model only if the launcher cannot detect it. Installs depend only on the processor (armhf).",
+}];
 
 /// One section of a page: its header, its rows in one card, and its footer.
 pub struct Group {
@@ -99,6 +123,7 @@ impl Page {
             Page::Store => "Store",
             Page::Storage => "Storage",
             Page::Device => "Device",
+            Page::ChooseModel => "Choose your Kindle",
             Page::DateTime => "Date and time",
             Page::About => "About",
         }
@@ -173,6 +198,7 @@ impl Page {
                 Group { header: "Manage storage", rows: &[Row::ManageInstalled, Row::StoreSettings], footer: "Use Store settings to clear the saved catalog." },
             ],
             Page::Device => &[
+                Group { header: "Kindle model", rows: &[Row::DeviceModel], footer: "The launcher detects your Kindle. If it cannot, choose it from the list." },
                 Group { header: "Startup", rows: &[Row::Autostart], footer: "Choose whether Launcher opens when the Kindle starts." },
                 Group { header: "Launcher", rows: &[Row::Restart], footer: "Starts the launcher again, as after an install. Apps and settings stay." },
                 Group { header: "Kindle", rows: &[Row::DeviceAbout, Row::KindleUi], footer: "Opening the Kindle UI takes about a minute." },
@@ -181,6 +207,7 @@ impl Page {
                 Group { header: "Kindle clock", rows: &[Row::LocalTime, Row::LocalDate, Row::SyncClock], footer: "Sync uses Cloudflare’s time service over Wi-Fi." },
                 Group { header: "Time zone", rows: &[Row::TimeZone], footer: "Launcher follows the Kindle’s time zone." },
             ],
+            Page::ChooseModel => &CHOOSE_MODEL_GROUPS,
             Page::About | Page::FileTransfer | Page::InstalledApps | Page::AppVisibility => &[],
         }
     }
@@ -211,6 +238,8 @@ pub struct Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
     Done,
+    /// Choose model `index` of `models::MODELS` on the Choose your Kindle page.
+    PickModel(u8),
     LightDown,
     LightUp,
     WarmDown,
@@ -275,6 +304,10 @@ pub enum QuickTile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
+    /// The Kindle model in use (detected, or chosen); opens the Choose your Kindle page.
+    DeviceModel,
+    /// Model `index` of `models::MODELS` on the Choose your Kindle page.
+    Model(u8),
     Frontlight,
     Warmth,
     DarkMode,
@@ -376,6 +409,8 @@ impl Row {
             Row::StoreSettings => "Store settings",
             Row::StorageUsage => "Used storage",
             Row::DeviceAbout => "Device information",
+            Row::DeviceModel => "Kindle model",
+            Row::Model(i) => crate::models::MODELS[i as usize].name,
             Row::StoreDailyCheck => "Check for updates daily",
             Row::StoreClearCache => "Clear saved catalog",
             Row::SleepScreen => "Sleep screen",
@@ -540,6 +575,8 @@ fn row_buttons(l: &Layout, row: Row, r: Rect) -> Vec<(Button, Rect)> {
         Row::BatteryWifi => vec![(Button::OpenPage(Page::Wifi), r)],
         Row::StoreSettings => vec![(Button::OpenPage(Page::Store), r)],
         Row::DeviceAbout => vec![(Button::OpenPage(Page::About), r)],
+        Row::DeviceModel => vec![(Button::OpenPage(Page::ChooseModel), r)],
+        Row::Model(i) => vec![(Button::PickModel(i), r)],
         Row::BatteryReading | Row::StorageUsage => vec![],
         Row::StoreDailyCheck => vec![(Button::StoreDailyCheck, r)],
         Row::StoreClearCache => vec![(Button::StoreClearCache, r)],

@@ -64,6 +64,8 @@ pub enum Input {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceCmd {
+    /// Choose model `index` of `models::MODELS` (saved in the settings).
+    PickModel(u8),
     Light(i32),
     Warmth(i32),
     ToggleWifi,
@@ -356,6 +358,12 @@ pub struct Ui {
     pub wallpaper_preview: Option<WallpaperDraft>,
     pub firmware: Option<String>,
     pub device_profile: Option<String>,
+    /// The model in use: its id, its name, and how it was known (`detected`, `selected` or `unknown`).
+    pub device_model_id: Option<String>,
+    pub device_model_name: String,
+    pub device_source: String,
+    /// The model has not been run with PrimitiveOS: the screens may not fit, and the launcher says so.
+    pub device_untested: bool,
     pub screen: Screen,
     before_sleep: Screen,
     /// The pressed icon, drawn darkened until the app starts.
@@ -461,6 +469,10 @@ impl Ui {
             wallpaper_preview: None,
             firmware: None,
             device_profile: None,
+            device_model_id: None,
+            device_model_name: String::new(),
+            device_source: "unknown".into(),
+            device_untested: false,
             screen: Screen::Home,
             before_sleep: Screen::Home,
             pressed: None,
@@ -2218,6 +2230,7 @@ impl Ui {
                     self.go(Screen::SshPassword)
                 }
                 Some(Button::Autostart) => Action::Device(DeviceCmd::ToggleAutostart),
+                Some(Button::PickModel(index)) => Action::Device(DeviceCmd::PickModel(index)),
                 Some(Button::ShowHidden) => self.show_all(),
                 Some(Button::StoreDailyCheck) => Action::Device(DeviceCmd::StoreToggleDailyCheck),
                 Some(Button::StoreClearCache) => {
