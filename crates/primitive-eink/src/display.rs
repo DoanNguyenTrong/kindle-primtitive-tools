@@ -34,10 +34,12 @@ impl Display {
         Display { panel, last: Vec::new(), presented_frame: false, paused: false }
     }
 
-    /// Stop or resume drawing. Resuming draws the whole screen on the next `show`, as the panel was someone else's.
+    /// Stop or resume drawing. Resuming takes what is on the panel now (an app's screen) as the last frame, so the
+    /// next `show` updates only the box that changes, without a flash: quick settings over an app updates the panel's
+    /// box, not the whole screen. Off the Kindle, or when the panel cannot be read, the next `show` is a full update.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-        self.last.clear();
+        self.last = if paused { Vec::new() } else { self.snapshot().unwrap_or_default() };
     }
 
     pub fn paused(&self) -> bool {
@@ -49,13 +51,28 @@ impl Display {
         self.panel.as_ref()?.snapshot(W, H)
     }
 
-    /// Put a snapshot back with one full update (it draws even while paused).
+    /// Put a snapshot back (it draws even while paused). Only the box that differs from what is on the panel is
+    /// updated, without a flash, when it is a pop-up's size (quick settings closing over an app). A change over most
+    /// of the screen (the sleep picture going) gets one full update, as a calm update there leaves a ghost.
     pub fn restore(&mut self, frame: Vec<u8>) {
         let Some(panel) = self.panel.as_mut() else { return };
-        match panel.draw(W, (0, 0, W, H), &frame, eink::WAVE_GC16, true) {
+        let changed = match panel.snapshot(W, H) {
+            Some(now) if now.len() == frame.len() => kl_render::changed_rect(&now, &frame, W as usize),
+            _ => Some((0, 0, W as usize, H as usize)),
+        };
+        let Some((x, y, w, h)) = changed else {
+            self.last = frame;
+            log("draw: the saved screen is back (unchanged)");
+            return;
+        };
+        let region = (x as u32, y as u32, w as u32, h as u32);
+        let calm = restores_calmly(region);
+        let (wave, name) = if calm { (region_wave(&frame, region), "calm") } else { (eink::WAVE_GC16, "GC16 full") };
+        let region = if calm { region } else { (0, 0, W, H) };
+        match panel.draw(W, region, &frame, wave, !calm) {
             Ok(true) => {
                 self.last = frame;
-                log("draw: the saved screen is back");
+                log(&format!("draw: the saved screen is back ({name} {}x{} at {},{})", region.2, region.3, region.0, region.1));
             }
             Ok(false) => {
                 self.last.clear();
@@ -141,6 +158,11 @@ impl Display {
     }
 }
 
+/// A restore of this box needs no flash: it is at most 60% of the screen (a pop-up, not the sleep picture).
+fn restores_calmly((_, _, w, h): (u32, u32, u32, u32)) -> bool {
+    (w as u64 * h as u64) * 10 <= (W as u64 * H as u64) * 6
+}
+
 fn region_wave(frame: &[u8], (x, y, w, h): (u32, u32, u32, u32)) -> u32 {
     let stride = W as usize;
     let (left, right) = (x as usize, (x + w) as usize);
@@ -152,6 +174,13 @@ fn region_wave(frame: &[u8], (x, y, w, h): (u32, u32, u32, u32)) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pop_up_is_put_back_calmly_and_the_whole_screen_with_a_flash() {
+        assert!(restores_calmly((200, 40, 832, 900)), "quick settings");
+        assert!(!restores_calmly((0, 0, W, H)), "the sleep picture");
+        assert!(!restores_calmly((0, 0, W, H * 2 / 3)), "most of the screen");
+    }
 
     #[test]
     fn rectangle_waveform_depends_only_on_the_region_pixels() {
